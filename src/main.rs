@@ -5,6 +5,7 @@ mod commands;
 mod editor;
 mod find_bar;
 mod palette;
+mod settings;
 mod workspace;
 
 use app::ForgeApp;

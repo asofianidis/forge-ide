@@ -12,6 +12,7 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
 - Find / replace with match-case and regex options (`$1` capture groups in replacements)
 - Go to line[:column]
 - Command palette with fuzzy matching over every command
+- Settings (Ctrl+,): color theme (all bundled syntect themes; the UI follows light/dark), font size, word wrap, line numbers
 - Syntax highlighting for many languages (via [syntect](https://github.com/trishume/syntect))
 - Line-number gutter with current-line highlight
 - Cursor line/column in the status bar
@@ -43,9 +44,27 @@ cargo run --release -- path/to/project
 | Go to line | Ctrl+G   |
 | Next / previous tab | Ctrl+Tab / Ctrl+Shift+Tab |
 | Command palette | Ctrl+Shift+P / F1 |
+| Settings   | Ctrl+,   |
+| Font size bigger / smaller / reset | Ctrl+= / Ctrl+- / Ctrl+0 |
+| Toggle word wrap | Alt+Z |
 | Quit       | Ctrl+Q   |
 
 (Cmd instead of Ctrl on macOS.)
+
+### Settings
+
+Settings are stored as TOML in `<config dir>/forge-ide/settings.toml`
+(`%APPDATA%\forge-ide\settings.toml` on Windows, `~/.config/forge-ide/settings.toml` on Linux,
+`~/Library/Application Support/forge-ide/settings.toml` on macOS). Set `FORGE_SETTINGS` to use a
+different file. Changes made in the Settings window are saved immediately; editing the file in
+Forge reloads it on save.
+
+```toml
+theme = "base16-ocean.dark"
+font_size = 14.0
+word_wrap = false
+line_numbers = true
+```
 
 ## Project layout
 
@@ -56,6 +75,7 @@ src/
 ├── commands.rs          # command list: labels, shortcuts (shared by menus and palette)
 ├── find_bar.rs          # find/replace bar and go-to-line prompt
 ├── palette.rs           # command palette and fuzzy matcher
+├── settings.rs          # persisted user settings
 ├── workspace.rs         # file tree / project explorer
 └── editor/
     ├── buffer.rs        # rope-backed text buffer, undo/redo history
@@ -74,7 +94,7 @@ src/
 - [x] Unsaved-changes prompt on close
 - [ ] Integrated terminal
 - [ ] LSP client (diagnostics, completion, go to definition)
-- [ ] Settings and themes
+- [x] Settings and themes
 
 ## License
 
