@@ -127,12 +127,29 @@ impl History {
         }
         self.sealed = false;
     }
+
+    /// Records already-applied edits as one standalone undo step.
+    fn record_transaction(&mut self, edits: Vec<Edit>, now: Instant) {
+        self.redo.clear();
+        let id = self.fresh_id();
+        self.undo.push(Transaction {
+            id,
+            edits,
+            last_edit: now,
+        });
+        if self.undo.len() > MAX_UNDO_STEPS {
+            self.undo.remove(0);
+        }
+        self.sealed = true;
+    }
 }
 
 pub struct Buffer {
     rope: Rope,
     text: String,
     history: History,
+    /// Incremented on every change, so derived data (search matches) can be cached.
+    revision: u64,
 }
 
 impl Default for Buffer {
@@ -147,6 +164,7 @@ impl From<&str> for Buffer {
             rope: Rope::from_str(text),
             text: text.to_owned(),
             history: History::default(),
+            revision: 0,
         }
     }
 }
@@ -171,6 +189,64 @@ impl Buffer {
 
     pub fn mark_saved(&mut self) {
         self.history.saved_id = self.history.current_id();
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Char offset of the start of a 1-based line, clamped to the last line.
+    pub fn line_start(&self, line: usize) -> usize {
+        let line = line.saturating_sub(1).min(self.rope.len_lines() - 1);
+        self.rope.line_to_char(line)
+    }
+
+    /// Char offset of a 1-based (line, column), clamped to the line's length.
+    pub fn char_at_line_col(&self, line: usize, col: usize) -> usize {
+        let start = self.line_start(line);
+        let content = self.rope.line(self.rope.char_to_line(start));
+        let len = content
+            .chars()
+            .take_while(|&c| c != '\n' && c != '\r')
+            .count();
+        start + col.saturating_sub(1).min(len)
+    }
+
+    /// Converts a byte range (e.g. from a regex match on [`TextBuffer::as_str`]) to chars.
+    pub fn byte_to_char_range(&self, range: Range<usize>) -> Range<usize> {
+        self.rope.byte_to_char(range.start)..self.rope.byte_to_char(range.end)
+    }
+
+    /// Replaces several non-overlapping char ranges as a single undo step.
+    ///
+    /// Returns the char range of each inserted text in the resulting buffer.
+    pub fn replace_ranges(&mut self, mut edits: Vec<(Range<usize>, String)>) -> Vec<Range<usize>> {
+        edits.sort_by_key(|(r, _)| r.start);
+        // Apply back to front so earlier offsets stay valid.
+        let mut recorded = Vec::with_capacity(edits.len());
+        for (range, text) in edits.iter().rev() {
+            let removed = self.rope.slice(range.clone()).to_string();
+            self.apply(range.clone(), text);
+            recorded.push(Edit {
+                at: range.start,
+                removed,
+                inserted: text.clone(),
+            });
+        }
+        if !recorded.is_empty() {
+            self.history.record_transaction(recorded, Instant::now());
+        }
+        // Resulting positions, accounting for the size change of earlier edits.
+        let mut shift: isize = 0;
+        edits
+            .iter()
+            .map(|(range, text)| {
+                let start = (range.start as isize + shift) as usize;
+                let len = text.chars().count();
+                shift += len as isize - range.len() as isize;
+                start..start + len
+            })
+            .collect()
     }
 
     pub fn can_undo(&self) -> bool {
@@ -232,6 +308,7 @@ impl Buffer {
         self.rope.remove(range.clone());
         self.rope.insert(range.start, text);
         self.text.replace_range(start_byte..end_byte, text);
+        self.revision += 1;
     }
 }
 
@@ -308,6 +385,38 @@ mod tests {
         assert_eq!(buf.line_col(7), (3, 2));
         assert_eq!(buf.line_col(999), (3, 3));
         assert_eq!(buf.line_count(), 3);
+    }
+
+    #[test]
+    fn line_start_and_line_col_lookup() {
+        let buf = Buffer::from("ab\r\ncd\nef");
+        assert_eq!(buf.line_start(2), 4);
+        assert_eq!(buf.line_start(99), 7);
+        assert_eq!(buf.char_at_line_col(1, 99), 2, "clamps before \\r\\n");
+        assert_eq!(buf.char_at_line_col(2, 2), 5);
+        assert_eq!(buf.char_at_line_col(3, 99), 9);
+    }
+
+    #[test]
+    fn replace_ranges_is_one_undo_step() {
+        let mut buf = Buffer::from("a-b-c");
+        let rev = buf.revision();
+        let placed = buf.replace_ranges(vec![(3..4, "++".into()), (1..2, "".into())]);
+        assert_eq!(buf.as_str(), "ab++c");
+        assert_eq!(placed, vec![1..1, 2..4]);
+        assert!(buf.revision() > rev);
+        assert_in_sync(&buf);
+        buf.undo();
+        assert_eq!(buf.as_str(), "a-b-c");
+        assert_in_sync(&buf);
+        buf.redo();
+        assert_eq!(buf.as_str(), "ab++c");
+    }
+
+    #[test]
+    fn byte_to_char_range_handles_multibyte() {
+        let buf = Buffer::from("é—x");
+        assert_eq!(buf.byte_to_char_range(5..6), 2..3);
     }
 
     #[test]

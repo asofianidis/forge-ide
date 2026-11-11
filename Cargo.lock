@@ -1544,6 +1544,7 @@ dependencies = [
  "dirs",
  "eframe",
  "egui",
+ "regex",
  "rfd",
  "ropey",
  "self_update",

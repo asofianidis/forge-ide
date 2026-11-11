@@ -2,6 +2,7 @@
 
 mod app;
 mod editor;
+mod find_bar;
 mod settings;
 mod theme;
 mod updater;
