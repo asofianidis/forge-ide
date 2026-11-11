@@ -4,6 +4,7 @@ mod buffer;
 mod document;
 pub mod gutter;
 mod highlight;
+pub mod search;
 
 pub use buffer::Buffer;
 pub use document::Document;

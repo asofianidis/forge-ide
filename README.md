@@ -9,6 +9,8 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
 - File explorer with lazily-loaded directory tree
 - Tabbed editing with unsaved-change indicators
 - Rope-backed buffers with grouped undo/redo history
+- Find / replace with match-case and regex options (`$1` capture groups in replacements)
+- Go to line[:column]
 - Syntax highlighting for many languages (via [syntect](https://github.com/trishume/syntect))
 - Line-number gutter with current-line highlight
 - Cursor line/column in the status bar
@@ -33,6 +35,10 @@ cargo run --release -- path/to/project
 | Close tab  | Ctrl+W   |
 | Undo       | Ctrl+Z   |
 | Redo       | Ctrl+Y / Ctrl+Shift+Z |
+| Find       | Ctrl+F   |
+| Replace    | Ctrl+H   |
+| Find next / previous | F3 / Shift+F3 |
+| Go to line | Ctrl+G   |
 
 (Cmd instead of Ctrl on macOS.)
 
@@ -42,11 +48,13 @@ cargo run --release -- path/to/project
 src/
 ├── main.rs              # entry point, window setup
 ├── app.rs               # application state and UI layout
+├── find_bar.rs          # find/replace bar and go-to-line prompt
 ├── workspace.rs         # file tree / project explorer
 └── editor/
     ├── buffer.rs        # rope-backed text buffer, undo/redo history
     ├── document.rs      # open file buffer, load/save, dirty tracking
     ├── gutter.rs        # line-number gutter
+    ├── search.rs        # find/replace matching
     └── highlight.rs     # syntect → egui LayoutJob highlighting
 ```
 
@@ -54,7 +62,7 @@ src/
 
 - [x] Line-number gutter
 - [x] Rope-based buffer for large files, undo/redo history
-- [ ] Find / replace, go to line
+- [x] Find / replace, go to line
 - [ ] Command palette
 - [ ] Unsaved-changes prompt on close
 - [ ] Integrated terminal

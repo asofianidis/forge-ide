@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use egui::text::{CCursor, CCursorRange};
 use egui::{Key, KeyboardShortcut, Modifiers, TextStyle};
 
-use crate::editor::{Document, Highlighter, gutter};
+use crate::editor::{Document, Highlighter, gutter, search};
+use crate::find_bar::{FindAction, FindBar, GotoLine};
 use crate::workspace::{FileNode, Workspace};
 
 const SHORTCUT_NEW: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::N);
@@ -17,6 +18,18 @@ const SHORTCUT_UNDO: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND
 const SHORTCUT_REDO: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Y);
 const SHORTCUT_REDO_ALT: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::Z);
+const SHORTCUT_FIND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::F);
+const SHORTCUT_REPLACE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::H);
+const SHORTCUT_GOTO_LINE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::G);
+const SHORTCUT_FIND_NEXT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::F3);
+const SHORTCUT_FIND_PREV: KeyboardShortcut = KeyboardShortcut::new(Modifiers::SHIFT, Key::F3);
+
+/// A selection to apply to the active editor on the next frame.
+struct PendingSelection {
+    range: Range<usize>,
+    /// Move keyboard focus to the editor (false while typing in the find bar).
+    focus: bool,
+}
 
 pub struct ForgeApp {
     workspace: Option<Workspace>,
@@ -26,8 +39,12 @@ pub struct ForgeApp {
     status: String,
     /// 1-based (line, column) of the cursor in the active document.
     cursor: (usize, usize),
-    /// Char range to select (and scroll to) in the active editor on the next frame.
-    pending_selection: Option<Range<usize>>,
+    /// Current selection in the active document, as a char range (empty = caret).
+    selection: Range<usize>,
+    /// Selection to apply (and scroll to) in the active editor on the next frame.
+    pending_selection: Option<PendingSelection>,
+    find: FindBar,
+    goto_line: GotoLine,
 }
 
 impl ForgeApp {
@@ -40,7 +57,10 @@ impl ForgeApp {
             highlighter: Highlighter::default(),
             status: "Ready".to_owned(),
             cursor: (1, 1),
+            selection: 0..0,
             pending_selection: None,
+            find: FindBar::default(),
+            goto_line: GotoLine::default(),
         }
     }
 
@@ -103,7 +123,7 @@ impl ForgeApp {
     fn undo(&mut self) {
         if let Some(doc) = self.documents.get_mut(self.active) {
             if let Some(cursor) = doc.buffer.undo() {
-                self.pending_selection = Some(cursor..cursor);
+                self.select(cursor..cursor, true);
             } else {
                 self.status = "Nothing to undo".to_owned();
             }
@@ -113,10 +133,113 @@ impl ForgeApp {
     fn redo(&mut self) {
         if let Some(doc) = self.documents.get_mut(self.active) {
             if let Some(cursor) = doc.buffer.redo() {
-                self.pending_selection = Some(cursor..cursor);
+                self.select(cursor..cursor, true);
             } else {
                 self.status = "Nothing to redo".to_owned();
             }
+        }
+    }
+
+    fn select(&mut self, range: Range<usize>, focus: bool) {
+        self.pending_selection = Some(PendingSelection { range, focus });
+    }
+
+    fn open_find(&mut self, replace: bool) {
+        let seed = self.documents.get(self.active).and_then(|doc| {
+            let r = self.selection.clone();
+            (!r.is_empty()).then(|| {
+                egui::TextBuffer::char_range(&doc.buffer, r.start.into()..r.end.into()).to_owned()
+            })
+        });
+        self.find.show(replace, seed);
+    }
+
+    /// Moves to the next/previous match relative to the cursor.
+    fn find_step(&mut self, forward: bool) {
+        let Some(doc) = self.documents.get(self.active) else {
+            return;
+        };
+        if !self.find.open {
+            self.open_find(false);
+            return;
+        }
+        self.find.refresh(doc);
+        let matches = self.find.matches();
+        let idx = if forward {
+            search::next_match(matches, self.selection.end.max(self.selection.start + 1))
+        } else {
+            search::prev_match(matches, self.selection.start)
+        };
+        // Starting right on a match (e.g. just opened with a selection) should not skip it.
+        let idx = match (forward, self.find.current) {
+            (true, None) => search::next_match(matches, self.selection.start),
+            _ => idx,
+        };
+        if let Some(i) = idx {
+            let range = matches[i].clone();
+            self.find.current = Some(i);
+            self.select(range, false);
+        }
+    }
+
+    fn replace_current(&mut self) {
+        let Some(doc) = self.documents.get_mut(self.active) else {
+            return;
+        };
+        self.find.refresh(doc);
+        // Only replace when the current match is what's selected; otherwise just find it.
+        let current = self
+            .find
+            .current
+            .filter(|&i| self.find.matches().get(i) == Some(&self.selection));
+        let Some(i) = current else {
+            self.find_step(true);
+            return;
+        };
+        let edits = self.find.replacements(doc, [i]);
+        let placed = doc.buffer.replace_ranges(edits);
+        if let Some(r) = placed.first() {
+            self.selection = r.end..r.end;
+            self.find.current = None;
+            self.find.refresh(doc);
+            self.find_step(true);
+        }
+    }
+
+    fn replace_all(&mut self) {
+        let Some(doc) = self.documents.get_mut(self.active) else {
+            return;
+        };
+        self.find.refresh(doc);
+        let edits = self.find.replacements(doc, 0..self.find.matches().len());
+        let count = edits.len();
+        if count > 0 {
+            doc.buffer.replace_ranges(edits);
+        }
+        self.status = format!(
+            "Replaced {count} occurrence{}",
+            if count == 1 { "" } else { "s" }
+        );
+    }
+
+    fn handle_find_action(&mut self, action: FindAction) {
+        match action {
+            FindAction::Next => self.find_step(true),
+            FindAction::Prev => self.find_step(false),
+            FindAction::Replace => self.replace_current(),
+            FindAction::ReplaceAll => self.replace_all(),
+            FindAction::Close => {
+                self.find.close();
+                let sel = self.selection.clone();
+                self.select(sel, true);
+            }
+        }
+    }
+
+    fn goto(&mut self, line: usize, col: usize) {
+        if let Some(doc) = self.documents.get(self.active) {
+            let at = doc.buffer.char_at_line_col(line, col);
+            self.select(at..at, true);
         }
     }
 
@@ -160,6 +283,29 @@ impl ForgeApp {
         }
         if close {
             self.close_tab(self.active);
+        }
+
+        let (find, replace, goto, find_prev, find_next) = ctx.input_mut(|i| {
+            (
+                i.consume_shortcut(&SHORTCUT_FIND),
+                i.consume_shortcut(&SHORTCUT_REPLACE),
+                i.consume_shortcut(&SHORTCUT_GOTO_LINE),
+                // Shift+F3 first: the plain F3 shortcut would also match it.
+                i.consume_shortcut(&SHORTCUT_FIND_PREV),
+                i.consume_shortcut(&SHORTCUT_FIND_NEXT),
+            )
+        });
+        if find || replace {
+            self.open_find(replace);
+        }
+        if goto {
+            self.goto_line.show();
+        }
+        if find_next {
+            self.find_step(true);
+        }
+        if find_prev {
+            self.find_step(false);
         }
 
         if self.editor_has_keyboard(ctx) {
@@ -256,6 +402,23 @@ impl ForgeApp {
                 {
                     self.redo();
                 }
+                ui.separator();
+                if menu_item(ui, "Find…", &SHORTCUT_FIND) {
+                    self.open_find(false);
+                }
+                if menu_item(ui, "Replace…", &SHORTCUT_REPLACE) {
+                    self.open_find(true);
+                }
+                if menu_item(ui, "Find Next", &SHORTCUT_FIND_NEXT) {
+                    self.find_step(true);
+                }
+                if menu_item(ui, "Find Previous", &SHORTCUT_FIND_PREV) {
+                    self.find_step(false);
+                }
+                ui.separator();
+                if menu_item(ui, "Go to Line…", &SHORTCUT_GOTO_LINE) {
+                    self.goto_line.show();
+                }
             });
         });
     }
@@ -336,16 +499,21 @@ impl ForgeApp {
         };
 
         // Apply a programmatic selection (undo/redo, find, go to line) before rendering.
-        let reveal = self.pending_selection.take().map(|range| {
+        let reveal = self.pending_selection.take().map(|pending| {
+            let range = pending.range;
             let mut state = egui::TextEdit::load_state(ui.ctx(), doc.id).unwrap_or_default();
             state.cursor.set_char_range(Some(CCursorRange::two(
                 CCursor::new(range.start),
                 CCursor::new(range.end),
             )));
             egui::TextEdit::store_state(ui.ctx(), doc.id, state);
-            ui.memory_mut(|m| m.request_focus(doc.id));
+            if pending.focus {
+                ui.memory_mut(|m| m.request_focus(doc.id));
+            }
             CCursor::new(range.end)
         });
+        let find = &self.find;
+        let matches = if find.open { find.matches() } else { &[] };
 
         let mut output = egui::ScrollArea::both()
             .id_salt("editor_scroll")
@@ -366,6 +534,7 @@ impl ForgeApp {
                     .layouter(&mut layouter)
                     .show(ui);
                 gutter::paint(ui, &output, current_line, &font);
+                paint_matches(ui, &output, matches, find.current);
                 if let Some(cursor) = reveal {
                     let rect = output
                         .galley
@@ -381,8 +550,79 @@ impl ForgeApp {
         output.state.clear_undoer();
 
         if let Some(range) = output.cursor_range {
+            let [start, end] = range.sorted_cursors();
+            self.selection = start.index.into()..end.index.into();
             self.cursor = doc.line_col(range.primary.index.into());
         }
+    }
+
+    /// Find bar above the editor; jumps to the first match as the query is typed.
+    fn find_bar(&mut self, ui: &mut egui::Ui) {
+        if !self.find.open {
+            return;
+        }
+        if let Some(action) = self.find.ui(ui) {
+            self.handle_find_action(action);
+        }
+        let Some(doc) = self.documents.get(self.active) else {
+            return;
+        };
+        if self.find.refresh(doc)
+            && let Some(i) = search::next_match(self.find.matches(), self.selection.start)
+        {
+            self.find.current = Some(i);
+            let range = self.find.matches()[i].clone();
+            self.select(range, false);
+        }
+        ui.separator();
+    }
+}
+
+/// A menu button with a shortcut hint. Returns true when clicked.
+fn menu_item(ui: &mut egui::Ui, label: &str, shortcut: &KeyboardShortcut) -> bool {
+    let hint = ui.ctx().format_shortcut(shortcut);
+    ui.add(egui::Button::new(label).shortcut_text(hint))
+        .clicked()
+}
+
+/// Highlights search matches inside the visible part of the editor.
+fn paint_matches(
+    ui: &egui::Ui,
+    output: &egui::text_edit::TextEditOutput,
+    matches: &[Range<usize>],
+    current: Option<usize>,
+) {
+    if matches.is_empty() {
+        return;
+    }
+    let clip = ui.clip_rect();
+    let galley_pos = output.galley_pos;
+    let origin = galley_pos.to_vec2();
+    let galley = &output.galley;
+    let first = galley.cursor_from_pos(clip.min - galley_pos).index.0;
+    let last = galley.cursor_from_pos(clip.max - galley_pos).index.0;
+    let start = matches.partition_point(|m| m.end < first);
+    let accent = ui.visuals().selection.bg_fill;
+    for (i, m) in matches.iter().enumerate().skip(start) {
+        if m.start > last {
+            break;
+        }
+        let a = galley
+            .pos_from_cursor(CCursor::new(m.start))
+            .translate(origin);
+        let b = galley
+            .pos_from_cursor(CCursor::new(m.end))
+            .translate(origin);
+        // Multi-line matches are marked on their first line only.
+        let right = if (a.top() - b.top()).abs() < 1.0 {
+            b.left()
+        } else {
+            a.left() + 8.0
+        };
+        let rect = egui::Rect::from_min_max(a.left_top(), egui::pos2(right, a.bottom()));
+        let alpha = if Some(i) == current { 160 } else { 70 };
+        ui.painter()
+            .rect_filled(rect, 2.0, accent.gamma_multiply_u8(alpha));
     }
 }
 
@@ -425,7 +665,16 @@ impl eframe::App for ForgeApp {
             .show(ui, |ui| {
                 self.tab_bar(ui);
                 ui.separator();
+                self.find_bar(ui);
                 self.editor(ui);
             });
+
+        let line_count = self
+            .documents
+            .get(self.active)
+            .map_or(1, Document::line_count);
+        if let Some((line, col)) = self.goto_line.ui(ui.ctx(), line_count) {
+            self.goto(line, col);
+        }
     }
 }
