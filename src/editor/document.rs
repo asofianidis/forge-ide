@@ -6,12 +6,30 @@ use egui::TextBuffer as _;
 
 use super::Buffer;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Severity {
+    Error,
+    Warning,
+    Info,
+    Hint,
+}
+
+/// A problem reported by a language server, positioned in the buffer.
+#[derive(Clone, Debug)]
+pub struct Diagnostic {
+    /// Char range in the buffer as of when it was reported.
+    pub range: std::ops::Range<usize>,
+    pub severity: Severity,
+    pub message: String,
+}
+
 /// A single open file (or unsaved scratch buffer).
 pub struct Document {
     /// Stable identity for this document's editor widget state.
     pub id: egui::Id,
     pub path: Option<PathBuf>,
     pub buffer: Buffer,
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 fn next_id() -> egui::Id {
@@ -25,6 +43,7 @@ impl Document {
             id: next_id(),
             path: None,
             buffer: Buffer::default(),
+            diagnostics: Vec::new(),
         }
     }
 
@@ -35,6 +54,7 @@ impl Document {
             id: next_id(),
             path: Some(path.to_path_buf()),
             buffer: Buffer::from(text.as_str()),
+            diagnostics: Vec::new(),
         })
     }
 

@@ -41,6 +41,11 @@ pub enum Command {
     ResetFontSize,
     ToggleTerminal,
     RestartTerminal,
+    TriggerCompletion,
+    GoToDefinition,
+    NextProblem,
+    PreviousProblem,
+    RestartLanguageServers,
 }
 
 impl Command {
@@ -62,6 +67,11 @@ impl Command {
         Command::FindNext,
         Command::FindPrevious,
         Command::GoToLine,
+        Command::GoToDefinition,
+        Command::NextProblem,
+        Command::PreviousProblem,
+        Command::TriggerCompletion,
+        Command::RestartLanguageServers,
         Command::ToggleWordWrap,
         Command::ToggleLineNumbers,
         Command::IncreaseFontSize,
@@ -103,6 +113,11 @@ impl Command {
             Command::ResetFontSize => "View: Reset Font Size",
             Command::ToggleTerminal => "Terminal: Toggle Terminal",
             Command::RestartTerminal => "Terminal: Restart Shell",
+            Command::TriggerCompletion => "Edit: Trigger Completion",
+            Command::GoToDefinition => "Go: Go to Definition",
+            Command::NextProblem => "Go: Next Problem",
+            Command::PreviousProblem => "Go: Previous Problem",
+            Command::RestartLanguageServers => "Language: Restart Language Servers",
         }
     }
 
@@ -140,6 +155,11 @@ impl Command {
             Command::ResetFontSize => shortcut(CMD, Key::Num0),
             Command::ToggleTerminal => shortcut(Modifiers::CTRL, Key::Backtick),
             Command::RestartTerminal => None,
+            Command::TriggerCompletion => shortcut(Modifiers::CTRL, Key::Space),
+            Command::GoToDefinition => shortcut(Modifiers::NONE, Key::F12),
+            Command::NextProblem => shortcut(Modifiers::NONE, Key::F8),
+            Command::PreviousProblem => shortcut(Modifiers::SHIFT, Key::F8),
+            Command::RestartLanguageServers => None,
         }
     }
 

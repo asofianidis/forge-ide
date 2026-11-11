@@ -12,6 +12,8 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
 - Find / replace with match-case and regex options (`$1` capture groups in replacements)
 - Go to line[:column]
 - Command palette with fuzzy matching over every command
+- Language server support: diagnostics, completion and go to definition
+  (rust-analyzer, clangd, gopls, pylsp and typescript-language-server out of the box)
 - Integrated terminal (Ctrl+`) running your shell in a pseudo-terminal, with colors and scrollback
 - Settings (Ctrl+,): color theme (all bundled syntect themes; the UI follows light/dark), font size, word wrap, line numbers
 - Syntax highlighting for many languages (via [syntect](https://github.com/trishume/syntect))
@@ -49,6 +51,9 @@ cargo run --release -- path/to/project
 | Font size bigger / smaller / reset | Ctrl+= / Ctrl+- / Ctrl+0 |
 | Toggle word wrap | Alt+Z |
 | Toggle terminal | Ctrl+` |
+| Trigger completion | Ctrl+Space |
+| Go to definition | F12 |
+| Next / previous problem | F8 / Shift+F8 |
 | Quit       | Ctrl+Q   |
 
 (Cmd instead of Ctrl on macOS.)
@@ -67,7 +72,30 @@ font_size = 14.0
 word_wrap = false
 line_numbers = true
 terminal_shell = "pwsh -NoLogo"  # optional; defaults to PowerShell on Windows, $SHELL elsewhere
+
+# Language servers by file extension, overriding the built-in defaults.
+# An empty command disables language support for that extension.
+[language_servers.py]
+command = "pyright-langserver"
+args = ["--stdio"]
 ```
+
+### Language servers
+
+Forge starts a language server the first time you open a file it handles; the server must be
+on your `PATH`. Built-in defaults:
+
+| Extensions | Server |
+|------------|--------|
+| `rs` | `rust-analyzer` (`rustup component add rust-analyzer`) |
+| `c`, `h`, `cpp`, `cc`, `hpp`, … | `clangd` |
+| `go` | `gopls` |
+| `py` | `pylsp` |
+| `js`, `jsx`, `ts`, `tsx`, … | `typescript-language-server --stdio` |
+
+Diagnostics are underlined in the editor (hover for the message) and counted in the status bar.
+Completion opens on Ctrl+Space or after the server's trigger characters (such as `.`).
+**Language: Restart Language Servers** in the command palette restarts them.
 
 ## Project layout
 
@@ -75,8 +103,11 @@ terminal_shell = "pwsh -NoLogo"  # optional; defaults to PowerShell on Windows, 
 src/
 ├── main.rs              # entry point, window setup
 ├── app.rs               # application state and UI layout
+├── app/language.rs      # diagnostics, completion and go-to-definition UI
 ├── commands.rs          # command list: labels, shortcuts (shared by menus and palette)
+├── completion.rs        # completion popup and edit application
 ├── find_bar.rs          # find/replace bar and go-to-line prompt
+├── lsp/                 # language server client (transport, protocol, conversions)
 ├── palette.rs           # command palette and fuzzy matcher
 ├── settings.rs          # persisted user settings
 ├── terminal.rs          # integrated terminal (PTY + vt100 screen)
@@ -97,7 +128,7 @@ src/
 - [x] Command palette
 - [x] Unsaved-changes prompt on close
 - [x] Integrated terminal
-- [ ] LSP client (diagnostics, completion, go to definition)
+- [x] LSP client (diagnostics, completion, go to definition)
 - [x] Settings and themes
 
 ## License

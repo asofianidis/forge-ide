@@ -7,5 +7,5 @@ mod highlight;
 pub mod search;
 
 pub use buffer::Buffer;
-pub use document::Document;
+pub use document::{Diagnostic, Document, Severity};
 pub use highlight::Highlighter;
