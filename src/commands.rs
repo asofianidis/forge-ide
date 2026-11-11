@@ -31,6 +31,9 @@ pub enum Command {
     NextTab,
     PreviousTab,
     ShowPalette,
+    ReloadThemes,
+    OpenThemesFolder,
+    CheckForUpdates,
 }
 
 impl Command {
@@ -52,6 +55,9 @@ impl Command {
         Command::FindNext,
         Command::FindPrevious,
         Command::GoToLine,
+        Command::ReloadThemes,
+        Command::OpenThemesFolder,
+        Command::CheckForUpdates,
         Command::Quit,
     ];
 
@@ -75,6 +81,9 @@ impl Command {
             Command::NextTab => "View: Next Tab",
             Command::PreviousTab => "View: Previous Tab",
             Command::ShowPalette => "View: Command Palette",
+            Command::ReloadThemes => "View: Reload Themes",
+            Command::OpenThemesFolder => "View: Open Themes Folder",
+            Command::CheckForUpdates => "Help: Check for Updates",
         }
     }
 
@@ -103,6 +112,7 @@ impl Command {
             Command::NextTab => shortcut(Modifiers::CTRL, Key::Tab),
             Command::PreviousTab => shortcut(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::Tab),
             Command::ShowPalette => shortcut(CMD_SHIFT, Key::P),
+            Command::ReloadThemes | Command::OpenThemesFolder | Command::CheckForUpdates => None,
         }
     }
 
