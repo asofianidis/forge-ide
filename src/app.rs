@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use egui::{Key, KeyboardShortcut, Modifiers, TextStyle};
 
 use crate::editor::{Document, Highlighter};
-use crate::theme::{self, Settings, Theme};
+use crate::settings::Settings;
+use crate::theme::{self, Theme};
+use crate::updater::{self, UpdateState, Updater};
 use crate::workspace::{FileNode, Workspace};
 
 const SHORTCUT_NEW: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::N);
@@ -24,15 +26,29 @@ pub struct ForgeApp {
     status: String,
     /// 1-based (line, column) of the cursor in the active document.
     cursor: (usize, usize),
+    settings: Settings,
+    updater: Updater,
+    /// Update state seen last frame, to report transitions in the status bar.
+    last_update_state: UpdateState,
+    /// The current check was started from the menu, so "up to date" and
+    /// errors are worth reporting.
+    manual_update_check: bool,
 }
 
 impl ForgeApp {
     pub fn new(cc: &eframe::CreationContext<'_>, root: Option<PathBuf>) -> Self {
+        let settings = Settings::load();
         let (themes, errors) = theme::load_all(theme::themes_dir().as_deref());
-        let wanted = Settings::load()
+        let wanted = settings
             .theme
+            .clone()
             .unwrap_or_else(|| theme::DEFAULT_THEME.to_owned());
         let idx = themes.iter().position(|t| t.name == wanted).unwrap_or(0);
+
+        let updater = Updater::default();
+        if settings.auto_update.unwrap_or(updater::IS_RELEASE_BUILD) {
+            updater.check(&cc.egui_ctx);
+        }
 
         cc.egui_ctx.all_styles_mut(|style| {
             style.spacing.item_spacing = egui::vec2(8.0, 6.0);
@@ -50,6 +66,105 @@ impl ForgeApp {
             themes,
             status: theme_errors_status(&errors).unwrap_or_else(|| "Ready".to_owned()),
             cursor: (1, 1),
+            settings,
+            updater,
+            last_update_state: UpdateState::Idle,
+            manual_update_check: false,
+        }
+    }
+
+    fn save_settings(&mut self) {
+        if let Err(e) = self.settings.save() {
+            self.status = format!("Could not save settings: {e:#}");
+        }
+    }
+
+    // ---- updates -------------------------------------------------------
+
+    fn check_for_updates(&mut self, ctx: &egui::Context) {
+        self.manual_update_check = true;
+        self.status = "Checking for updates…".to_owned();
+        self.updater.check(ctx);
+    }
+
+    fn has_unsaved_changes(&self) -> bool {
+        self.documents.iter().any(Document::is_dirty)
+    }
+
+    /// Reports update state changes in the status bar.
+    fn poll_updater(&mut self) {
+        let state = self.updater.state();
+        if state == self.last_update_state {
+            return;
+        }
+        match &state {
+            UpdateState::UpToDate if self.manual_update_check => {
+                self.status = format!("Forge IDE {} is up to date", updater::VERSION);
+            }
+            UpdateState::Available(v) => {
+                self.status = format!("Forge IDE {v} is available");
+            }
+            UpdateState::Installed(v) => {
+                self.status = format!("Forge IDE {v} installed. Restart to use it.");
+            }
+            // Failed background checks (e.g. offline) stay quiet; failed
+            // installs and manual checks are reported.
+            UpdateState::Failed(msg)
+                if self.manual_update_check
+                    || matches!(self.last_update_state, UpdateState::Installing(_)) =>
+            {
+                self.status = msg.clone();
+            }
+            _ => {}
+        }
+        if !matches!(state, UpdateState::Checking) {
+            self.manual_update_check = false;
+        }
+        self.last_update_state = state;
+    }
+
+    /// Update indicator on the right side of the status bar.
+    fn update_indicator(&mut self, ui: &mut egui::Ui) {
+        let accent = self.current_theme().ui.accent.0;
+        let accent_text = self.current_theme().ui.accent_text.0;
+        let accent_button = |text: String| {
+            egui::Button::new(egui::RichText::new(text).color(accent_text))
+                .fill(accent)
+                .small()
+        };
+        match self.updater.state() {
+            UpdateState::Available(v) => {
+                if ui
+                    .add(accent_button(format!("Update to {v}")))
+                    .on_hover_text(format!("You have {}", updater::VERSION))
+                    .clicked()
+                {
+                    self.updater.install(ui.ctx());
+                }
+                ui.separator();
+            }
+            UpdateState::Installing(progress) => {
+                let text = match progress {
+                    Some(p) => format!("Updating… {:.0}%", p * 100.0),
+                    None => "Updating…".to_owned(),
+                };
+                ui.label(text);
+                ui.spinner();
+                ui.separator();
+            }
+            UpdateState::Installed(_) => {
+                let unsaved = self.has_unsaved_changes();
+                let response = ui
+                    .add_enabled(!unsaved, accent_button("Restart to update".to_owned()))
+                    .on_disabled_hover_text("Save your changes first");
+                if response.clicked()
+                    && let Err(e) = updater::restart()
+                {
+                    self.status = format!("Could not restart: {e:#}");
+                }
+                ui.separator();
+            }
+            _ => {}
         }
     }
 
@@ -64,13 +179,9 @@ impl ForgeApp {
         let theme = &self.themes[idx];
         theme.apply(ctx);
         self.highlighter.set_theme(theme.syntect_theme());
-        let settings = Settings {
-            theme: Some(theme.name.clone()),
-        };
-        self.status = match settings.save() {
-            Ok(()) => format!("Theme: {}", theme.name),
-            Err(e) => format!("Theme: {} (could not save setting: {e:#})", theme.name),
-        };
+        self.status = format!("Theme: {}", theme.name);
+        self.settings.theme = Some(theme.name.clone());
+        self.save_settings();
     }
 
     fn reload_themes(&mut self, ctx: &egui::Context) {
@@ -272,6 +383,31 @@ impl ForgeApp {
                     }
                 });
             });
+            ui.menu_button("Help", |ui| {
+                let busy = matches!(
+                    self.updater.state(),
+                    UpdateState::Checking | UpdateState::Installing(_)
+                );
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Check for Updates"))
+                    .clicked()
+                {
+                    self.check_for_updates(ui.ctx());
+                }
+                let mut auto = self
+                    .settings
+                    .auto_update
+                    .unwrap_or(updater::IS_RELEASE_BUILD);
+                if ui
+                    .checkbox(&mut auto, "Check for Updates on Startup")
+                    .changed()
+                {
+                    self.settings.auto_update = Some(auto);
+                    self.save_settings();
+                }
+                ui.separator();
+                ui.label(format!("Forge IDE {}", updater::VERSION));
+            });
         });
     }
 
@@ -299,10 +435,11 @@ impl ForgeApp {
         }
     }
 
-    fn status_bar(&self, ui: &mut egui::Ui) {
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(&self.status);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.update_indicator(ui);
                 if let Some(doc) = self.documents.get(self.active) {
                     ui.label(doc.extension());
                     ui.separator();
@@ -449,6 +586,7 @@ fn file_tree(ui: &mut egui::Ui, node: &mut FileNode, is_root: bool, clicked: &mu
 impl eframe::App for ForgeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.handle_shortcuts(&ui.ctx().clone());
+        self.poll_updater();
 
         let panel_frame =
             egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin::symmetric(10, 6));
