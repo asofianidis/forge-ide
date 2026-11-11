@@ -1,12 +1,11 @@
-//! User settings, persisted as TOML in the platform config directory.
+//! User settings, persisted as TOML in `<config dir>/forge-ide/settings.toml`.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
-/// Syntax theme used when none is configured (or the configured one is unknown).
-pub const DEFAULT_THEME: &str = "base16-ocean.dark";
+use crate::theme::{self, config_dir};
 
 pub const MIN_FONT_SIZE: f32 = 8.0;
 pub const MAX_FONT_SIZE: f32 = 32.0;
@@ -14,7 +13,7 @@ pub const MAX_FONT_SIZE: f32 = 32.0;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
 pub struct Settings {
-    /// Syntax highlighting theme; the UI switches to light or dark to match it.
+    /// Name of the selected theme (built-in or custom, see [`crate::theme`]).
     pub theme: String,
     /// Editor font size in points.
     pub font_size: f32,
@@ -24,16 +23,19 @@ pub struct Settings {
     /// Defaults to PowerShell on Windows and `$SHELL` elsewhere.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_shell: Option<String>,
+    /// Check for updates on startup. Defaults to on for release builds.
+    pub auto_update: Option<bool>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            theme: DEFAULT_THEME.to_owned(),
+            theme: theme::DEFAULT_THEME.to_owned(),
             font_size: 14.0,
             word_wrap: false,
             line_numbers: true,
             terminal_shell: None,
+            auto_update: None,
         }
     }
 }
@@ -45,7 +47,7 @@ impl Settings {
         if let Some(path) = std::env::var_os("FORGE_SETTINGS").filter(|p| !p.is_empty()) {
             return Some(PathBuf::from(path));
         }
-        dirs::config_dir().map(|d| d.join("forge-ide").join("settings.toml"))
+        config_dir().map(|d| d.join("settings.toml"))
     }
 
     /// Loads settings from `path`. A missing file yields the defaults.
@@ -65,7 +67,12 @@ impl Settings {
     }
 
     /// Editor controls for the settings window. Returns true if anything changed.
-    pub fn ui(&mut self, ui: &mut egui::Ui, theme_names: &[String]) -> bool {
+    pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        theme_names: &[String],
+        auto_update_default: bool,
+    ) -> bool {
         let before = self.clone();
         egui::Grid::new("settings_grid")
             .num_columns(2)
@@ -113,6 +120,13 @@ impl Settings {
                     self.terminal_shell = Some(shell).filter(|s| !s.trim().is_empty());
                 }
                 ui.end_row();
+
+                ui.label("Check for updates on startup");
+                let mut auto = self.auto_update.unwrap_or(auto_update_default);
+                if ui.checkbox(&mut auto, "").changed() {
+                    self.auto_update = Some(auto);
+                }
+                ui.end_row();
             });
         *self != before
     }
@@ -133,23 +147,36 @@ mod tests {
 
     #[test]
     fn round_trips_through_toml() {
-        let settings = Settings {
-            theme: "InspiredGitHub".into(),
-            font_size: 16.0,
-            word_wrap: true,
-            line_numbers: false,
-            terminal_shell: Some("bash --login".into()),
-        };
-        let text = toml::to_string_pretty(&settings).unwrap();
-        assert_eq!(Settings::parse(&text).unwrap(), settings);
+        for auto_update in [None, Some(false)] {
+            let settings = Settings {
+                theme: "Blossom Light".into(),
+                font_size: 16.0,
+                word_wrap: true,
+                line_numbers: false,
+                auto_update,
+                terminal_shell: Some("bash --login".into()),
+            };
+            let text = toml::to_string_pretty(&settings).unwrap();
+            assert_eq!(Settings::parse(&text).unwrap(), settings);
+        }
     }
 
     #[test]
     fn missing_fields_use_defaults() {
         let settings = Settings::parse("word_wrap = true").unwrap();
         assert!(settings.word_wrap);
-        assert_eq!(settings.theme, DEFAULT_THEME);
+        assert_eq!(settings.theme, theme::DEFAULT_THEME);
         assert!(settings.line_numbers);
+        assert_eq!(settings.auto_update, None);
+        assert_eq!(Settings::parse("").unwrap(), Settings::default());
+    }
+
+    #[test]
+    fn reads_files_written_before_editor_settings() {
+        let settings = Settings::parse("theme = \"Blossom Light\"\nauto_update = false").unwrap();
+        assert_eq!(settings.theme, "Blossom Light");
+        assert_eq!(settings.auto_update, Some(false));
+        assert_eq!(settings.font_size, Settings::default().font_size);
     }
 
     #[test]

@@ -7,6 +7,8 @@ mod find_bar;
 mod palette;
 mod settings;
 mod terminal;
+mod theme;
+mod updater;
 mod workspace;
 
 use app::ForgeApp;

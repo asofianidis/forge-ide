@@ -41,6 +41,9 @@ pub enum Command {
     ResetFontSize,
     ToggleTerminal,
     RestartTerminal,
+    ReloadThemes,
+    OpenThemesFolder,
+    CheckForUpdates,
 }
 
 impl Command {
@@ -71,6 +74,9 @@ impl Command {
         Command::RestartTerminal,
         Command::OpenSettings,
         Command::OpenSettingsFile,
+        Command::ReloadThemes,
+        Command::OpenThemesFolder,
+        Command::CheckForUpdates,
         Command::Quit,
     ];
 
@@ -103,6 +109,9 @@ impl Command {
             Command::ResetFontSize => "View: Reset Font Size",
             Command::ToggleTerminal => "Terminal: Toggle Terminal",
             Command::RestartTerminal => "Terminal: Restart Shell",
+            Command::ReloadThemes => "View: Reload Themes",
+            Command::OpenThemesFolder => "View: Open Themes Folder",
+            Command::CheckForUpdates => "Help: Check for Updates",
         }
     }
 
@@ -140,6 +149,7 @@ impl Command {
             Command::ResetFontSize => shortcut(CMD, Key::Num0),
             Command::ToggleTerminal => shortcut(Modifiers::CTRL, Key::Backtick),
             Command::RestartTerminal => None,
+            Command::ReloadThemes | Command::OpenThemesFolder | Command::CheckForUpdates => None,
         }
     }
 
