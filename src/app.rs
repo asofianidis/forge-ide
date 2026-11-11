@@ -214,24 +214,26 @@ impl ForgeApp {
 
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
         let mut to_close = None;
-        egui::ScrollArea::horizontal().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                for (idx, doc) in self.documents.iter().enumerate() {
-                    let label = if doc.is_dirty() {
-                        format!("● {}", doc.title())
-                    } else {
-                        doc.title()
-                    };
-                    if ui.selectable_label(idx == self.active, label).clicked() {
-                        self.active = idx;
+        egui::ScrollArea::horizontal()
+            .id_salt("tab_bar")
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (idx, doc) in self.documents.iter().enumerate() {
+                        let label = if doc.is_dirty() {
+                            format!("● {}", doc.title())
+                        } else {
+                            doc.title()
+                        };
+                        if ui.selectable_label(idx == self.active, label).clicked() {
+                            self.active = idx;
+                        }
+                        if ui.small_button("×").clicked() {
+                            to_close = Some(idx);
+                        }
+                        ui.separator();
                     }
-                    if ui.small_button("×").clicked() {
-                        to_close = Some(idx);
-                    }
-                    ui.separator();
-                }
+                });
             });
-        });
         if let Some(idx) = to_close {
             self.close_tab(idx);
         }
@@ -255,6 +257,7 @@ impl ForgeApp {
         };
 
         let output = egui::ScrollArea::both()
+            .id_salt("editor_scroll")
             .auto_shrink(false)
             .show(ui, |ui| {
                 let output = egui::TextEdit::multiline(&mut doc.text)
