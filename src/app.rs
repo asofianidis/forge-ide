@@ -10,7 +10,7 @@ use crate::commands::Command;
 use crate::editor::{Document, Highlighter, gutter, search};
 use crate::find_bar::{FindAction, FindBar, GotoLine};
 use crate::palette::Palette;
-use crate::settings::Settings;
+use crate::settings::{self, Settings};
 use crate::theme::{self, Theme};
 use crate::updater::{self, UpdateState, Updater};
 use crate::workspace::{FileNode, Workspace};
@@ -60,6 +60,11 @@ pub struct ForgeApp {
     /// Set once the user has resolved unsaved changes, so the next close request goes through.
     allow_window_close: bool,
     settings: Settings,
+    /// Where settings are persisted; `None` if the platform has no config dir.
+    settings_path: Option<PathBuf>,
+    settings_open: bool,
+    /// The settings file was saved from the editor; reload it next frame.
+    settings_reload_pending: bool,
     updater: Updater,
     /// Update state seen last frame, to report transitions in the status bar.
     last_update_state: UpdateState,
@@ -70,32 +75,21 @@ pub struct ForgeApp {
 
 impl ForgeApp {
     pub fn new(cc: &eframe::CreationContext<'_>, root: Option<PathBuf>) -> Self {
-        let settings = Settings::load();
-        let (themes, errors) = theme::load_all(theme::themes_dir().as_deref());
-        let wanted = settings
-            .theme
-            .clone()
-            .unwrap_or_else(|| theme::DEFAULT_THEME.to_owned());
-        let idx = themes.iter().position(|t| t.name == wanted).unwrap_or(0);
-
-        let updater = Updater::default();
-        if settings.auto_update.unwrap_or(updater::IS_RELEASE_BUILD) {
-            updater.check(&cc.egui_ctx);
-        }
-
+        // Ctrl+=/Ctrl+- change the editor font size instead of zooming the whole UI.
+        cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         cc.egui_ctx.all_styles_mut(|style| {
             style.spacing.item_spacing = egui::vec2(8.0, 6.0);
             style.spacing.button_padding = egui::vec2(10.0, 4.0);
             style.spacing.menu_margin = egui::Margin::same(8);
         });
-        themes[idx].apply(&cc.egui_ctx);
 
-        Self {
+        let (themes, errors) = theme::load_all(theme::themes_dir().as_deref());
+        let mut app = Self {
             workspace: root.filter(|p| p.is_dir()).map(Workspace::open),
             documents: vec![Document::untitled()],
             active: 0,
-            highlighter: Highlighter::new(themes[idx].syntect_theme()),
-            theme: idx,
+            highlighter: Highlighter::new(themes[0].syntect_theme()),
+            theme: 0,
             themes,
             status: theme_errors_status(&errors).unwrap_or_else(|| "Ready".to_owned()),
             cursor: (1, 1),
@@ -106,16 +100,139 @@ impl ForgeApp {
             palette: Palette::default(),
             pending_close: None,
             allow_window_close: false,
-            settings,
-            updater,
+            settings: Settings::default(),
+            settings_path: Settings::default_path(),
+            settings_open: false,
+            settings_reload_pending: false,
+            updater: Updater::default(),
             last_update_state: UpdateState::Idle,
             manual_update_check: false,
+        };
+        app.reload_settings(&cc.egui_ctx);
+        if app
+            .settings
+            .auto_update
+            .unwrap_or(updater::IS_RELEASE_BUILD)
+        {
+            app.updater.check(&cc.egui_ctx);
         }
+        app
+    }
+
+    // ---- settings ------------------------------------------------------
+
+    /// (Re)loads settings from disk and applies them.
+    fn reload_settings(&mut self, ctx: &egui::Context) {
+        if let Some(path) = &self.settings_path {
+            match Settings::load(path) {
+                Ok(s) => self.settings = s,
+                Err(e) => self.status = format!("Error: {e:#}"),
+            }
+        }
+        self.apply_settings(ctx);
+    }
+
+    /// Applies the current settings to the theme and egui style.
+    fn apply_settings(&mut self, ctx: &egui::Context) {
+        match self
+            .themes
+            .iter()
+            .position(|t| t.name == self.settings.theme)
+        {
+            Some(idx) => self.activate_theme(ctx, idx),
+            None => {
+                // Keep the unknown name in the settings so a custom theme that
+                // failed to load isn't forgotten; fall back for this session.
+                self.activate_theme(ctx, self.theme);
+                self.status = format!(
+                    "Unknown theme \"{}\", using {}",
+                    self.settings.theme,
+                    self.current_theme().name
+                );
+            }
+        }
+        let font_size = self.settings.font_size;
+        ctx.all_styles_mut(|style| {
+            if let Some(font) = style.text_styles.get_mut(&TextStyle::Monospace) {
+                font.size = font_size;
+            }
+        });
     }
 
     fn save_settings(&mut self) {
-        if let Err(e) = self.settings.save() {
+        if let Some(path) = &self.settings_path
+            && let Err(e) = self.settings.save(path)
+        {
             self.status = format!("Could not save settings: {e:#}");
+        }
+    }
+
+    /// Applies and persists changed settings.
+    fn settings_changed(&mut self, ctx: &egui::Context) {
+        self.apply_settings(ctx);
+        self.save_settings();
+    }
+
+    fn change_font_size(&mut self, ctx: &egui::Context, delta: f32) {
+        let size = if delta == 0.0 {
+            Settings::default().font_size
+        } else {
+            self.settings.font_size + delta
+        };
+        self.settings.font_size = size.clamp(settings::MIN_FONT_SIZE, settings::MAX_FONT_SIZE);
+        self.settings_changed(ctx);
+    }
+
+    /// Opens the settings file in an editor tab, creating it with defaults if needed.
+    fn open_settings_file(&mut self) {
+        let Some(path) = self.settings_path.clone() else {
+            self.status = "No config directory available on this platform".to_owned();
+            return;
+        };
+        if !path.exists()
+            && let Err(e) = self.settings.save(&path)
+        {
+            self.status = format!("Error: {e:#}");
+            return;
+        }
+        self.open_file(&path);
+    }
+
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.settings_open;
+        let theme_names: Vec<String> = self.themes.iter().map(|t| t.name.clone()).collect();
+        let mut changed = false;
+        let mut open_file = false;
+        egui::Window::new("Settings")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(380.0)
+            .show(ctx, |ui| {
+                ui.set_max_width(380.0);
+                changed = self
+                    .settings
+                    .ui(ui, &theme_names, updater::IS_RELEASE_BUILD);
+                ui.separator();
+                if let Some(path) = &self.settings_path {
+                    ui.horizontal(|ui| {
+                        open_file = ui.small_button("Edit as TOML").clicked();
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(path.display().to_string()).weak(),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(path.display().to_string());
+                    });
+                }
+            });
+        self.settings_open = open && !ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        if changed {
+            self.settings_changed(ctx);
+        }
+        if open_file {
+            self.open_settings_file();
         }
     }
 
@@ -214,24 +331,38 @@ impl ForgeApp {
 
     // ---- themes --------------------------------------------------------
 
-    fn set_theme(&mut self, ctx: &egui::Context, idx: usize) {
+    /// Makes `themes[idx]` the active theme for the UI and the highlighter.
+    fn activate_theme(&mut self, ctx: &egui::Context, idx: usize) {
         self.theme = idx;
         let theme = &self.themes[idx];
+        // Follow the color theme rather than the OS light/dark preference.
+        ctx.set_theme(if theme.dark {
+            egui::Theme::Dark
+        } else {
+            egui::Theme::Light
+        });
         theme.apply(ctx);
         self.highlighter.set_theme(theme.syntect_theme());
-        self.status = format!("Theme: {}", theme.name);
-        self.settings.theme = Some(theme.name.clone());
-        self.save_settings();
+    }
+
+    /// Switches to `themes[idx]` and remembers the choice.
+    fn set_theme(&mut self, ctx: &egui::Context, idx: usize) {
+        self.settings.theme = self.themes[idx].name.clone();
+        self.settings_changed(ctx);
+        self.status = format!("Theme: {}", self.current_theme().name);
     }
 
     fn reload_themes(&mut self, ctx: &egui::Context) {
-        let name = self.current_theme().name.clone();
+        let current = self.current_theme().name.clone();
         let (themes, errors) = theme::load_all(theme::themes_dir().as_deref());
         self.themes = themes;
-        self.theme = self.themes.iter().position(|t| t.name == name).unwrap_or(0);
-        let theme = &self.themes[self.theme];
-        theme.apply(ctx);
-        self.highlighter.set_theme(theme.syntect_theme());
+        self.theme = self
+            .themes
+            .iter()
+            .position(|t| t.name == current)
+            .unwrap_or(0);
+        // Also picks up a configured theme that previously failed to load.
+        self.apply_settings(ctx);
         self.status = theme_errors_status(&errors)
             .unwrap_or_else(|| format!("Loaded {} themes", self.themes.len()));
     }
@@ -336,6 +467,9 @@ impl ForgeApp {
         match result {
             Ok(()) => {
                 self.status = format!("Saved {}", doc.title());
+                if doc.path.is_some() && doc.path == self.settings_path {
+                    self.settings_reload_pending = true;
+                }
                 true
             }
             Err(e) => {
@@ -529,6 +663,19 @@ impl ForgeApp {
                     .unwrap_or(self.documents.len() - 1);
             }
             Command::ShowPalette => self.palette.show(),
+            Command::OpenSettings => self.settings_open = true,
+            Command::OpenSettingsFile => self.open_settings_file(),
+            Command::ToggleWordWrap => {
+                self.settings.word_wrap = !self.settings.word_wrap;
+                self.settings_changed(ctx);
+            }
+            Command::ToggleLineNumbers => {
+                self.settings.line_numbers = !self.settings.line_numbers;
+                self.settings_changed(ctx);
+            }
+            Command::IncreaseFontSize => self.change_font_size(ctx, 1.0),
+            Command::DecreaseFontSize => self.change_font_size(ctx, -1.0),
+            Command::ResetFontSize => self.change_font_size(ctx, 0.0),
             Command::ReloadThemes => self.reload_themes(ctx),
             Command::OpenThemesFolder => self.open_themes_folder(),
             Command::CheckForUpdates => self.check_for_updates(ctx),
@@ -612,6 +759,13 @@ impl ForgeApp {
             ui.menu_button("View", |ui| {
                 self.menu_command(ui, ShowPalette);
                 ui.separator();
+                self.menu_command(ui, ToggleWordWrap);
+                self.menu_command(ui, ToggleLineNumbers);
+                ui.separator();
+                self.menu_command(ui, IncreaseFontSize);
+                self.menu_command(ui, DecreaseFontSize);
+                self.menu_command(ui, ResetFontSize);
+                ui.separator();
                 ui.menu_button("Theme", |ui| {
                     let mut chosen = None;
                     for (idx, theme) in self.themes.iter().enumerate() {
@@ -626,6 +780,9 @@ impl ForgeApp {
                     self.menu_command(ui, ReloadThemes);
                     self.menu_command(ui, OpenThemesFolder);
                 });
+                ui.separator();
+                self.menu_command(ui, OpenSettings);
+                self.menu_command(ui, OpenSettingsFile);
             });
             ui.menu_button("Help", |ui| {
                 self.menu_command(ui, CheckForUpdates);
@@ -749,7 +906,17 @@ impl ForgeApp {
         let highlighter = &mut self.highlighter;
         let font = TextStyle::Monospace.resolve(ui.style());
         let digit_width = ui.fonts_mut(|f| f.glyph_width(&font, '0'));
-        let gutter_width = gutter::width(doc.line_count(), digit_width);
+        let line_numbers = self.settings.line_numbers;
+        let gutter_width = if line_numbers {
+            gutter::width(doc.line_count(), digit_width)
+        } else {
+            4.0
+        };
+        let desired_width = if self.settings.word_wrap {
+            ui.available_width()
+        } else {
+            f32::INFINITY
+        };
         let current_line = self.cursor.0;
 
         let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
@@ -783,7 +950,7 @@ impl ForgeApp {
                     .id(doc.id)
                     .code_editor()
                     .lock_focus(true)
-                    .desired_width(f32::INFINITY)
+                    .desired_width(desired_width)
                     .desired_rows(40)
                     .margin(egui::Margin {
                         left: gutter_width as i8,
@@ -793,7 +960,9 @@ impl ForgeApp {
                     })
                     .layouter(&mut layouter)
                     .show(ui);
-                gutter::paint(ui, &output, current_line, &font);
+                if line_numbers {
+                    gutter::paint(ui, &output, current_line, &font);
+                }
                 paint_matches(ui, &output, matches, find.current);
                 if let Some(cursor) = reveal {
                     let rect = output
@@ -1043,6 +1212,9 @@ fn file_tree(ui: &mut egui::Ui, node: &mut FileNode, is_root: bool, clicked: &mu
 impl eframe::App for ForgeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if std::mem::take(&mut self.settings_reload_pending) {
+            self.reload_settings(&ctx);
+        }
         self.intercept_window_close(&ctx);
         if !self.palette.open {
             self.handle_shortcuts(&ctx);
@@ -1083,6 +1255,7 @@ impl eframe::App for ForgeApp {
         if let Some(command) = self.palette.ui(&ctx) {
             self.run(&ctx, command);
         }
+        self.settings_window(&ctx);
         self.close_prompt(&ctx);
     }
 }

@@ -1,40 +1,122 @@
-//! Persisted user preferences, stored in `<config dir>/forge-ide/settings.toml`.
+//! User settings, persisted as TOML in `<config dir>/forge-ide/settings.toml`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result};
+use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
-use crate::theme::config_dir;
+use crate::theme::{self, config_dir};
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
+pub const MIN_FONT_SIZE: f32 = 8.0;
+pub const MAX_FONT_SIZE: f32 = 32.0;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
 pub struct Settings {
-    /// Name of the selected theme.
-    pub theme: Option<String>,
+    /// Name of the selected theme (built-in or custom, see [`crate::theme`]).
+    pub theme: String,
+    /// Editor font size in points.
+    pub font_size: f32,
+    pub word_wrap: bool,
+    pub line_numbers: bool,
     /// Check for updates on startup. Defaults to on for release builds.
     pub auto_update: Option<bool>,
 }
 
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            theme: theme::DEFAULT_THEME.to_owned(),
+            font_size: 14.0,
+            word_wrap: false,
+            line_numbers: true,
+            auto_update: None,
+        }
+    }
+}
+
 impl Settings {
-    fn path() -> Option<PathBuf> {
+    /// `$FORGE_SETTINGS` if set, otherwise `<config dir>/forge-ide/settings.toml`
+    /// (e.g. `%APPDATA%\forge-ide\settings.toml` on Windows).
+    pub fn default_path() -> Option<PathBuf> {
+        if let Some(path) = std::env::var_os("FORGE_SETTINGS").filter(|p| !p.is_empty()) {
+            return Some(PathBuf::from(path));
+        }
         config_dir().map(|d| d.join("settings.toml"))
     }
 
-    pub fn load() -> Self {
-        Self::path()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| toml::from_str(&s).ok())
-            .unwrap_or_default()
+    /// Loads settings from `path`. A missing file yields the defaults.
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Self::parse(&text)
+                .with_context(|| format!("invalid settings in {}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e).with_context(|| format!("failed to read {}", path.display())),
+        }
     }
 
-    pub fn save(&self) -> Result<()> {
-        let path = Self::path().context("no config directory")?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+    pub fn parse(text: &str) -> anyhow::Result<Self> {
+        let mut settings: Self = toml::from_str(text)?;
+        settings.font_size = settings.font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+        Ok(settings)
+    }
+
+    /// Editor controls for the settings window. Returns true if anything changed.
+    pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        theme_names: &[String],
+        auto_update_default: bool,
+    ) -> bool {
+        let before = self.clone();
+        egui::Grid::new("settings_grid")
+            .num_columns(2)
+            .spacing([16.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("Color theme");
+                egui::ComboBox::from_id_salt("theme")
+                    .selected_text(&self.theme)
+                    .width(220.0)
+                    .show_ui(ui, |ui| {
+                        for name in theme_names {
+                            ui.selectable_value(&mut self.theme, name.clone(), name);
+                        }
+                    });
+                ui.end_row();
+
+                ui.label("Font size");
+                ui.add(
+                    egui::Slider::new(&mut self.font_size, MIN_FONT_SIZE..=MAX_FONT_SIZE)
+                        .step_by(1.0)
+                        .suffix(" pt"),
+                );
+                ui.end_row();
+
+                ui.label("Word wrap");
+                ui.checkbox(&mut self.word_wrap, "");
+                ui.end_row();
+
+                ui.label("Line numbers");
+                ui.checkbox(&mut self.line_numbers, "");
+                ui.end_row();
+
+                ui.label("Check for updates on startup");
+                let mut auto = self.auto_update.unwrap_or(auto_update_default);
+                if ui.checkbox(&mut auto, "").changed() {
+                    self.auto_update = Some(auto);
+                }
+                ui.end_row();
+            });
+        *self != before
+    }
+
+    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("failed to create {}", dir.display()))?;
         }
-        std::fs::write(&path, toml::to_string_pretty(self)?)
-            .with_context(|| format!("could not write {}", path.display()))
+        let text = toml::to_string_pretty(self)?;
+        std::fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))
     }
 }
 
@@ -43,11 +125,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn missing_fields_default() {
-        let s: Settings = toml::from_str("theme = \"Blossom\"").unwrap();
-        assert_eq!(s.theme.as_deref(), Some("Blossom"));
-        assert_eq!(s.auto_update, None);
-        let s: Settings = toml::from_str("").unwrap();
-        assert!(s.theme.is_none());
+    fn round_trips_through_toml() {
+        for auto_update in [None, Some(false)] {
+            let settings = Settings {
+                theme: "Blossom Light".into(),
+                font_size: 16.0,
+                word_wrap: true,
+                line_numbers: false,
+                auto_update,
+            };
+            let text = toml::to_string_pretty(&settings).unwrap();
+            assert_eq!(Settings::parse(&text).unwrap(), settings);
+        }
+    }
+
+    #[test]
+    fn missing_fields_use_defaults() {
+        let settings = Settings::parse("word_wrap = true").unwrap();
+        assert!(settings.word_wrap);
+        assert_eq!(settings.theme, theme::DEFAULT_THEME);
+        assert!(settings.line_numbers);
+        assert_eq!(settings.auto_update, None);
+        assert_eq!(Settings::parse("").unwrap(), Settings::default());
+    }
+
+    #[test]
+    fn reads_files_written_before_editor_settings() {
+        let settings = Settings::parse("theme = \"Blossom Light\"\nauto_update = false").unwrap();
+        assert_eq!(settings.theme, "Blossom Light");
+        assert_eq!(settings.auto_update, Some(false));
+        assert_eq!(settings.font_size, Settings::default().font_size);
+    }
+
+    #[test]
+    fn font_size_is_clamped() {
+        assert_eq!(
+            Settings::parse("font_size = 1000").unwrap().font_size,
+            MAX_FONT_SIZE
+        );
+        assert_eq!(
+            Settings::parse("font_size = 1").unwrap().font_size,
+            MIN_FONT_SIZE
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_toml() {
+        assert!(Settings::parse("font_size = \"big\"").is_err());
+    }
+
+    #[test]
+    fn load_and_save() {
+        let dir = std::env::temp_dir().join(format!("forge-settings-{}", std::process::id()));
+        let path = dir.join("nested").join("settings.toml");
+        assert_eq!(Settings::load(&path).unwrap(), Settings::default());
+        let settings = Settings {
+            font_size: 18.0,
+            ..Settings::default()
+        };
+        settings.save(&path).unwrap();
+        assert_eq!(Settings::load(&path).unwrap(), settings);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

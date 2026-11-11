@@ -12,6 +12,7 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
 - Find / replace with match-case and regex options (`$1` capture groups in replacements)
 - Go to line[:column]
 - Command palette with fuzzy matching over every command
+- Settings (Ctrl+,): color theme, font size, word wrap, line numbers, update checks
 - Syntax highlighting for many languages (via [syntect](https://github.com/trishume/syntect))
 - Line-number gutter with current-line highlight
 - Cursor line/column in the status bar
@@ -101,9 +102,28 @@ cargo run --release -- path/to/project
 | Go to line | Ctrl+G   |
 | Next / previous tab | Ctrl+Tab / Ctrl+Shift+Tab |
 | Command palette | Ctrl+Shift+P / F1 |
+| Settings   | Ctrl+,   |
+| Font size bigger / smaller / reset | Ctrl+= / Ctrl+- / Ctrl+0 |
+| Toggle word wrap | Alt+Z |
 | Quit       | Ctrl+Q   |
 
 (Cmd instead of Ctrl on macOS.)
+
+### Settings
+
+Settings are stored as TOML in `<config dir>/forge-ide/settings.toml`
+(`%APPDATA%\forge-ide\settings.toml` on Windows, `~/.config/forge-ide/settings.toml` on Linux,
+`~/Library/Application Support/forge-ide/settings.toml` on macOS). Set `FORGE_SETTINGS` to use a
+different file. Changes made in the Settings window are saved immediately; editing the file in
+Forge reloads it on save.
+
+```toml
+theme = "Blossom"         # any built-in or custom theme name
+font_size = 14.0
+word_wrap = false
+line_numbers = true
+auto_update = true        # check for updates on startup (default: on for release builds)
+```
 
 ## Project layout
 
@@ -114,7 +134,7 @@ src/
 ├── commands.rs          # command list: labels, shortcuts (shared by menus and palette)
 ├── find_bar.rs          # find/replace bar and go-to-line prompt
 ├── palette.rs           # command palette and fuzzy matcher
-├── settings.rs          # persisted preferences (settings.toml)
+├── settings.rs          # persisted preferences (settings.toml) and settings window
 ├── theme.rs             # built-in + custom themes
 ├── updater.rs           # self-update from GitHub releases
 ├── workspace.rs         # file tree / project explorer
@@ -136,7 +156,7 @@ src/
 - [ ] Integrated terminal
 - [ ] LSP client (diagnostics, completion, go to definition)
 - [x] Themes
-- [ ] Settings UI
+- [x] Settings UI
 
 ## License
 

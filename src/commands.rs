@@ -11,6 +11,7 @@ const CMD: Modifiers = Modifiers::COMMAND;
 const CMD_SHIFT: Modifiers = Modifiers::COMMAND.plus(Modifiers::SHIFT);
 const REDO_ALT: KeyboardShortcut = KeyboardShortcut::new(CMD_SHIFT, Key::Z);
 const PALETTE_ALT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::F1);
+const ZOOM_IN_ALT: KeyboardShortcut = KeyboardShortcut::new(CMD, Key::Plus);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
@@ -31,6 +32,13 @@ pub enum Command {
     NextTab,
     PreviousTab,
     ShowPalette,
+    OpenSettings,
+    OpenSettingsFile,
+    ToggleWordWrap,
+    ToggleLineNumbers,
+    IncreaseFontSize,
+    DecreaseFontSize,
+    ResetFontSize,
     ReloadThemes,
     OpenThemesFolder,
     CheckForUpdates,
@@ -55,6 +63,13 @@ impl Command {
         Command::FindNext,
         Command::FindPrevious,
         Command::GoToLine,
+        Command::ToggleWordWrap,
+        Command::ToggleLineNumbers,
+        Command::IncreaseFontSize,
+        Command::DecreaseFontSize,
+        Command::ResetFontSize,
+        Command::OpenSettings,
+        Command::OpenSettingsFile,
         Command::ReloadThemes,
         Command::OpenThemesFolder,
         Command::CheckForUpdates,
@@ -81,6 +96,13 @@ impl Command {
             Command::NextTab => "View: Next Tab",
             Command::PreviousTab => "View: Previous Tab",
             Command::ShowPalette => "View: Command Palette",
+            Command::OpenSettings => "Preferences: Settings…",
+            Command::OpenSettingsFile => "Preferences: Open Settings File (TOML)",
+            Command::ToggleWordWrap => "View: Toggle Word Wrap",
+            Command::ToggleLineNumbers => "View: Toggle Line Numbers",
+            Command::IncreaseFontSize => "View: Increase Font Size",
+            Command::DecreaseFontSize => "View: Decrease Font Size",
+            Command::ResetFontSize => "View: Reset Font Size",
             Command::ReloadThemes => "View: Reload Themes",
             Command::OpenThemesFolder => "View: Open Themes Folder",
             Command::CheckForUpdates => "Help: Check for Updates",
@@ -112,6 +134,13 @@ impl Command {
             Command::NextTab => shortcut(Modifiers::CTRL, Key::Tab),
             Command::PreviousTab => shortcut(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::Tab),
             Command::ShowPalette => shortcut(CMD_SHIFT, Key::P),
+            Command::OpenSettings => shortcut(CMD, Key::Comma),
+            Command::OpenSettingsFile => None,
+            Command::ToggleWordWrap => shortcut(Modifiers::ALT, Key::Z),
+            Command::ToggleLineNumbers => None,
+            Command::IncreaseFontSize => shortcut(CMD, Key::Equals),
+            Command::DecreaseFontSize => shortcut(CMD, Key::Minus),
+            Command::ResetFontSize => shortcut(CMD, Key::Num0),
             Command::ReloadThemes | Command::OpenThemesFolder | Command::CheckForUpdates => None,
         }
     }
@@ -121,6 +150,7 @@ impl Command {
         match self {
             Command::Redo => &[REDO_ALT],
             Command::ShowPalette => &[PALETTE_ALT],
+            Command::IncreaseFontSize => &[ZOOM_IN_ALT],
             _ => &[],
         }
     }

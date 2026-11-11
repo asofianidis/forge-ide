@@ -10,6 +10,7 @@ use syntect::util::LinesWithEndings;
 /// Last highlighted input, so unchanged text isn't re-highlighted every frame.
 struct Cached {
     extension: String,
+    font: FontId,
     text: String,
     job: LayoutJob,
 }
@@ -38,13 +39,15 @@ impl Highlighter {
     pub fn highlight(&mut self, text: &str, extension: &str, font: FontId) -> LayoutJob {
         if let Some(c) = &self.cache
             && c.extension == extension
+            && c.font == font
             && c.text == text
         {
             return c.job.clone();
         }
-        let job = self.build_job(text, extension, font);
+        let job = self.build_job(text, extension, font.clone());
         self.cache = Some(Cached {
             extension: extension.to_owned(),
+            font,
             text: text.to_owned(),
             job: job.clone(),
         });
@@ -96,5 +99,36 @@ impl Highlighter {
             .background
             .map(|c| Color32::from_rgb(c.r, c.g, c.b))
             .unwrap_or(Color32::from_gray(30))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme;
+
+    #[test]
+    fn theme_change_invalidates_cache() {
+        let mut hl = Highlighter::new(theme::Theme::blossom().syntect_theme());
+        let dark = hl.highlight("fn x() {}", "rs", FontId::monospace(14.0));
+        hl.set_theme(theme::Theme::blossom_light().syntect_theme());
+        let light = hl.highlight("fn x() {}", "rs", FontId::monospace(14.0));
+        assert_ne!(
+            dark.sections[0].format.color,
+            light.sections[0].format.color
+        );
+        assert_ne!(
+            hl.background(),
+            Highlighter::new(theme::Theme::blossom().syntect_theme()).background()
+        );
+    }
+
+    #[test]
+    fn font_change_invalidates_cache() {
+        let mut hl = Highlighter::new(theme::Theme::blossom().syntect_theme());
+        let small = hl.highlight("fn x() {}", "rs", FontId::monospace(10.0));
+        let large = hl.highlight("fn x() {}", "rs", FontId::monospace(20.0));
+        assert_eq!(small.sections[0].format.font_id.size, 10.0);
+        assert_eq!(large.sections[0].format.font_id.size, 20.0);
     }
 }
