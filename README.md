@@ -7,7 +7,7 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
 ## Features
 
 - File explorer with lazily-loaded directory tree
-- Tabbed editing with unsaved-change indicators
+- Tabbed editing with unsaved-change indicators and a save prompt when closing tabs or the window
 - Rope-backed buffers with grouped undo/redo history
 - Find / replace with match-case and regex options (`$1` capture groups in replacements)
 - Go to line[:column]
@@ -125,7 +125,7 @@ src/
 - [x] Rope-based buffer for large files, undo/redo history
 - [x] Find / replace, go to line
 - [ ] Command palette
-- [ ] Unsaved-changes prompt on close
+- [x] Unsaved-changes prompt on close
 - [ ] Integrated terminal
 - [ ] LSP client (diagnostics, completion, go to definition)
 - [x] Themes

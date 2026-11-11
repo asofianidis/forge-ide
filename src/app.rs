@@ -27,6 +27,21 @@ const SHORTCUT_GOTO_LINE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CO
 const SHORTCUT_FIND_NEXT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::F3);
 const SHORTCUT_FIND_PREV: KeyboardShortcut = KeyboardShortcut::new(Modifiers::SHIFT, Key::F3);
 
+/// Something waiting on the user to decide what to do with unsaved changes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CloseRequest {
+    /// Close the tab holding the document with this id.
+    Tab(egui::Id),
+    /// Close the whole window.
+    Window,
+}
+
+enum CloseChoice {
+    Save,
+    Discard,
+    Cancel,
+}
+
 /// A selection to apply to the active editor on the next frame.
 struct PendingSelection {
     range: Range<usize>,
@@ -51,6 +66,10 @@ pub struct ForgeApp {
     pending_selection: Option<PendingSelection>,
     find: FindBar,
     goto_line: GotoLine,
+    /// Close waiting on the unsaved-changes prompt.
+    pending_close: Option<CloseRequest>,
+    /// Set once the user has resolved unsaved changes, so the next close request goes through.
+    allow_window_close: bool,
     settings: Settings,
     updater: Updater,
     /// Update state seen last frame, to report transitions in the status bar.
@@ -95,6 +114,8 @@ impl ForgeApp {
             pending_selection: None,
             find: FindBar::default(),
             goto_line: GotoLine::default(),
+            pending_close: None,
+            allow_window_close: false,
             settings,
             updater,
             last_update_state: UpdateState::Idle,
@@ -289,20 +310,34 @@ impl ForgeApp {
     }
 
     fn save_active(&mut self) {
-        let Some(doc) = self.documents.get_mut(self.active) else {
-            return;
+        self.save_document(self.active);
+    }
+
+    /// Saves a document, asking for a path if it has none. Returns true on success.
+    fn save_document(&mut self, idx: usize) -> bool {
+        let Some(doc) = self.documents.get_mut(idx) else {
+            return false;
         };
         let result = if doc.path.is_some() {
             doc.save()
-        } else if let Some(path) = rfd::FileDialog::new().save_file() {
+        } else if let Some(path) = rfd::FileDialog::new()
+            .set_file_name(doc.title())
+            .save_file()
+        {
             doc.save_as(path)
         } else {
-            return;
+            return false;
         };
-        self.status = match result {
-            Ok(()) => format!("Saved {}", doc.title()),
-            Err(e) => format!("Error: {e:#}"),
-        };
+        match result {
+            Ok(()) => {
+                self.status = format!("Saved {}", doc.title());
+                true
+            }
+            Err(e) => {
+                self.status = format!("Error: {e:#}");
+                false
+            }
+        }
     }
 
     fn undo(&mut self) {
@@ -435,8 +470,20 @@ impl ForgeApp {
         focused.is_none() || focused == self.documents.get(self.active).map(|d| d.id)
     }
 
+    /// Closes a tab, first asking what to do if it has unsaved changes.
+    fn request_close_tab(&mut self, idx: usize) {
+        match self.documents.get(idx) {
+            Some(doc) if doc.is_dirty() => {
+                self.active = idx;
+                self.pending_close = Some(CloseRequest::Tab(doc.id));
+            }
+            Some(_) => self.close_tab(idx),
+            None => {}
+        }
+    }
+
+    /// Closes a tab unconditionally, discarding unsaved changes.
     fn close_tab(&mut self, idx: usize) {
-        // TODO: prompt before discarding unsaved changes.
         if idx < self.documents.len() {
             self.documents.remove(idx);
         }
@@ -467,7 +514,7 @@ impl ForgeApp {
             self.save_active();
         }
         if close {
-            self.close_tab(self.active);
+            self.request_close_tab(self.active);
         }
 
         let (find, replace, goto, find_prev, find_next) = ctx.input_mut(|i| {
@@ -554,7 +601,7 @@ impl ForgeApp {
                     )
                     .clicked()
                 {
-                    self.close_tab(self.active);
+                    self.request_close_tab(self.active);
                 }
                 ui.separator();
                 if ui.button("Quit").clicked() {
@@ -744,7 +791,7 @@ impl ForgeApp {
                 });
             });
         if let Some(idx) = to_close {
-            self.close_tab(idx);
+            self.request_close_tab(idx);
         }
     }
 
@@ -820,6 +867,124 @@ impl ForgeApp {
             let [start, end] = range.sorted_cursors();
             self.selection = start.index.into()..end.index.into();
             self.cursor = doc.line_col(range.primary.index.into());
+        }
+    }
+
+    /// Intercepts window close while there are unsaved changes.
+    fn intercept_window_close(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|i| i.viewport().close_requested()) || self.allow_window_close {
+            return;
+        }
+        if self.documents.iter().any(Document::is_dirty) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.pending_close = Some(CloseRequest::Window);
+        }
+    }
+
+    /// Shows the unsaved-changes prompt for a pending close, if any.
+    fn close_prompt(&mut self, ctx: &egui::Context) {
+        let Some(request) = self.pending_close else {
+            return;
+        };
+        let dirty: Vec<String> = match request {
+            CloseRequest::Tab(id) => self
+                .documents
+                .iter()
+                .filter(|d| d.id == id && d.is_dirty())
+                .map(Document::title)
+                .collect(),
+            CloseRequest::Window => self
+                .documents
+                .iter()
+                .filter(|d| d.is_dirty())
+                .map(Document::title)
+                .collect(),
+        };
+        if dirty.is_empty() {
+            // Saved or closed some other way in the meantime.
+            self.pending_close = None;
+            self.finish_close(ctx, request);
+            return;
+        }
+
+        let modal = egui::Modal::new(egui::Id::unique("unsaved_changes")).show(ctx, |ui| {
+            ui.set_max_width(360.0);
+            let (heading, save_label, discard_label) = match &dirty[..] {
+                [one] => (
+                    format!("Do you want to save the changes you made to {one}?"),
+                    "Save",
+                    "Don't Save",
+                ),
+                many => (
+                    format!("Do you want to save changes to {} files?", many.len()),
+                    "Save All",
+                    "Discard All",
+                ),
+            };
+            ui.label(egui::RichText::new(heading).strong());
+            if dirty.len() > 1 {
+                for title in &dirty {
+                    ui.label(format!("• {title}"));
+                }
+            }
+            ui.label("Your changes will be lost if you don't save them.");
+            ui.add_space(8.0);
+            let mut choice = None;
+            ui.horizontal(|ui| {
+                if ui.button(save_label).clicked() {
+                    choice = Some(CloseChoice::Save);
+                }
+                if ui.button(discard_label).clicked() {
+                    choice = Some(CloseChoice::Discard);
+                }
+                if ui.button("Cancel").clicked() {
+                    choice = Some(CloseChoice::Cancel);
+                }
+            });
+            choice
+        });
+        let choice = if modal.should_close() {
+            Some(CloseChoice::Cancel)
+        } else {
+            modal.inner
+        };
+
+        match choice {
+            None => {}
+            Some(CloseChoice::Cancel) => self.pending_close = None,
+            Some(CloseChoice::Discard) => {
+                self.pending_close = None;
+                self.finish_close(ctx, request);
+            }
+            Some(CloseChoice::Save) => {
+                self.pending_close = None;
+                let targets: Vec<usize> = (0..self.documents.len())
+                    .filter(|&i| {
+                        let d = &self.documents[i];
+                        d.is_dirty()
+                            && (request == CloseRequest::Window
+                                || CloseRequest::Tab(d.id) == request)
+                    })
+                    .collect();
+                // Stop at the first failure (or cancelled save dialog) and keep everything open.
+                if targets.into_iter().all(|i| self.save_document(i)) {
+                    self.finish_close(ctx, request);
+                }
+            }
+        }
+    }
+
+    fn finish_close(&mut self, ctx: &egui::Context, request: CloseRequest) {
+        match request {
+            CloseRequest::Tab(id) => {
+                if let Some(idx) = self.documents.iter().position(|d| d.id == id) {
+                    self.close_tab(idx);
+                }
+            }
+            CloseRequest::Window => {
+                self.allow_window_close = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         }
     }
 
@@ -938,7 +1103,9 @@ fn file_tree(ui: &mut egui::Ui, node: &mut FileNode, is_root: bool, clicked: &mu
 
 impl eframe::App for ForgeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.handle_shortcuts(&ui.ctx().clone());
+        let ctx = ui.ctx().clone();
+        self.intercept_window_close(&ctx);
+        self.handle_shortcuts(&ctx);
         self.poll_updater();
 
         let panel_frame =
@@ -972,5 +1139,6 @@ impl eframe::App for ForgeApp {
         if let Some((line, col)) = self.goto_line.ui(ui.ctx(), line_count) {
             self.goto(line, col);
         }
+        self.close_prompt(&ctx);
     }
 }
