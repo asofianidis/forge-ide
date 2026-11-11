@@ -46,6 +46,9 @@ pub enum Command {
     NextProblem,
     PreviousProblem,
     RestartLanguageServers,
+    ReloadThemes,
+    OpenThemesFolder,
+    CheckForUpdates,
 }
 
 impl Command {
@@ -81,6 +84,9 @@ impl Command {
         Command::RestartTerminal,
         Command::OpenSettings,
         Command::OpenSettingsFile,
+        Command::ReloadThemes,
+        Command::OpenThemesFolder,
+        Command::CheckForUpdates,
         Command::Quit,
     ];
 
@@ -118,6 +124,9 @@ impl Command {
             Command::NextProblem => "Go: Next Problem",
             Command::PreviousProblem => "Go: Previous Problem",
             Command::RestartLanguageServers => "Language: Restart Language Servers",
+            Command::ReloadThemes => "View: Reload Themes",
+            Command::OpenThemesFolder => "View: Open Themes Folder",
+            Command::CheckForUpdates => "Help: Check for Updates",
         }
     }
 
@@ -160,6 +169,7 @@ impl Command {
             Command::NextProblem => shortcut(Modifiers::NONE, Key::F8),
             Command::PreviousProblem => shortcut(Modifiers::SHIFT, Key::F8),
             Command::RestartLanguageServers => None,
+            Command::ReloadThemes | Command::OpenThemesFolder | Command::CheckForUpdates => None,
         }
     }
 

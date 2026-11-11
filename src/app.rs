@@ -16,6 +16,8 @@ use crate::lsp::LspManager;
 use crate::palette::Palette;
 use crate::settings::{self, Settings};
 use crate::terminal::Terminal;
+use crate::theme::{self, Theme};
+use crate::updater::{self, UpdateState, Updater};
 use crate::workspace::{FileNode, Workspace};
 
 /// Something waiting on the user to decide what to do with unsaved changes.
@@ -45,6 +47,9 @@ pub struct ForgeApp {
     documents: Vec<Document>,
     active: usize,
     highlighter: Highlighter,
+    /// Built-in and custom themes; `theme` indexes into this.
+    themes: Vec<Theme>,
+    theme: usize,
     status: String,
     /// 1-based (line, column) of the cursor in the active document.
     cursor: (usize, usize),
@@ -75,18 +80,33 @@ pub struct ForgeApp {
     completion: Option<CompletionPopup>,
     /// Give the terminal keyboard focus on the next frame.
     focus_terminal: bool,
+    updater: Updater,
+    /// Update state seen last frame, to report transitions in the status bar.
+    last_update_state: UpdateState,
+    /// The current check was started from the menu, so "up to date" and
+    /// errors are worth reporting.
+    manual_update_check: bool,
 }
 
 impl ForgeApp {
     pub fn new(cc: &eframe::CreationContext<'_>, root: Option<PathBuf>) -> Self {
         // Ctrl+=/Ctrl+- change the editor font size instead of zooming the whole UI.
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        cc.egui_ctx.all_styles_mut(|style| {
+            style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+            style.spacing.button_padding = egui::vec2(10.0, 4.0);
+            style.spacing.menu_margin = egui::Margin::same(8);
+        });
+
+        let (themes, errors) = theme::load_all(theme::themes_dir().as_deref());
         let mut app = Self {
             workspace: root.filter(|p| p.is_dir()).map(Workspace::open),
             documents: vec![Document::untitled()],
             active: 0,
-            highlighter: Highlighter::default(),
-            status: "Ready".to_owned(),
+            highlighter: Highlighter::new(themes[0].syntect_theme()),
+            theme: 0,
+            themes,
+            status: theme_errors_status(&errors).unwrap_or_else(|| "Ready".to_owned()),
             cursor: (1, 1),
             selection: 0..0,
             cursor_offset: 0,
@@ -106,8 +126,18 @@ impl ForgeApp {
             lsp: LspManager::default(),
             completion: None,
             focus_terminal: false,
+            updater: Updater::default(),
+            last_update_state: UpdateState::Idle,
+            manual_update_check: false,
         };
         app.reload_settings(&cc.egui_ctx);
+        if app
+            .settings
+            .auto_update
+            .unwrap_or(updater::IS_RELEASE_BUILD)
+        {
+            app.updater.check(&cc.egui_ctx);
+        }
         app
     }
 
@@ -124,24 +154,25 @@ impl ForgeApp {
         self.apply_settings(ctx);
     }
 
-    /// Applies the current settings to the highlighter and egui style.
+    /// Applies the current settings to the theme and egui style.
     fn apply_settings(&mut self, ctx: &egui::Context) {
-        if !self.highlighter.set_theme(&self.settings.theme) {
-            self.status = format!(
-                "Unknown theme \"{}\", using {}",
-                self.settings.theme,
-                self.highlighter.theme_name()
-            );
+        match self
+            .themes
+            .iter()
+            .position(|t| t.name == self.settings.theme)
+        {
+            Some(idx) => self.activate_theme(ctx, idx),
+            None => {
+                // Keep the unknown name in the settings so a custom theme that
+                // failed to load isn't forgotten; fall back for this session.
+                self.activate_theme(ctx, self.theme);
+                self.status = format!(
+                    "Unknown theme \"{}\", using {}",
+                    self.settings.theme,
+                    self.current_theme().name
+                );
+            }
         }
-        let theme = if self.highlighter.is_dark() {
-            egui::Theme::Dark
-        } else {
-            egui::Theme::Light
-        };
-        // Follow the syntax theme rather than the OS light/dark preference.
-        ctx.set_theme(theme);
-        let background = self.highlighter.background();
-        ctx.style_mut_of(theme, |style| style.visuals.extreme_bg_color = background);
         let font_size = self.settings.font_size;
         ctx.all_styles_mut(|style| {
             if let Some(font) = style.text_styles.get_mut(&TextStyle::Monospace) {
@@ -150,14 +181,18 @@ impl ForgeApp {
         });
     }
 
-    /// Applies and persists changed settings.
-    fn settings_changed(&mut self, ctx: &egui::Context) {
-        self.apply_settings(ctx);
+    fn save_settings(&mut self) {
         if let Some(path) = &self.settings_path
             && let Err(e) = self.settings.save(path)
         {
-            self.status = format!("Error: {e:#}");
+            self.status = format!("Could not save settings: {e:#}");
         }
+    }
+
+    /// Applies and persists changed settings.
+    fn settings_changed(&mut self, ctx: &egui::Context) {
+        self.apply_settings(ctx);
+        self.save_settings();
     }
 
     fn change_font_size(&mut self, ctx: &egui::Context, delta: f32) {
@@ -250,7 +285,7 @@ impl ForgeApp {
 
     fn settings_window(&mut self, ctx: &egui::Context) {
         let mut open = self.settings_open;
-        let theme_names: Vec<String> = self.highlighter.theme_names().map(str::to_owned).collect();
+        let theme_names: Vec<String> = self.themes.iter().map(|t| t.name.clone()).collect();
         let mut changed = false;
         let mut open_file = false;
         egui::Window::new("Settings")
@@ -260,7 +295,9 @@ impl ForgeApp {
             .default_width(380.0)
             .show(ctx, |ui| {
                 ui.set_max_width(380.0);
-                changed = self.settings.ui(ui, &theme_names);
+                changed = self
+                    .settings
+                    .ui(ui, &theme_names, updater::IS_RELEASE_BUILD);
                 ui.separator();
                 if let Some(path) = &self.settings_path {
                     ui.horizontal(|ui| {
@@ -282,6 +319,163 @@ impl ForgeApp {
         if open_file {
             self.open_settings_file();
         }
+    }
+
+    // ---- updates -------------------------------------------------------
+
+    fn check_for_updates(&mut self, ctx: &egui::Context) {
+        self.manual_update_check = true;
+        self.status = "Checking for updates…".to_owned();
+        self.updater.check(ctx);
+    }
+
+    fn has_unsaved_changes(&self) -> bool {
+        self.documents.iter().any(Document::is_dirty)
+    }
+
+    /// Reports update state changes in the status bar.
+    fn poll_updater(&mut self) {
+        let state = self.updater.state();
+        if state == self.last_update_state {
+            return;
+        }
+        match &state {
+            UpdateState::UpToDate if self.manual_update_check => {
+                self.status = format!("Forge IDE {} is up to date", updater::VERSION);
+            }
+            UpdateState::Available(v) => {
+                self.status = format!("Forge IDE {v} is available");
+            }
+            UpdateState::Installed(v) => {
+                self.status = format!("Forge IDE {v} installed. Restart to use it.");
+            }
+            // Failed background checks (e.g. offline) stay quiet; failed
+            // installs and manual checks are reported.
+            UpdateState::Failed(msg)
+                if self.manual_update_check
+                    || matches!(self.last_update_state, UpdateState::Installing(_)) =>
+            {
+                self.status = msg.clone();
+            }
+            _ => {}
+        }
+        if !matches!(state, UpdateState::Checking) {
+            self.manual_update_check = false;
+        }
+        self.last_update_state = state;
+    }
+
+    /// Update indicator on the right side of the status bar.
+    fn update_indicator(&mut self, ui: &mut egui::Ui) {
+        let accent = self.current_theme().ui.accent.0;
+        let accent_text = self.current_theme().ui.accent_text.0;
+        let accent_button = |text: String| {
+            egui::Button::new(egui::RichText::new(text).color(accent_text))
+                .fill(accent)
+                .small()
+        };
+        match self.updater.state() {
+            UpdateState::Available(v) => {
+                if ui
+                    .add(accent_button(format!("Update to {v}")))
+                    .on_hover_text(format!("You have {}", updater::VERSION))
+                    .clicked()
+                {
+                    self.updater.install(ui.ctx());
+                }
+                ui.separator();
+            }
+            UpdateState::Installing(progress) => {
+                let text = match progress {
+                    Some(p) => format!("Updating… {:.0}%", p * 100.0),
+                    None => "Updating…".to_owned(),
+                };
+                ui.label(text);
+                ui.spinner();
+                ui.separator();
+            }
+            UpdateState::Installed(_) => {
+                let unsaved = self.has_unsaved_changes();
+                let response = ui
+                    .add_enabled(!unsaved, accent_button("Restart to update".to_owned()))
+                    .on_disabled_hover_text("Save your changes first");
+                if response.clicked() {
+                    // Restarting exits without running destructors; stop the shell first.
+                    self.terminal = None;
+                    if let Err(e) = updater::restart() {
+                        self.status = format!("Could not restart: {e:#}");
+                    }
+                }
+                ui.separator();
+            }
+            _ => {}
+        }
+    }
+
+    fn current_theme(&self) -> &Theme {
+        &self.themes[self.theme]
+    }
+
+    // ---- themes --------------------------------------------------------
+
+    /// Makes `themes[idx]` the active theme for the UI and the highlighter.
+    fn activate_theme(&mut self, ctx: &egui::Context, idx: usize) {
+        self.theme = idx;
+        let theme = &self.themes[idx];
+        // Follow the color theme rather than the OS light/dark preference.
+        ctx.set_theme(if theme.dark {
+            egui::Theme::Dark
+        } else {
+            egui::Theme::Light
+        });
+        theme.apply(ctx);
+        self.highlighter.set_theme(theme.syntect_theme());
+    }
+
+    /// Switches to `themes[idx]` and remembers the choice.
+    fn set_theme(&mut self, ctx: &egui::Context, idx: usize) {
+        self.settings.theme = self.themes[idx].name.clone();
+        self.settings_changed(ctx);
+        self.status = format!("Theme: {}", self.current_theme().name);
+    }
+
+    fn reload_themes(&mut self, ctx: &egui::Context) {
+        let current = self.current_theme().name.clone();
+        let (themes, errors) = theme::load_all(theme::themes_dir().as_deref());
+        self.themes = themes;
+        self.theme = self
+            .themes
+            .iter()
+            .position(|t| t.name == current)
+            .unwrap_or(0);
+        // Also picks up a configured theme that previously failed to load.
+        self.apply_settings(ctx);
+        self.status = theme_errors_status(&errors)
+            .unwrap_or_else(|| format!("Loaded {} themes", self.themes.len()));
+    }
+
+    fn open_themes_folder(&mut self) {
+        let Some(dir) = theme::themes_dir() else {
+            self.status = "Error: no config directory".to_owned();
+            return;
+        };
+        let result = std::fs::create_dir_all(&dir)
+            .and_then(|()| {
+                // Seed an empty folder with the documented example.
+                if std::fs::read_dir(&dir)?.next().is_none() {
+                    std::fs::write(
+                        dir.join("example.toml"),
+                        include_str!("../themes/example.toml"),
+                    )?;
+                }
+                Ok(())
+            })
+            .map_err(anyhow::Error::from)
+            .and_then(|()| open_path(&dir));
+        self.status = match result {
+            Ok(()) => format!("Themes folder: {}", dir.display()),
+            Err(e) => format!("Error: {e:#}"),
+        };
     }
 
     // ---- actions -------------------------------------------------------
@@ -588,6 +782,9 @@ impl ForgeApp {
             Command::IncreaseFontSize => self.change_font_size(ctx, 1.0),
             Command::DecreaseFontSize => self.change_font_size(ctx, -1.0),
             Command::ResetFontSize => self.change_font_size(ctx, 0.0),
+            Command::ReloadThemes => self.reload_themes(ctx),
+            Command::OpenThemesFolder => self.open_themes_folder(),
+            Command::CheckForUpdates => self.check_for_updates(ctx),
         }
     }
 
@@ -598,6 +795,10 @@ impl ForgeApp {
             Command::Undo => doc.is_some_and(|d| d.buffer.can_undo()),
             Command::Redo => doc.is_some_and(|d| d.buffer.can_redo()),
             Command::NextTab | Command::PreviousTab => self.documents.len() > 1,
+            Command::CheckForUpdates => !matches!(
+                self.updater.state(),
+                UpdateState::Checking | UpdateState::Installing(_)
+            ),
             _ => true,
         }
     }
@@ -633,7 +834,7 @@ impl ForgeApp {
 
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         use Command::*;
-        let menus: [(&str, &[&[Command]]); 4] = [
+        let menus: [(&str, &[&[Command]]); 3] = [
             (
                 "File",
                 &[
@@ -658,17 +859,6 @@ impl ForgeApp {
                     &[NextTab, PreviousTab],
                 ],
             ),
-            (
-                "View",
-                &[
-                    &[ShowPalette],
-                    &[ToggleWordWrap, ToggleLineNumbers],
-                    &[IncreaseFontSize, DecreaseFontSize, ResetFontSize],
-                    &[ToggleTerminal, RestartTerminal],
-                    &[RestartLanguageServers],
-                    &[OpenSettings, OpenSettingsFile],
-                ],
-            ),
         ];
         egui::MenuBar::new().ui(ui, |ui| {
             for (title, groups) in menus {
@@ -683,12 +873,67 @@ impl ForgeApp {
                     }
                 });
             }
+            ui.menu_button("View", |ui| {
+                self.menu_command(ui, ShowPalette);
+                ui.separator();
+                self.menu_command(ui, ToggleWordWrap);
+                self.menu_command(ui, ToggleLineNumbers);
+                ui.separator();
+                self.menu_command(ui, IncreaseFontSize);
+                self.menu_command(ui, DecreaseFontSize);
+                self.menu_command(ui, ResetFontSize);
+                ui.separator();
+                ui.menu_button("Theme", |ui| {
+                    let mut chosen = None;
+                    for (idx, theme) in self.themes.iter().enumerate() {
+                        if ui.radio(idx == self.theme, &theme.name).clicked() {
+                            chosen = Some(idx);
+                        }
+                    }
+                    if let Some(idx) = chosen {
+                        self.set_theme(ui.ctx(), idx);
+                    }
+                    ui.separator();
+                    self.menu_command(ui, ReloadThemes);
+                    self.menu_command(ui, OpenThemesFolder);
+                });
+                ui.separator();
+                self.menu_command(ui, ToggleTerminal);
+                self.menu_command(ui, RestartTerminal);
+                ui.separator();
+                self.menu_command(ui, RestartLanguageServers);
+                ui.separator();
+                self.menu_command(ui, OpenSettings);
+                self.menu_command(ui, OpenSettingsFile);
+            });
+            ui.menu_button("Help", |ui| {
+                self.menu_command(ui, CheckForUpdates);
+                let mut auto = self
+                    .settings
+                    .auto_update
+                    .unwrap_or(updater::IS_RELEASE_BUILD);
+                if ui
+                    .checkbox(&mut auto, "Check for Updates on Startup")
+                    .changed()
+                {
+                    self.settings.auto_update = Some(auto);
+                    self.save_settings();
+                }
+                ui.separator();
+                ui.label(format!("Forge IDE {}", updater::VERSION));
+            });
         });
     }
 
     fn explorer(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Explorer");
-        ui.separator();
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("EXPLORER")
+                .small()
+                .strong()
+                .color(self.current_theme().ui.text_muted.0),
+        );
+        ui.add_space(2.0);
         let Some(ws) = &mut self.workspace else {
             if ui.button("Open Folder…").clicked() {
                 self.open_folder_dialog();
@@ -704,10 +949,11 @@ impl ForgeApp {
         }
     }
 
-    fn status_bar(&self, ui: &mut egui::Ui) {
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(&self.status);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.update_indicator(ui);
                 if let Some(doc) = self.documents.get(self.active) {
                     ui.label(doc.extension());
                     ui.separator();
@@ -730,23 +976,53 @@ impl ForgeApp {
 
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
         let mut to_close = None;
+        let colors = self.current_theme().ui.clone();
         egui::ScrollArea::horizontal()
             .id_salt("tab_bar")
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     for (idx, doc) in self.documents.iter().enumerate() {
+                        let selected = idx == self.active;
                         let label = if doc.is_dirty() {
                             format!("● {}", doc.title())
                         } else {
                             doc.title()
                         };
-                        if ui.selectable_label(idx == self.active, label).clicked() {
+                        let text = egui::RichText::new(label).color(if selected {
+                            colors.text.0
+                        } else {
+                            colors.text_muted.0
+                        });
+                        let fill = if selected {
+                            colors.widget.0
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        };
+                        let response = ui.add(
+                            egui::Button::new(text)
+                                .fill(fill)
+                                .stroke(egui::Stroke::NONE),
+                        );
+                        if selected {
+                            // Accent underline marks the active tab.
+                            let r = response.rect;
+                            ui.painter().hline(
+                                r.x_range().shrink(6.0),
+                                r.bottom() + 1.0,
+                                egui::Stroke::new(2.0, colors.accent.0),
+                            );
+                        }
+                        if response.clicked() {
                             self.active = idx;
                         }
-                        if ui.small_button("×").clicked() {
+                        if ui
+                            .add(egui::Button::new("×").small().frame(false))
+                            .on_hover_text("Close")
+                            .clicked()
+                        {
                             to_close = Some(idx);
                         }
-                        ui.separator();
+                        ui.add_space(4.0);
                     }
                 });
             });
@@ -1042,6 +1318,27 @@ fn paint_matches(
     }
 }
 
+/// Formats theme loading errors for the status bar.
+fn theme_errors_status(errors: &[String]) -> Option<String> {
+    match errors {
+        [] => None,
+        [one] => Some(format!("Theme error: {one}")),
+        [first, rest @ ..] => Some(format!("Theme error: {first} (and {} more)", rest.len())),
+    }
+}
+
+/// Opens a file or folder with the platform's default handler.
+fn open_path(path: &Path) -> anyhow::Result<()> {
+    #[cfg(target_os = "windows")]
+    let program = "explorer";
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let program = "xdg-open";
+    std::process::Command::new(program).arg(path).spawn()?;
+    Ok(())
+}
+
 /// Recursively renders a directory tree. Sets `clicked` when a file is selected.
 fn file_tree(ui: &mut egui::Ui, node: &mut FileNode, is_root: bool, clicked: &mut Option<PathBuf>) {
     if node.is_dir {
@@ -1078,13 +1375,20 @@ impl eframe::App for ForgeApp {
             }
             self.handle_shortcuts(&ctx);
         }
+        self.poll_updater();
         let revision_before = self
             .documents
             .get(self.active)
             .map_or(0, |d| d.buffer.revision());
 
-        egui::Panel::top("menu_bar").show(ui, |ui| self.menu_bar(ui));
-        egui::Panel::bottom("status_bar").show(ui, |ui| self.status_bar(ui));
+        let panel_frame =
+            egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin::symmetric(10, 6));
+        egui::Panel::top("menu_bar")
+            .frame(panel_frame)
+            .show(ui, |ui| self.menu_bar(ui));
+        egui::Panel::bottom("status_bar")
+            .frame(panel_frame)
+            .show(ui, |ui| self.status_bar(ui));
         if self.terminal_open {
             egui::Panel::bottom("terminal")
                 .resizable(true)
@@ -1093,6 +1397,7 @@ impl eframe::App for ForgeApp {
                 .show(ui, |ui| self.terminal_panel(ui));
         }
         egui::Panel::left("explorer")
+            .frame(panel_frame.inner_margin(egui::Margin::same(10)))
             .resizable(true)
             .default_size(240.0)
             .show(ui, |ui| self.explorer(ui));
