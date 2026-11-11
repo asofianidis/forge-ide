@@ -9,6 +9,7 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
 - File explorer with lazily-loaded directory tree
 - Tabbed editing with unsaved-change indicators
 - Syntax highlighting for many languages (via [syntect](https://github.com/trishume/syntect))
+- Line-number gutter with current-line highlight
 - Cursor line/column in the status bar
 - Native open/save dialogs (via [rfd](https://github.com/PolyMeilex/rfd))
 - Themes: built-in **Blossom** (default) and **Blossom Light**, plus custom TOML themes
@@ -102,12 +103,13 @@ src/
 ├── workspace.rs         # file tree / project explorer
 └── editor/
     ├── document.rs      # open file buffer, load/save, dirty tracking
+    ├── gutter.rs        # line-number gutter
     └── highlight.rs     # syntect → egui LayoutJob highlighting
 ```
 
 ## Roadmap
 
-- [ ] Line-number gutter
+- [x] Line-number gutter
 - [ ] Rope-based buffer for large files, undo/redo history
 - [ ] Find / replace, go to line
 - [ ] Command palette

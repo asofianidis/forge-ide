@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use egui::{Key, KeyboardShortcut, Modifiers, TextStyle};
 
-use crate::editor::{Document, Highlighter};
+use crate::editor::{Document, Highlighter, gutter};
 use crate::settings::Settings;
 use crate::theme::{self, Theme};
 use crate::updater::{self, UpdateState, Updater};
@@ -513,6 +513,9 @@ impl ForgeApp {
         let extension = doc.extension().to_owned();
         let highlighter = &mut self.highlighter;
         let font = TextStyle::Monospace.resolve(ui.style());
+        let digit_width = ui.fonts_mut(|f| f.glyph_width(&font, '0'));
+        let gutter_width = gutter::width(doc.line_count(), digit_width);
+        let current_line = self.cursor.0;
 
         let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
             let mut job = highlighter.highlight(text.as_str(), &extension, font.clone());
@@ -521,16 +524,25 @@ impl ForgeApp {
         };
 
         let output = egui::ScrollArea::both()
+            .id_salt("editor_scroll")
             .auto_shrink(false)
             .show(ui, |ui| {
-                egui::TextEdit::multiline(&mut doc.text)
+                let output = egui::TextEdit::multiline(&mut doc.text)
                     .id_salt(self.active)
                     .code_editor()
                     .lock_focus(true)
                     .desired_width(f32::INFINITY)
                     .desired_rows(40)
+                    .margin(egui::Margin {
+                        left: gutter_width as i8,
+                        right: 4,
+                        top: 2,
+                        bottom: 2,
+                    })
                     .layouter(&mut layouter)
-                    .show(ui)
+                    .show(ui);
+                gutter::paint(ui, &output, current_line, &font);
+                output
             })
             .inner;
 
