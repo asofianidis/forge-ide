@@ -1,0 +1,43 @@
+# Example custom theme for Forge IDE.
+#
+# Copy this file into your themes directory and edit it:
+#   Linux:   ~/.config/forge-ide/themes/
+#   macOS:   ~/Library/Application Support/forge-ide/themes/
+#   Windows: %APPDATA%\forge-ide\themes\
+# (View → Theme → Open Themes Folder opens it for you.)
+#
+# Then pick it from View → Theme (use "Reload Themes" after editing).
+#
+# Only `name` is required. Anything you leave out is inherited from the
+# theme named in `extends` ("Blossom" by default, or "Blossom Light", or another
+# theme loaded before this one). Colors are "#rrggbb" or "#rrggbbaa".
+
+name = "Midnight Teal"
+extends = "Blossom"
+
+# dark = true          # use egui's dark defaults underneath
+# corner_radius = 8    # rounding of buttons, tabs and menus
+
+[ui]
+panel = "#0f1a1c"
+editor = "#132225"
+surface = "#18292d"
+widget = "#1c3035"
+widget_hover = "#244046"
+accent = "#0f9d8f"
+accent_text = "#eafffb"
+selection = "#1f5c57"
+border = "#22383d"
+cursor = "#5eead4"
+link = "#5eead4"
+# text = "#..."
+# text_muted = "#..."
+# warning = "#..."
+# error = "#..."
+
+[syntax]
+keyword = "#5eead4"
+function = "#93c5fd"
+type = "#fcd34d"
+# text, comment, string, number, constant, variable, operator,
+# punctuation, tag, attribute, invalid
