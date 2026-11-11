@@ -11,6 +11,36 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
 - Syntax highlighting for many languages (via [syntect](https://github.com/trishume/syntect))
 - Cursor line/column in the status bar
 - Native open/save dialogs (via [rfd](https://github.com/PolyMeilex/rfd))
+- Themes: built-in **Blossom** (default) and **Blossom Light**, plus custom TOML themes
+
+## Themes
+
+Switch themes from **View → Theme**. Your choice is remembered between sessions.
+
+Custom themes are TOML files in the themes folder (**View → Theme → Open Themes Folder**):
+
+| OS      | Location                                          |
+|---------|---------------------------------------------------|
+| Linux   | `~/.config/forge-ide/themes/`                     |
+| macOS   | `~/Library/Application Support/forge-ide/themes/` |
+| Windows | `%APPDATA%\forge-ide\themes\`                     |
+
+A theme only needs a `name`. Anything you leave out comes from the theme named in `extends`
+(`"Blossom"` if you don't set one):
+
+```toml
+name = "My Theme"
+extends = "Blossom Light"
+
+[ui]
+accent = "#0f9d8f"
+
+[syntax]
+keyword = "#0f9d8f"
+```
+
+See [`themes/example.toml`](themes/example.toml) for every key. After editing a file, use
+**View → Theme → Reload Themes**. Files that fail to load are reported in the status bar.
 
 ## Getting started
 
@@ -38,6 +68,7 @@ cargo run --release -- path/to/project
 src/
 ├── main.rs              # entry point, window setup
 ├── app.rs               # application state and UI layout
+├── theme.rs             # built-in + custom themes, settings
 ├── workspace.rs         # file tree / project explorer
 └── editor/
     ├── document.rs      # open file buffer, load/save, dirty tracking
@@ -53,7 +84,8 @@ src/
 - [ ] Unsaved-changes prompt on close
 - [ ] Integrated terminal
 - [ ] LSP client (diagnostics, completion, go to definition)
-- [ ] Settings and themes
+- [x] Themes
+- [ ] Settings UI
 
 ## License
 
