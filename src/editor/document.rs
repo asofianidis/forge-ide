@@ -63,6 +63,11 @@ impl Document {
             .unwrap_or("txt")
     }
 
+    /// Number of lines in the buffer (an empty buffer has one line).
+    pub fn line_count(&self) -> usize {
+        self.text.bytes().filter(|&b| b == b'\n').count() + 1
+    }
+
     /// 1-based (line, column) of a character offset.
     pub fn line_col(&self, char_idx: usize) -> (usize, usize) {
         let mut line = 1;
@@ -91,6 +96,16 @@ mod tests {
         assert_eq!(doc.line_col(2), (1, 3));
         assert_eq!(doc.line_col(3), (2, 1));
         assert_eq!(doc.line_col(7), (3, 2));
+    }
+
+    #[test]
+    fn line_count_includes_trailing_empty_line() {
+        let mut doc = Document::untitled();
+        assert_eq!(doc.line_count(), 1);
+        doc.text = "a\nb".into();
+        assert_eq!(doc.line_count(), 2);
+        doc.text.push('\n');
+        assert_eq!(doc.line_count(), 3);
     }
 
     #[test]
