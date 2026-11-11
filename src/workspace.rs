@@ -110,7 +110,7 @@ impl FileKinds {
                 if file_type.is_dir() {
                     if depth < SCAN_MAX_DEPTH
                         && !IGNORED_DIRS.contains(&name.as_str())
-                        && !name.starts_with('.')
+                        && (!name.starts_with('.') || name == ".github")
                     {
                         stack.push((entry.path(), depth + 1));
                     }

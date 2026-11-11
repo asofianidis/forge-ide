@@ -11,6 +11,9 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
 - Syntax highlighting for many languages (via [syntect](https://github.com/trishume/syntect))
 - Cursor line/column in the status bar
 - Native open/save dialogs (via [rfd](https://github.com/PolyMeilex/rfd))
+- Language server browser (**Tools → Language Servers…**): finds servers for the
+  languages in your project, shows which are installed, and installs missing ones
+  with one click via the language's own toolchain (rustup, npm, go, pipx, …)
 
 ## Getting started
 
@@ -38,7 +41,12 @@ cargo run --release -- path/to/project
 src/
 ├── main.rs              # entry point, window setup
 ├── app.rs               # application state and UI layout
-├── workspace.rs         # file tree / project explorer
+├── workspace.rs         # file tree / project explorer, file-type scan
+├── lsp/
+│   ├── catalog.rs       # known language servers and their install commands
+│   ├── detect.rs        # finding installed servers / package managers
+│   ├── install.rs       # background install jobs
+│   └── browser.rs       # "Language Servers" window
 └── editor/
     ├── document.rs      # open file buffer, load/save, dirty tracking
     └── highlight.rs     # syntect → egui LayoutJob highlighting
@@ -52,6 +60,7 @@ src/
 - [ ] Command palette
 - [ ] Unsaved-changes prompt on close
 - [ ] Integrated terminal
+- [x] Language server discovery and installation
 - [ ] LSP client (diagnostics, completion, go to definition)
 - [ ] Settings and themes
 
