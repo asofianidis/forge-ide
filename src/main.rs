@@ -2,6 +2,7 @@
 
 mod app;
 mod editor;
+mod lsp;
 mod workspace;
 
 use app::ForgeApp;
