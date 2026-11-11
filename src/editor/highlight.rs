@@ -3,11 +3,9 @@
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontId, Stroke};
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{FontStyle, Theme, ThemeSet};
+use syntect::highlighting::{FontStyle, Theme};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
-
-const THEME_NAME: &str = "base16-ocean.dark";
 
 /// Last highlighted input, so unchanged text isn't re-highlighted every frame.
 struct Cached {
@@ -22,22 +20,21 @@ pub struct Highlighter {
     cache: Option<Cached>,
 }
 
-impl Default for Highlighter {
-    fn default() -> Self {
-        let mut themes = ThemeSet::load_defaults();
-        let theme = themes
-            .themes
-            .remove(THEME_NAME)
-            .expect("theme is bundled with syntect");
+impl Highlighter {
+    pub fn new(theme: Theme) -> Self {
         Self {
             syntaxes: SyntaxSet::load_defaults_newlines(),
             theme,
             cache: None,
         }
     }
-}
 
-impl Highlighter {
+    /// Switches the color theme, invalidating cached highlighting.
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+        self.cache = None;
+    }
+
     pub fn highlight(&mut self, text: &str, extension: &str, font: FontId) -> LayoutJob {
         if let Some(c) = &self.cache
             && c.extension == extension
@@ -67,7 +64,7 @@ impl Highlighter {
                 job.append(
                     line,
                     0.0,
-                    TextFormat::simple(font.clone(), Color32::LIGHT_GRAY),
+                    TextFormat::simple(font.clone(), self.foreground()),
                 );
                 continue;
             };
@@ -83,6 +80,14 @@ impl Highlighter {
             }
         }
         job
+    }
+
+    fn foreground(&self) -> Color32 {
+        self.theme
+            .settings
+            .foreground
+            .map(|c| Color32::from_rgb(c.r, c.g, c.b))
+            .unwrap_or(Color32::LIGHT_GRAY)
     }
 
     pub fn background(&self) -> Color32 {
