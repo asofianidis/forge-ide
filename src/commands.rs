@@ -39,6 +39,9 @@ pub enum Command {
     IncreaseFontSize,
     DecreaseFontSize,
     ResetFontSize,
+    ReloadThemes,
+    OpenThemesFolder,
+    CheckForUpdates,
 }
 
 impl Command {
@@ -67,6 +70,9 @@ impl Command {
         Command::ResetFontSize,
         Command::OpenSettings,
         Command::OpenSettingsFile,
+        Command::ReloadThemes,
+        Command::OpenThemesFolder,
+        Command::CheckForUpdates,
         Command::Quit,
     ];
 
@@ -97,6 +103,9 @@ impl Command {
             Command::IncreaseFontSize => "View: Increase Font Size",
             Command::DecreaseFontSize => "View: Decrease Font Size",
             Command::ResetFontSize => "View: Reset Font Size",
+            Command::ReloadThemes => "View: Reload Themes",
+            Command::OpenThemesFolder => "View: Open Themes Folder",
+            Command::CheckForUpdates => "Help: Check for Updates",
         }
     }
 
@@ -132,6 +141,7 @@ impl Command {
             Command::IncreaseFontSize => shortcut(CMD, Key::Equals),
             Command::DecreaseFontSize => shortcut(CMD, Key::Minus),
             Command::ResetFontSize => shortcut(CMD, Key::Num0),
+            Command::ReloadThemes | Command::OpenThemesFolder | Command::CheckForUpdates => None,
         }
     }
 
