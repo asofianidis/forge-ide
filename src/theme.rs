@@ -476,34 +476,6 @@ pub fn load_all(dir: Option<&Path>) -> (Vec<Theme>, Vec<String>) {
     (themes, errors)
 }
 
-/// Persisted user preferences.
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct Settings {
-    pub theme: Option<String>,
-}
-
-impl Settings {
-    fn path() -> Option<PathBuf> {
-        config_dir().map(|d| d.join("settings.toml"))
-    }
-
-    pub fn load() -> Self {
-        Self::path()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| toml::from_str(&s).ok())
-            .unwrap_or_default()
-    }
-
-    pub fn save(&self) -> Result<()> {
-        let path = Self::path().context("no config directory")?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&path, toml::to_string_pretty(self)?)
-            .with_context(|| format!("could not write {}", path.display()))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

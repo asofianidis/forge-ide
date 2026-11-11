@@ -12,6 +12,34 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
 - Cursor line/column in the status bar
 - Native open/save dialogs (via [rfd](https://github.com/PolyMeilex/rfd))
 - Themes: built-in **Blossom** (default) and **Blossom Light**, plus custom TOML themes
+- Automatic updates from GitHub releases
+
+## Install
+
+Download the archive for your platform from the
+[latest release](https://github.com/asofianidis/forge-ide/releases/latest), extract it, and
+run `forge-ide` (`forge-ide.exe` on Windows). Builds are published for Windows (x64),
+Linux (x64), and macOS (Apple Silicon and Intel).
+
+> **macOS:** the binary isn't signed yet. If Gatekeeper blocks it, run
+> `xattr -d com.apple.quarantine forge-ide` once.
+
+## Updates
+
+Release builds check for a new version on startup. When one is available, an
+**Update to …** button appears in the status bar. Click it to download and install the new version
+(verified against the release's `SHA256SUMS`), then **Restart to update**. Restarting is disabled
+while you have unsaved changes.
+
+You can also use **Help → Check for Updates**, or turn off the startup check under
+**Help → Check for Updates on Startup**. Builds you compile yourself only check when you ask.
+
+### Releases
+
+Every push to `main` runs [`.github/workflows/release.yml`](.github/workflows/release.yml). It
+checks and tests the code, builds all platforms, and publishes a GitHub release tagged
+`v<major>.<minor>.<run number>`, using the major/minor from `Cargo.toml`, e.g. `v0.1.42`.
+To start a new series, bump the major or minor version in `Cargo.toml`.
 
 ## Themes
 
@@ -68,7 +96,9 @@ cargo run --release -- path/to/project
 src/
 ├── main.rs              # entry point, window setup
 ├── app.rs               # application state and UI layout
-├── theme.rs             # built-in + custom themes, settings
+├── settings.rs          # persisted preferences (settings.toml)
+├── theme.rs             # built-in + custom themes
+├── updater.rs           # self-update from GitHub releases
 ├── workspace.rs         # file tree / project explorer
 └── editor/
     ├── document.rs      # open file buffer, load/save, dirty tracking
