@@ -1,5 +1,6 @@
 //! User settings, persisted as TOML in `<config dir>/forge-ide/settings.toml`.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
@@ -25,6 +26,40 @@ pub struct Settings {
     pub terminal_shell: Option<String>,
     /// Check for updates on startup. Defaults to on for release builds.
     pub auto_update: Option<bool>,
+    /// Language servers by file extension, overriding the built-in defaults.
+    /// An empty `command` disables the server for that extension.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub language_servers: BTreeMap<String, ServerConfig>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+impl ServerConfig {
+    fn new(command: &str, args: &[&str]) -> Self {
+        Self {
+            command: command.to_owned(),
+            args: args.iter().map(|&a| a.to_owned()).collect(),
+        }
+    }
+}
+
+/// Language servers used when none is configured for an extension.
+fn builtin_language_server(extension: &str) -> Option<ServerConfig> {
+    Some(match extension {
+        "rs" => ServerConfig::new("rust-analyzer", &[]),
+        "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => ServerConfig::new("clangd", &[]),
+        "go" => ServerConfig::new("gopls", &[]),
+        "py" => ServerConfig::new("pylsp", &[]),
+        "js" | "mjs" | "cjs" | "jsx" | "ts" | "mts" | "cts" | "tsx" => {
+            ServerConfig::new("typescript-language-server", &["--stdio"])
+        }
+        _ => return None,
+    })
 }
 
 impl Default for Settings {
@@ -36,6 +71,7 @@ impl Default for Settings {
             line_numbers: true,
             terminal_shell: None,
             auto_update: None,
+            language_servers: BTreeMap::new(),
         }
     }
 }
@@ -57,6 +93,15 @@ impl Settings {
                 .with_context(|| format!("invalid settings in {}", path.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("failed to read {}", path.display())),
+        }
+    }
+
+    /// The language server for files with this extension, if any.
+    pub fn language_server(&self, extension: &str) -> Option<ServerConfig> {
+        match self.language_servers.get(extension) {
+            Some(config) if config.command.trim().is_empty() => None,
+            Some(config) => Some(config.clone()),
+            None => builtin_language_server(extension),
         }
     }
 
@@ -155,6 +200,10 @@ mod tests {
                 line_numbers: false,
                 auto_update,
                 terminal_shell: Some("bash --login".into()),
+                language_servers: BTreeMap::from([(
+                    "py".to_owned(),
+                    ServerConfig::new("pyright-langserver", &["--stdio"]),
+                )]),
             };
             let text = toml::to_string_pretty(&settings).unwrap();
             assert_eq!(Settings::parse(&text).unwrap(), settings);
@@ -177,6 +226,26 @@ mod tests {
         assert_eq!(settings.theme, "Blossom Light");
         assert_eq!(settings.auto_update, Some(false));
         assert_eq!(settings.font_size, Settings::default().font_size);
+    }
+
+    #[test]
+    fn language_servers_override_builtins() {
+        let settings = Settings::parse(
+            "[language_servers.py]\ncommand = \"pyright-langserver\"\nargs = [\"--stdio\"]\n\
+             [language_servers.rs]\ncommand = \"\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            settings.language_server("py").unwrap().command,
+            "pyright-langserver"
+        );
+        assert_eq!(
+            settings.language_server("rs"),
+            None,
+            "empty command disables"
+        );
+        assert_eq!(settings.language_server("go").unwrap().command, "gopls");
+        assert_eq!(settings.language_server("txt"), None);
     }
 
     #[test]

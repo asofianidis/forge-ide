@@ -219,12 +219,14 @@ impl Buffer {
 
     /// Replaces several non-overlapping char ranges as a single undo step.
     ///
-    /// Returns the char range of each inserted text in the resulting buffer.
-    pub fn replace_ranges(&mut self, mut edits: Vec<(Range<usize>, String)>) -> Vec<Range<usize>> {
-        edits.sort_by_key(|(r, _)| r.start);
+    /// Returns the char range of each inserted text in the resulting buffer, in
+    /// the same order as `edits`.
+    pub fn replace_ranges(&mut self, edits: Vec<(Range<usize>, String)>) -> Vec<Range<usize>> {
+        let mut order: Vec<usize> = (0..edits.len()).collect();
+        order.sort_by_key(|&i| edits[i].0.start);
         // Apply back to front so earlier offsets stay valid.
         let mut recorded = Vec::with_capacity(edits.len());
-        for (range, text) in edits.iter().rev() {
+        for (range, text) in order.iter().rev().map(|&i| &edits[i]) {
             let removed = self.rope.slice(range.clone()).to_string();
             self.apply(range.clone(), text);
             recorded.push(Edit {
@@ -237,16 +239,56 @@ impl Buffer {
             self.history.record_transaction(recorded, Instant::now());
         }
         // Resulting positions, accounting for the size change of earlier edits.
+        let mut placed = vec![0..0; edits.len()];
         let mut shift: isize = 0;
-        edits
-            .iter()
-            .map(|(range, text)| {
-                let start = (range.start as isize + shift) as usize;
-                let len = text.chars().count();
-                shift += len as isize - range.len() as isize;
-                start..start + len
-            })
-            .collect()
+        for i in order {
+            let (range, text) = &edits[i];
+            let start = (range.start as isize + shift) as usize;
+            let len = text.chars().count();
+            shift += len as isize - range.len() as isize;
+            placed[i] = start..start + len;
+        }
+        placed
+    }
+
+    /// Start of the identifier-like word ending at `char_idx`.
+    pub fn word_start(&self, char_idx: usize) -> usize {
+        let mut start = char_idx.min(self.rope.len_chars());
+        while start > 0 {
+            let c = self.rope.char(start - 1);
+            if !(c.is_alphanumeric() || c == '_') {
+                break;
+            }
+            start -= 1;
+        }
+        start
+    }
+
+    /// LSP position (0-based line, UTF-16 code unit column) of a char offset.
+    pub fn lsp_position(&self, char_idx: usize) -> (u32, u32) {
+        let char_idx = char_idx.min(self.rope.len_chars());
+        let line = self.rope.char_to_line(char_idx);
+        let line_start = self.rope.line_to_char(line);
+        let col = self.rope.char_to_utf16_cu(char_idx) - self.rope.char_to_utf16_cu(line_start);
+        (line as u32, col as u32)
+    }
+
+    /// Char offset of an LSP position, clamped to the buffer and the line's length.
+    pub fn char_from_lsp_position(&self, line: u32, character: u32) -> usize {
+        let line = line as usize;
+        if line >= self.rope.len_lines() {
+            return self.rope.len_chars();
+        }
+        let line_start = self.rope.line_to_char(line);
+        let content = self.rope.line(line);
+        let line_len = content
+            .chars()
+            .take_while(|&c| c != '\n' && c != '\r')
+            .count();
+        let base = self.rope.char_to_utf16_cu(line_start);
+        let target = base + character as usize;
+        let end_cu = self.rope.char_to_utf16_cu(line_start + line_len);
+        self.rope.utf16_cu_to_char(target.min(end_cu))
     }
 
     pub fn can_undo(&self) -> bool {
@@ -403,7 +445,7 @@ mod tests {
         let rev = buf.revision();
         let placed = buf.replace_ranges(vec![(3..4, "++".into()), (1..2, "".into())]);
         assert_eq!(buf.as_str(), "ab++c");
-        assert_eq!(placed, vec![1..1, 2..4]);
+        assert_eq!(placed, vec![2..4, 1..1], "same order as the input");
         assert!(buf.revision() > rev);
         assert_in_sync(&buf);
         buf.undo();
@@ -411,6 +453,29 @@ mod tests {
         assert_in_sync(&buf);
         buf.redo();
         assert_eq!(buf.as_str(), "ab++c");
+    }
+
+    #[test]
+    fn word_start_scans_identifier_chars() {
+        let buf = Buffer::from("self.foo_bar1 x");
+        assert_eq!(buf.word_start(13), 5);
+        assert_eq!(buf.word_start(5), 5);
+        assert_eq!(buf.word_start(4), 0);
+        assert_eq!(buf.word_start(0), 0);
+    }
+
+    #[test]
+    fn lsp_positions_use_utf16_columns() {
+        // '😀' is one char but two UTF-16 code units.
+        let buf = Buffer::from("a😀b\r\nxyz");
+        assert_eq!(buf.lsp_position(2), (0, 3));
+        assert_eq!(buf.char_from_lsp_position(0, 3), 2);
+        assert_eq!(buf.lsp_position(6), (1, 1));
+        assert_eq!(buf.char_from_lsp_position(1, 1), 6);
+        // Past the end of a line clamps before its line break; past the end of the
+        // buffer clamps to the end.
+        assert_eq!(buf.char_from_lsp_position(0, 99), 3);
+        assert_eq!(buf.char_from_lsp_position(9, 0), buf.rope.len_chars());
     }
 
     #[test]

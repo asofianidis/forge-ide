@@ -1,5 +1,7 @@
 //! Top-level application state and UI layout.
 
+mod language;
+
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -7,8 +9,10 @@ use egui::TextStyle;
 use egui::text::{CCursor, CCursorRange};
 
 use crate::commands::Command;
-use crate::editor::{Document, Highlighter, gutter, search};
+use crate::completion::CompletionPopup;
+use crate::editor::{Document, Highlighter, Severity, gutter, search};
 use crate::find_bar::{FindAction, FindBar, GotoLine};
+use crate::lsp::LspManager;
 use crate::palette::Palette;
 use crate::settings::{self, Settings};
 use crate::terminal::Terminal;
@@ -51,6 +55,10 @@ pub struct ForgeApp {
     cursor: (usize, usize),
     /// Current selection in the active document, as a char range (empty = caret).
     selection: Range<usize>,
+    /// Char offset of the caret (the moving end of the selection).
+    cursor_offset: usize,
+    /// Screen position just below the caret, for anchoring popups.
+    cursor_screen_pos: Option<egui::Pos2>,
     /// Selection to apply (and scroll to) in the active editor on the next frame.
     pending_selection: Option<PendingSelection>,
     find: FindBar,
@@ -68,6 +76,8 @@ pub struct ForgeApp {
     settings_reload_pending: bool,
     terminal: Option<Terminal>,
     terminal_open: bool,
+    lsp: LspManager,
+    completion: Option<CompletionPopup>,
     /// Give the terminal keyboard focus on the next frame.
     focus_terminal: bool,
     updater: Updater,
@@ -99,6 +109,8 @@ impl ForgeApp {
             status: theme_errors_status(&errors).unwrap_or_else(|| "Ready".to_owned()),
             cursor: (1, 1),
             selection: 0..0,
+            cursor_offset: 0,
+            cursor_screen_pos: None,
             pending_selection: None,
             find: FindBar::default(),
             goto_line: GotoLine::default(),
@@ -111,6 +123,8 @@ impl ForgeApp {
             settings_reload_pending: false,
             terminal: None,
             terminal_open: false,
+            lsp: LspManager::default(),
+            completion: None,
             focus_terminal: false,
             updater: Updater::default(),
             last_update_state: UpdateState::Idle,
@@ -540,6 +554,7 @@ impl ForgeApp {
         match result {
             Ok(()) => {
                 self.status = format!("Saved {}", doc.title());
+                self.lsp.did_save(doc);
                 if doc.path.is_some() && doc.path == self.settings_path {
                     self.settings_reload_pending = true;
                 }
@@ -697,7 +712,8 @@ impl ForgeApp {
     /// Closes a tab unconditionally, discarding unsaved changes.
     fn close_tab(&mut self, idx: usize) {
         if idx < self.documents.len() {
-            self.documents.remove(idx);
+            let doc = self.documents.remove(idx);
+            self.lsp.did_close(&doc);
         }
         if self.documents.is_empty() {
             self.documents.push(Document::untitled());
@@ -751,6 +767,17 @@ impl ForgeApp {
                 self.terminal = None;
                 self.terminal_open = true;
                 self.start_terminal(ctx);
+            }
+            Command::TriggerCompletion => self.trigger_completion(),
+            Command::GoToDefinition => self.go_to_definition(),
+            Command::NextProblem => self.goto_problem(true),
+            Command::PreviousProblem => self.goto_problem(false),
+            Command::RestartLanguageServers => {
+                self.lsp.restart();
+                for doc in &mut self.documents {
+                    doc.diagnostics.clear();
+                }
+                self.status = "Restarting language servers".to_owned();
             }
             Command::IncreaseFontSize => self.change_font_size(ctx, 1.0),
             Command::DecreaseFontSize => self.change_font_size(ctx, -1.0),
@@ -818,9 +845,20 @@ impl ForgeApp {
             ),
             (
                 "Edit",
-                &[&[Undo, Redo], &[Find, Replace, FindNext, FindPrevious]],
+                &[
+                    &[Undo, Redo],
+                    &[Find, Replace, FindNext, FindPrevious],
+                    &[TriggerCompletion],
+                ],
             ),
-            ("Go", &[&[GoToLine], &[NextTab, PreviousTab]]),
+            (
+                "Go",
+                &[
+                    &[GoToLine, GoToDefinition],
+                    &[NextProblem, PreviousProblem],
+                    &[NextTab, PreviousTab],
+                ],
+            ),
         ];
         egui::MenuBar::new().ui(ui, |ui| {
             for (title, groups) in menus {
@@ -862,6 +900,8 @@ impl ForgeApp {
                 ui.separator();
                 self.menu_command(ui, ToggleTerminal);
                 self.menu_command(ui, RestartTerminal);
+                ui.separator();
+                self.menu_command(ui, RestartLanguageServers);
                 ui.separator();
                 self.menu_command(ui, OpenSettings);
                 self.menu_command(ui, OpenSettingsFile);
@@ -918,6 +958,17 @@ impl ForgeApp {
                     ui.label(doc.extension());
                     ui.separator();
                     ui.label(format!("Ln {}, Col {}", self.cursor.0, self.cursor.1));
+                    if let Some(status) = self.lsp.status(doc) {
+                        ui.separator();
+                        ui.weak(status);
+                    }
+                    let count = |s| doc.diagnostics.iter().filter(|d| d.severity == s).count();
+                    let (errors, warnings) = (count(Severity::Error), count(Severity::Warning));
+                    if errors + warnings > 0 {
+                        ui.separator();
+                        ui.label(format!("⊗ {errors}  ⚠ {warnings}"))
+                            .on_hover_text("Errors and warnings; F8 jumps to the next one");
+                    }
                 }
             });
         });
@@ -1023,6 +1074,7 @@ impl ForgeApp {
         });
         let find = &self.find;
         let matches = if find.open { find.matches() } else { &[] };
+        let mut hovered_problem = None;
 
         let mut output = egui::ScrollArea::both()
             .id_salt("editor_scroll")
@@ -1046,6 +1098,7 @@ impl ForgeApp {
                     gutter::paint(ui, &output, current_line, &font);
                 }
                 paint_matches(ui, &output, matches, find.current);
+                hovered_problem = language::paint_diagnostics(ui, &output, &doc.diagnostics);
                 if let Some(cursor) = reveal {
                     let rect = output
                         .galley
@@ -1060,10 +1113,27 @@ impl ForgeApp {
         // Undo history lives in `Buffer`; drop egui's whole-text snapshots.
         output.state.clear_undoer();
 
+        if let Some(message) = hovered_problem {
+            output
+                .response
+                .response
+                .clone()
+                .on_hover_text_at_pointer(message);
+        }
+
         if let Some(range) = output.cursor_range {
             let [start, end] = range.sorted_cursors();
             self.selection = start.index.into()..end.index.into();
-            self.cursor = doc.line_col(range.primary.index.into());
+            self.cursor_offset = range.primary.index.into();
+            self.cursor = doc.line_col(self.cursor_offset);
+            let caret = output
+                .galley
+                .pos_from_cursor(range.primary)
+                .translate(output.galley_pos.to_vec2());
+            self.cursor_screen_pos = ui
+                .clip_rect()
+                .contains(caret.left_bottom())
+                .then(|| caret.left_bottom());
         }
     }
 
@@ -1298,10 +1368,18 @@ impl eframe::App for ForgeApp {
             self.reload_settings(&ctx);
         }
         self.intercept_window_close(&ctx);
+        self.update_language_servers(&ctx);
         if !self.palette.open {
+            if self.editor_has_keyboard(&ctx) {
+                self.completion_keys(&ctx);
+            }
             self.handle_shortcuts(&ctx);
         }
         self.poll_updater();
+        let revision_before = self
+            .documents
+            .get(self.active)
+            .map_or(0, |d| d.buffer.revision());
 
         let panel_frame =
             egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin::symmetric(10, 6));
@@ -1333,6 +1411,8 @@ impl eframe::App for ForgeApp {
                 self.find_bar(ui);
                 self.editor(ui);
             });
+        self.after_editor_update(revision_before);
+        self.completion_popup(&ctx);
 
         let line_count = self
             .documents

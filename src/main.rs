@@ -2,8 +2,10 @@
 
 mod app;
 mod commands;
+mod completion;
 mod editor;
 mod find_bar;
+mod lsp;
 mod palette;
 mod settings;
 mod terminal;
