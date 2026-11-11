@@ -129,7 +129,7 @@ impl FindBar {
         let mut action = None;
         let query_id = self.query_focus_id();
         ui.horizontal(|ui| {
-            let toggle = if self.show_replace { "⏷" } else { "⏵" };
+            let toggle = if self.show_replace { "▼" } else { "▶" };
             if ui
                 .small_button(toggle)
                 .on_hover_text("Toggle replace")
