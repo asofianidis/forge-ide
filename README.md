@@ -11,6 +11,7 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
 - Rope-backed buffers with grouped undo/redo history
 - Find / replace with match-case and regex options (`$1` capture groups in replacements)
 - Go to line[:column]
+- Command palette with fuzzy matching over every command
 - Syntax highlighting for many languages (via [syntect](https://github.com/trishume/syntect))
 - Line-number gutter with current-line highlight
 - Cursor line/column in the status bar
@@ -90,6 +91,7 @@ cargo run --release -- path/to/project
 | New file   | Ctrl+N   |
 | Open file  | Ctrl+O   |
 | Save       | Ctrl+S   |
+| Save as    | Ctrl+Shift+S |
 | Close tab  | Ctrl+W   |
 | Undo       | Ctrl+Z   |
 | Redo       | Ctrl+Y / Ctrl+Shift+Z |
@@ -97,6 +99,9 @@ cargo run --release -- path/to/project
 | Replace    | Ctrl+H   |
 | Find next / previous | F3 / Shift+F3 |
 | Go to line | Ctrl+G   |
+| Next / previous tab | Ctrl+Tab / Ctrl+Shift+Tab |
+| Command palette | Ctrl+Shift+P / F1 |
+| Quit       | Ctrl+Q   |
 
 (Cmd instead of Ctrl on macOS.)
 
@@ -106,7 +111,9 @@ cargo run --release -- path/to/project
 src/
 ├── main.rs              # entry point, window setup
 ├── app.rs               # application state and UI layout
+├── commands.rs          # command list: labels, shortcuts (shared by menus and palette)
 ├── find_bar.rs          # find/replace bar and go-to-line prompt
+├── palette.rs           # command palette and fuzzy matcher
 ├── settings.rs          # persisted preferences (settings.toml)
 ├── theme.rs             # built-in + custom themes
 ├── updater.rs           # self-update from GitHub releases
@@ -124,7 +131,7 @@ src/
 - [x] Line-number gutter
 - [x] Rope-based buffer for large files, undo/redo history
 - [x] Find / replace, go to line
-- [ ] Command palette
+- [x] Command palette
 - [x] Unsaved-changes prompt on close
 - [ ] Integrated terminal
 - [ ] LSP client (diagnostics, completion, go to definition)

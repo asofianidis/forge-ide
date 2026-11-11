@@ -1,8 +1,10 @@
 //! Forge IDE — a lightweight code editor written in Rust.
 
 mod app;
+mod commands;
 mod editor;
 mod find_bar;
+mod palette;
 mod settings;
 mod theme;
 mod updater;

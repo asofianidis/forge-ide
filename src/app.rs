@@ -3,29 +3,17 @@
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
+use egui::TextStyle;
 use egui::text::{CCursor, CCursorRange};
-use egui::{Key, KeyboardShortcut, Modifiers, TextStyle};
 
+use crate::commands::Command;
 use crate::editor::{Document, Highlighter, gutter, search};
 use crate::find_bar::{FindAction, FindBar, GotoLine};
+use crate::palette::Palette;
 use crate::settings::Settings;
 use crate::theme::{self, Theme};
 use crate::updater::{self, UpdateState, Updater};
 use crate::workspace::{FileNode, Workspace};
-
-const SHORTCUT_NEW: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::N);
-const SHORTCUT_OPEN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::O);
-const SHORTCUT_SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
-const SHORTCUT_CLOSE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::W);
-const SHORTCUT_UNDO: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Z);
-const SHORTCUT_REDO: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Y);
-const SHORTCUT_REDO_ALT: KeyboardShortcut =
-    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::Z);
-const SHORTCUT_FIND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::F);
-const SHORTCUT_REPLACE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::H);
-const SHORTCUT_GOTO_LINE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::G);
-const SHORTCUT_FIND_NEXT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::F3);
-const SHORTCUT_FIND_PREV: KeyboardShortcut = KeyboardShortcut::new(Modifiers::SHIFT, Key::F3);
 
 /// Something waiting on the user to decide what to do with unsaved changes.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -66,6 +54,7 @@ pub struct ForgeApp {
     pending_selection: Option<PendingSelection>,
     find: FindBar,
     goto_line: GotoLine,
+    palette: Palette,
     /// Close waiting on the unsaved-changes prompt.
     pending_close: Option<CloseRequest>,
     /// Set once the user has resolved unsaved changes, so the next close request goes through.
@@ -114,6 +103,7 @@ impl ForgeApp {
             pending_selection: None,
             find: FindBar::default(),
             goto_line: GotoLine::default(),
+            palette: Palette::default(),
             pending_close: None,
             allow_window_close: false,
             settings,
@@ -315,19 +305,34 @@ impl ForgeApp {
 
     /// Saves a document, asking for a path if it has none. Returns true on success.
     fn save_document(&mut self, idx: usize) -> bool {
+        match self.documents.get(idx) {
+            Some(doc) if doc.path.is_some() => {}
+            Some(_) => return self.save_document_as(idx),
+            None => return false,
+        }
+        let doc = &mut self.documents[idx];
+        let result = doc.save();
+        self.report_save(idx, result)
+    }
+
+    /// Saves a document under a new path chosen in a dialog. Returns true on success.
+    fn save_document_as(&mut self, idx: usize) -> bool {
         let Some(doc) = self.documents.get_mut(idx) else {
             return false;
         };
-        let result = if doc.path.is_some() {
-            doc.save()
-        } else if let Some(path) = rfd::FileDialog::new()
-            .set_file_name(doc.title())
-            .save_file()
-        {
-            doc.save_as(path)
-        } else {
+        let mut dialog = rfd::FileDialog::new().set_file_name(doc.title());
+        if let Some(dir) = doc.path.as_deref().and_then(Path::parent) {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(path) = dialog.save_file() else {
             return false;
         };
+        let result = doc.save_as(path);
+        self.report_save(idx, result)
+    }
+
+    fn report_save(&mut self, idx: usize, result: anyhow::Result<()>) -> bool {
+        let doc = &self.documents[idx];
         match result {
             Ok(()) => {
                 self.status = format!("Saved {}", doc.title());
@@ -495,164 +500,118 @@ impl ForgeApp {
         }
     }
 
+    /// Runs a command, whether it came from a shortcut, a menu or the palette.
+    fn run(&mut self, ctx: &egui::Context, command: Command) {
+        match command {
+            Command::NewFile => self.new_file(),
+            Command::OpenFile => self.open_file_dialog(),
+            Command::OpenFolder => self.open_folder_dialog(),
+            Command::Save => self.save_active(),
+            Command::SaveAs => {
+                self.save_document_as(self.active);
+            }
+            Command::CloseTab => self.request_close_tab(self.active),
+            Command::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Command::Undo => self.undo(),
+            Command::Redo => self.redo(),
+            Command::Find => self.open_find(false),
+            Command::Replace => self.open_find(true),
+            Command::FindNext => self.find_step(true),
+            Command::FindPrevious => self.find_step(false),
+            Command::GoToLine => self.goto_line.show(),
+            Command::NextTab => {
+                self.active = (self.active + 1) % self.documents.len();
+            }
+            Command::PreviousTab => {
+                self.active = self
+                    .active
+                    .checked_sub(1)
+                    .unwrap_or(self.documents.len() - 1);
+            }
+            Command::ShowPalette => self.palette.show(),
+            Command::ReloadThemes => self.reload_themes(ctx),
+            Command::OpenThemesFolder => self.open_themes_folder(),
+            Command::CheckForUpdates => self.check_for_updates(ctx),
+        }
+    }
+
+    /// Whether a command can run right now (greys out menu items).
+    fn is_enabled(&self, command: Command) -> bool {
+        let doc = self.documents.get(self.active);
+        match command {
+            Command::Undo => doc.is_some_and(|d| d.buffer.can_undo()),
+            Command::Redo => doc.is_some_and(|d| d.buffer.can_redo()),
+            Command::NextTab | Command::PreviousTab => self.documents.len() > 1,
+            Command::CheckForUpdates => !matches!(
+                self.updater.state(),
+                UpdateState::Checking | UpdateState::Installing(_)
+            ),
+            _ => true,
+        }
+    }
+
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let (new, open, save, close) = ctx.input_mut(|i| {
-            (
-                i.consume_shortcut(&SHORTCUT_NEW),
-                i.consume_shortcut(&SHORTCUT_OPEN),
-                i.consume_shortcut(&SHORTCUT_SAVE),
-                i.consume_shortcut(&SHORTCUT_CLOSE),
-            )
+        let editor_has_keyboard = self.editor_has_keyboard(ctx);
+        let triggered: Vec<Command> = ctx.input_mut(|i| {
+            Command::shortcut_table()
+                .into_iter()
+                // Leave e.g. Ctrl+Z to whichever other text field has focus.
+                .filter(|(_, cmd)| editor_has_keyboard || !cmd.needs_editor_focus())
+                .filter(|(shortcut, _)| i.consume_shortcut(shortcut))
+                .map(|(_, cmd)| cmd)
+                .collect()
         });
-        if new {
-            self.new_file();
-        }
-        if open {
-            self.open_file_dialog();
-        }
-        if save {
-            self.save_active();
-        }
-        if close {
-            self.request_close_tab(self.active);
-        }
-
-        let (find, replace, goto, find_prev, find_next) = ctx.input_mut(|i| {
-            (
-                i.consume_shortcut(&SHORTCUT_FIND),
-                i.consume_shortcut(&SHORTCUT_REPLACE),
-                i.consume_shortcut(&SHORTCUT_GOTO_LINE),
-                // Shift+F3 first: the plain F3 shortcut would also match it.
-                i.consume_shortcut(&SHORTCUT_FIND_PREV),
-                i.consume_shortcut(&SHORTCUT_FIND_NEXT),
-            )
-        });
-        if find || replace {
-            self.open_find(replace);
-        }
-        if goto {
-            self.goto_line.show();
-        }
-        if find_next {
-            self.find_step(true);
-        }
-        if find_prev {
-            self.find_step(false);
-        }
-
-        if self.editor_has_keyboard(ctx) {
-            // Consumed before the TextEdit runs, so egui's built-in undo never sees them.
-            // Redo first: the plain Ctrl+Z shortcut would also match Ctrl+Shift+Z.
-            let (redo, undo) = ctx.input_mut(|i| {
-                let redo =
-                    i.consume_shortcut(&SHORTCUT_REDO_ALT) | i.consume_shortcut(&SHORTCUT_REDO);
-                (redo, i.consume_shortcut(&SHORTCUT_UNDO))
-            });
-            if redo {
-                self.redo();
-            }
-            if undo {
-                self.undo();
-            }
+        for command in triggered {
+            self.run(ctx, command);
         }
     }
 
     // ---- panels --------------------------------------------------------
 
+    /// A menu entry for a command, with its shortcut hint. Runs it when clicked.
+    fn menu_command(&mut self, ui: &mut egui::Ui, command: Command) {
+        let mut button = egui::Button::new(command.menu_label());
+        if let Some(shortcut) = command.shortcut() {
+            button = button.shortcut_text(ui.ctx().format_shortcut(&shortcut));
+        }
+        if ui.add_enabled(self.is_enabled(command), button).clicked() {
+            self.run(&ui.ctx().clone(), command);
+        }
+    }
+
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
+        use Command::*;
+        let menus: [(&str, &[&[Command]]); 3] = [
+            (
+                "File",
+                &[
+                    &[NewFile, OpenFile, OpenFolder],
+                    &[Save, SaveAs, CloseTab],
+                    &[Quit],
+                ],
+            ),
+            (
+                "Edit",
+                &[&[Undo, Redo], &[Find, Replace, FindNext, FindPrevious]],
+            ),
+            ("Go", &[&[GoToLine], &[NextTab, PreviousTab]]),
+        ];
         egui::MenuBar::new().ui(ui, |ui| {
-            ui.menu_button("File", |ui| {
-                let ctx = ui.ctx().clone();
-                if ui
-                    .add(
-                        egui::Button::new("New File")
-                            .shortcut_text(ctx.format_shortcut(&SHORTCUT_NEW)),
-                    )
-                    .clicked()
-                {
-                    self.new_file();
-                }
-                if ui
-                    .add(
-                        egui::Button::new("Open File…")
-                            .shortcut_text(ctx.format_shortcut(&SHORTCUT_OPEN)),
-                    )
-                    .clicked()
-                {
-                    self.open_file_dialog();
-                }
-                if ui.button("Open Folder…").clicked() {
-                    self.open_folder_dialog();
-                }
-                ui.separator();
-                if ui
-                    .add(
-                        egui::Button::new("Save")
-                            .shortcut_text(ctx.format_shortcut(&SHORTCUT_SAVE)),
-                    )
-                    .clicked()
-                {
-                    self.save_active();
-                }
-                if ui
-                    .add(
-                        egui::Button::new("Close Tab")
-                            .shortcut_text(ctx.format_shortcut(&SHORTCUT_CLOSE)),
-                    )
-                    .clicked()
-                {
-                    self.request_close_tab(self.active);
-                }
-                ui.separator();
-                if ui.button("Quit").clicked() {
-                    ui.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            });
-            ui.menu_button("Edit", |ui| {
-                let ctx = ui.ctx().clone();
-                let (can_undo, can_redo) =
-                    self.documents.get(self.active).map_or((false, false), |d| {
-                        (d.buffer.can_undo(), d.buffer.can_redo())
-                    });
-                if ui
-                    .add_enabled(
-                        can_undo,
-                        egui::Button::new("Undo")
-                            .shortcut_text(ctx.format_shortcut(&SHORTCUT_UNDO)),
-                    )
-                    .clicked()
-                {
-                    self.undo();
-                }
-                if ui
-                    .add_enabled(
-                        can_redo,
-                        egui::Button::new("Redo")
-                            .shortcut_text(ctx.format_shortcut(&SHORTCUT_REDO)),
-                    )
-                    .clicked()
-                {
-                    self.redo();
-                }
-                ui.separator();
-                if menu_item(ui, "Find…", &SHORTCUT_FIND) {
-                    self.open_find(false);
-                }
-                if menu_item(ui, "Replace…", &SHORTCUT_REPLACE) {
-                    self.open_find(true);
-                }
-                if menu_item(ui, "Find Next", &SHORTCUT_FIND_NEXT) {
-                    self.find_step(true);
-                }
-                if menu_item(ui, "Find Previous", &SHORTCUT_FIND_PREV) {
-                    self.find_step(false);
-                }
-                ui.separator();
-                if menu_item(ui, "Go to Line…", &SHORTCUT_GOTO_LINE) {
-                    self.goto_line.show();
-                }
-            });
+            for (title, groups) in menus {
+                ui.menu_button(title, |ui| {
+                    for (i, group) in groups.iter().enumerate() {
+                        if i > 0 {
+                            ui.separator();
+                        }
+                        for &command in *group {
+                            self.menu_command(ui, command);
+                        }
+                    }
+                });
+            }
             ui.menu_button("View", |ui| {
+                self.menu_command(ui, ShowPalette);
+                ui.separator();
                 ui.menu_button("Theme", |ui| {
                     let mut chosen = None;
                     for (idx, theme) in self.themes.iter().enumerate() {
@@ -664,25 +623,12 @@ impl ForgeApp {
                         self.set_theme(ui.ctx(), idx);
                     }
                     ui.separator();
-                    if ui.button("Reload Themes").clicked() {
-                        self.reload_themes(ui.ctx());
-                    }
-                    if ui.button("Open Themes Folder").clicked() {
-                        self.open_themes_folder();
-                    }
+                    self.menu_command(ui, ReloadThemes);
+                    self.menu_command(ui, OpenThemesFolder);
                 });
             });
             ui.menu_button("Help", |ui| {
-                let busy = matches!(
-                    self.updater.state(),
-                    UpdateState::Checking | UpdateState::Installing(_)
-                );
-                if ui
-                    .add_enabled(!busy, egui::Button::new("Check for Updates"))
-                    .clicked()
-                {
-                    self.check_for_updates(ui.ctx());
-                }
+                self.menu_command(ui, CheckForUpdates);
                 let mut auto = self
                     .settings
                     .auto_update
@@ -1010,13 +956,6 @@ impl ForgeApp {
     }
 }
 
-/// A menu button with a shortcut hint. Returns true when clicked.
-fn menu_item(ui: &mut egui::Ui, label: &str, shortcut: &KeyboardShortcut) -> bool {
-    let hint = ui.ctx().format_shortcut(shortcut);
-    ui.add(egui::Button::new(label).shortcut_text(hint))
-        .clicked()
-}
-
 /// Highlights search matches inside the visible part of the editor.
 fn paint_matches(
     ui: &egui::Ui,
@@ -1105,7 +1044,9 @@ impl eframe::App for ForgeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.intercept_window_close(&ctx);
-        self.handle_shortcuts(&ctx);
+        if !self.palette.open {
+            self.handle_shortcuts(&ctx);
+        }
         self.poll_updater();
 
         let panel_frame =
@@ -1138,6 +1079,9 @@ impl eframe::App for ForgeApp {
             .map_or(1, Document::line_count);
         if let Some((line, col)) = self.goto_line.ui(ui.ctx(), line_count) {
             self.goto(line, col);
+        }
+        if let Some(command) = self.palette.ui(&ctx) {
+            self.run(&ctx, command);
         }
         self.close_prompt(&ctx);
     }
