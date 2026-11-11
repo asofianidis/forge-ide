@@ -1,21 +1,30 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context as _;
+use egui::TextBuffer as _;
+
+use super::Buffer;
 
 /// A single open file (or unsaved scratch buffer).
 pub struct Document {
+    /// Stable identity for this document's editor widget state.
+    pub id: egui::Id,
     pub path: Option<PathBuf>,
-    pub text: String,
-    /// Text as of the last load/save, used to compute the dirty flag.
-    saved_text: String,
+    pub buffer: Buffer,
+}
+
+fn next_id() -> egui::Id {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    egui::Id::unique(("document", NEXT.fetch_add(1, Ordering::Relaxed)))
 }
 
 impl Document {
     pub fn untitled() -> Self {
         Self {
+            id: next_id(),
             path: None,
-            text: String::new(),
-            saved_text: String::new(),
+            buffer: Buffer::default(),
         }
     }
 
@@ -23,17 +32,17 @@ impl Document {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
         Ok(Self {
+            id: next_id(),
             path: Some(path.to_path_buf()),
-            saved_text: text.clone(),
-            text,
+            buffer: Buffer::from(text.as_str()),
         })
     }
 
     pub fn save(&mut self) -> anyhow::Result<()> {
         let path = self.path.as_ref().context("document has no path")?;
-        std::fs::write(path, &self.text)
+        std::fs::write(path, self.buffer.as_str())
             .with_context(|| format!("failed to write {}", path.display()))?;
-        self.saved_text.clone_from(&self.text);
+        self.buffer.mark_saved();
         Ok(())
     }
 
@@ -43,7 +52,7 @@ impl Document {
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.text != self.saved_text
+        self.buffer.is_modified()
     }
 
     pub fn title(&self) -> String {
@@ -65,54 +74,41 @@ impl Document {
 
     /// Number of lines in the buffer (an empty buffer has one line).
     pub fn line_count(&self) -> usize {
-        self.text.bytes().filter(|&b| b == b'\n').count() + 1
+        self.buffer.line_count()
     }
 
     /// 1-based (line, column) of a character offset.
     pub fn line_col(&self, char_idx: usize) -> (usize, usize) {
-        let mut line = 1;
-        let mut col = 1;
-        for c in self.text.chars().take(char_idx) {
-            if c == '\n' {
-                line += 1;
-                col = 1;
-            } else {
-                col += 1;
-            }
-        }
-        (line, col)
+        self.buffer.line_col(char_idx)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn line_col_counts_newlines() {
-        let mut doc = Document::untitled();
-        doc.text = "ab\ncd\nef".into();
-        assert_eq!(doc.line_col(0), (1, 1));
-        assert_eq!(doc.line_col(2), (1, 3));
-        assert_eq!(doc.line_col(3), (2, 1));
-        assert_eq!(doc.line_col(7), (3, 2));
-    }
-
-    #[test]
-    fn line_count_includes_trailing_empty_line() {
-        let mut doc = Document::untitled();
-        assert_eq!(doc.line_count(), 1);
-        doc.text = "a\nb".into();
-        assert_eq!(doc.line_count(), 2);
-        doc.text.push('\n');
-        assert_eq!(doc.line_count(), 3);
-    }
+    use egui::text::CharIndex;
 
     #[test]
     fn dirty_tracking() {
         let mut doc = Document::untitled();
         assert!(!doc.is_dirty());
-        doc.text.push('x');
+        doc.buffer.insert_text("x", CharIndex(0));
         assert!(doc.is_dirty());
+        doc.buffer.undo();
+        assert!(!doc.is_dirty());
+    }
+
+    #[test]
+    fn save_marks_clean() {
+        let dir = std::env::temp_dir().join(format!("forge-doc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.txt");
+        let mut doc = Document::untitled();
+        doc.buffer.insert_text("hello", CharIndex(0));
+        doc.save_as(path.clone()).unwrap();
+        assert!(!doc.is_dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+        assert_eq!(Document::open(&path).unwrap().buffer.as_str(), "hello");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

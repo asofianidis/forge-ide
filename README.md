@@ -8,6 +8,7 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
 
 - File explorer with lazily-loaded directory tree
 - Tabbed editing with unsaved-change indicators
+- Rope-backed buffers with grouped undo/redo history
 - Syntax highlighting for many languages (via [syntect](https://github.com/trishume/syntect))
 - Line-number gutter with current-line highlight
 - Cursor line/column in the status bar
@@ -30,6 +31,8 @@ cargo run --release -- path/to/project
 | Open file  | Ctrl+O   |
 | Save       | Ctrl+S   |
 | Close tab  | Ctrl+W   |
+| Undo       | Ctrl+Z   |
+| Redo       | Ctrl+Y / Ctrl+Shift+Z |
 
 (Cmd instead of Ctrl on macOS.)
 
@@ -41,6 +44,7 @@ src/
 ├── app.rs               # application state and UI layout
 ├── workspace.rs         # file tree / project explorer
 └── editor/
+    ├── buffer.rs        # rope-backed text buffer, undo/redo history
     ├── document.rs      # open file buffer, load/save, dirty tracking
     ├── gutter.rs        # line-number gutter
     └── highlight.rs     # syntect → egui LayoutJob highlighting
@@ -49,7 +53,7 @@ src/
 ## Roadmap
 
 - [x] Line-number gutter
-- [ ] Rope-based buffer for large files, undo/redo history
+- [x] Rope-based buffer for large files, undo/redo history
 - [ ] Find / replace, go to line
 - [ ] Command palette
 - [ ] Unsaved-changes prompt on close

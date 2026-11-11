@@ -1,7 +1,9 @@
 //! Top-level application state and UI layout.
 
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
+use egui::text::{CCursor, CCursorRange};
 use egui::{Key, KeyboardShortcut, Modifiers, TextStyle};
 
 use crate::editor::{Document, Highlighter, gutter};
@@ -11,6 +13,10 @@ const SHORTCUT_NEW: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND,
 const SHORTCUT_OPEN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::O);
 const SHORTCUT_SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
 const SHORTCUT_CLOSE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::W);
+const SHORTCUT_UNDO: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Z);
+const SHORTCUT_REDO: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Y);
+const SHORTCUT_REDO_ALT: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::Z);
 
 pub struct ForgeApp {
     workspace: Option<Workspace>,
@@ -20,6 +26,8 @@ pub struct ForgeApp {
     status: String,
     /// 1-based (line, column) of the cursor in the active document.
     cursor: (usize, usize),
+    /// Char range to select (and scroll to) in the active editor on the next frame.
+    pending_selection: Option<Range<usize>>,
 }
 
 impl ForgeApp {
@@ -32,6 +40,7 @@ impl ForgeApp {
             highlighter: Highlighter::default(),
             status: "Ready".to_owned(),
             cursor: (1, 1),
+            pending_selection: None,
         }
     }
 
@@ -91,6 +100,33 @@ impl ForgeApp {
         };
     }
 
+    fn undo(&mut self) {
+        if let Some(doc) = self.documents.get_mut(self.active) {
+            if let Some(cursor) = doc.buffer.undo() {
+                self.pending_selection = Some(cursor..cursor);
+            } else {
+                self.status = "Nothing to undo".to_owned();
+            }
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(doc) = self.documents.get_mut(self.active) {
+            if let Some(cursor) = doc.buffer.redo() {
+                self.pending_selection = Some(cursor..cursor);
+            } else {
+                self.status = "Nothing to redo".to_owned();
+            }
+        }
+    }
+
+    /// Whether keyboard input currently targets the active editor (or nothing),
+    /// as opposed to some other text field with its own undo.
+    fn editor_has_keyboard(&self, ctx: &egui::Context) -> bool {
+        let focused = ctx.memory(|m| m.focused());
+        focused.is_none() || focused == self.documents.get(self.active).map(|d| d.id)
+    }
+
     fn close_tab(&mut self, idx: usize) {
         // TODO: prompt before discarding unsaved changes.
         if idx < self.documents.len() {
@@ -124,6 +160,22 @@ impl ForgeApp {
         }
         if close {
             self.close_tab(self.active);
+        }
+
+        if self.editor_has_keyboard(ctx) {
+            // Consumed before the TextEdit runs, so egui's built-in undo never sees them.
+            // Redo first: the plain Ctrl+Z shortcut would also match Ctrl+Shift+Z.
+            let (redo, undo) = ctx.input_mut(|i| {
+                let redo =
+                    i.consume_shortcut(&SHORTCUT_REDO_ALT) | i.consume_shortcut(&SHORTCUT_REDO);
+                (redo, i.consume_shortcut(&SHORTCUT_UNDO))
+            });
+            if redo {
+                self.redo();
+            }
+            if undo {
+                self.undo();
+            }
         }
     }
 
@@ -176,6 +228,33 @@ impl ForgeApp {
                 ui.separator();
                 if ui.button("Quit").clicked() {
                     ui.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+            ui.menu_button("Edit", |ui| {
+                let ctx = ui.ctx().clone();
+                let (can_undo, can_redo) =
+                    self.documents.get(self.active).map_or((false, false), |d| {
+                        (d.buffer.can_undo(), d.buffer.can_redo())
+                    });
+                if ui
+                    .add_enabled(
+                        can_undo,
+                        egui::Button::new("Undo")
+                            .shortcut_text(ctx.format_shortcut(&SHORTCUT_UNDO)),
+                    )
+                    .clicked()
+                {
+                    self.undo();
+                }
+                if ui
+                    .add_enabled(
+                        can_redo,
+                        egui::Button::new("Redo")
+                            .shortcut_text(ctx.format_shortcut(&SHORTCUT_REDO)),
+                    )
+                    .clicked()
+                {
+                    self.redo();
                 }
             });
         });
@@ -256,12 +335,24 @@ impl ForgeApp {
             ui.painter().layout_job(job)
         };
 
-        let output = egui::ScrollArea::both()
+        // Apply a programmatic selection (undo/redo, find, go to line) before rendering.
+        let reveal = self.pending_selection.take().map(|range| {
+            let mut state = egui::TextEdit::load_state(ui.ctx(), doc.id).unwrap_or_default();
+            state.cursor.set_char_range(Some(CCursorRange::two(
+                CCursor::new(range.start),
+                CCursor::new(range.end),
+            )));
+            egui::TextEdit::store_state(ui.ctx(), doc.id, state);
+            ui.memory_mut(|m| m.request_focus(doc.id));
+            CCursor::new(range.end)
+        });
+
+        let mut output = egui::ScrollArea::both()
             .id_salt("editor_scroll")
             .auto_shrink(false)
             .show(ui, |ui| {
-                let output = egui::TextEdit::multiline(&mut doc.text)
-                    .id_salt(self.active)
+                let output = egui::TextEdit::multiline(&mut doc.buffer)
+                    .id(doc.id)
                     .code_editor()
                     .lock_focus(true)
                     .desired_width(f32::INFINITY)
@@ -275,9 +366,19 @@ impl ForgeApp {
                     .layouter(&mut layouter)
                     .show(ui);
                 gutter::paint(ui, &output, current_line, &font);
+                if let Some(cursor) = reveal {
+                    let rect = output
+                        .galley
+                        .pos_from_cursor(cursor)
+                        .translate(output.galley_pos.to_vec2());
+                    ui.scroll_to_rect(rect.expand(8.0), Some(egui::Align::Center));
+                }
                 output
             })
             .inner;
+
+        // Undo history lives in `Buffer`; drop egui's whole-text snapshots.
+        output.state.clear_undoer();
 
         if let Some(range) = output.cursor_range {
             self.cursor = doc.line_col(range.primary.index.into());
