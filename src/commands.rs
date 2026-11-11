@@ -39,6 +39,8 @@ pub enum Command {
     IncreaseFontSize,
     DecreaseFontSize,
     ResetFontSize,
+    ToggleTerminal,
+    RestartTerminal,
 }
 
 impl Command {
@@ -65,6 +67,8 @@ impl Command {
         Command::IncreaseFontSize,
         Command::DecreaseFontSize,
         Command::ResetFontSize,
+        Command::ToggleTerminal,
+        Command::RestartTerminal,
         Command::OpenSettings,
         Command::OpenSettingsFile,
         Command::Quit,
@@ -97,6 +101,8 @@ impl Command {
             Command::IncreaseFontSize => "View: Increase Font Size",
             Command::DecreaseFontSize => "View: Decrease Font Size",
             Command::ResetFontSize => "View: Reset Font Size",
+            Command::ToggleTerminal => "Terminal: Toggle Terminal",
+            Command::RestartTerminal => "Terminal: Restart Shell",
         }
     }
 
@@ -132,6 +138,8 @@ impl Command {
             Command::IncreaseFontSize => shortcut(CMD, Key::Equals),
             Command::DecreaseFontSize => shortcut(CMD, Key::Minus),
             Command::ResetFontSize => shortcut(CMD, Key::Num0),
+            Command::ToggleTerminal => shortcut(Modifiers::CTRL, Key::Backtick),
+            Command::RestartTerminal => None,
         }
     }
 

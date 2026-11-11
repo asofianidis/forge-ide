@@ -12,6 +12,7 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
 - Find / replace with match-case and regex options (`$1` capture groups in replacements)
 - Go to line[:column]
 - Command palette with fuzzy matching over every command
+- Integrated terminal (Ctrl+`) running your shell in a pseudo-terminal, with colors and scrollback
 - Settings (Ctrl+,): color theme (all bundled syntect themes; the UI follows light/dark), font size, word wrap, line numbers
 - Syntax highlighting for many languages (via [syntect](https://github.com/trishume/syntect))
 - Line-number gutter with current-line highlight
@@ -47,6 +48,7 @@ cargo run --release -- path/to/project
 | Settings   | Ctrl+,   |
 | Font size bigger / smaller / reset | Ctrl+= / Ctrl+- / Ctrl+0 |
 | Toggle word wrap | Alt+Z |
+| Toggle terminal | Ctrl+` |
 | Quit       | Ctrl+Q   |
 
 (Cmd instead of Ctrl on macOS.)
@@ -64,6 +66,7 @@ theme = "base16-ocean.dark"
 font_size = 14.0
 word_wrap = false
 line_numbers = true
+terminal_shell = "pwsh -NoLogo"  # optional; defaults to PowerShell on Windows, $SHELL elsewhere
 ```
 
 ## Project layout
@@ -76,6 +79,7 @@ src/
 ├── find_bar.rs          # find/replace bar and go-to-line prompt
 ├── palette.rs           # command palette and fuzzy matcher
 ├── settings.rs          # persisted user settings
+├── terminal.rs          # integrated terminal (PTY + vt100 screen)
 ├── workspace.rs         # file tree / project explorer
 └── editor/
     ├── buffer.rs        # rope-backed text buffer, undo/redo history
@@ -92,7 +96,7 @@ src/
 - [x] Find / replace, go to line
 - [x] Command palette
 - [x] Unsaved-changes prompt on close
-- [ ] Integrated terminal
+- [x] Integrated terminal
 - [ ] LSP client (diagnostics, completion, go to definition)
 - [x] Settings and themes
 

@@ -20,6 +20,10 @@ pub struct Settings {
     pub font_size: f32,
     pub word_wrap: bool,
     pub line_numbers: bool,
+    /// Shell for the integrated terminal, with optional arguments (e.g. `"bash --login"`).
+    /// Defaults to PowerShell on Windows and `$SHELL` elsewhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_shell: Option<String>,
 }
 
 impl Default for Settings {
@@ -29,6 +33,7 @@ impl Default for Settings {
             font_size: 14.0,
             word_wrap: false,
             line_numbers: true,
+            terminal_shell: None,
         }
     }
 }
@@ -92,6 +97,22 @@ impl Settings {
                 ui.label("Line numbers");
                 ui.checkbox(&mut self.line_numbers, "");
                 ui.end_row();
+
+                ui.label("Terminal shell");
+                let mut shell = self.terminal_shell.clone().unwrap_or_default();
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut shell)
+                        .hint_text(if cfg!(windows) {
+                            "powershell.exe"
+                        } else {
+                            "$SHELL"
+                        })
+                        .desired_width(220.0),
+                );
+                if response.changed() {
+                    self.terminal_shell = Some(shell).filter(|s| !s.trim().is_empty());
+                }
+                ui.end_row();
             });
         *self != before
     }
@@ -117,6 +138,7 @@ mod tests {
             font_size: 16.0,
             word_wrap: true,
             line_numbers: false,
+            terminal_shell: Some("bash --login".into()),
         };
         let text = toml::to_string_pretty(&settings).unwrap();
         assert_eq!(Settings::parse(&text).unwrap(), settings);

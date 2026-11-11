@@ -11,6 +11,7 @@ use crate::editor::{Document, Highlighter, gutter, search};
 use crate::find_bar::{FindAction, FindBar, GotoLine};
 use crate::palette::Palette;
 use crate::settings::{self, Settings};
+use crate::terminal::Terminal;
 use crate::workspace::{FileNode, Workspace};
 
 /// Something waiting on the user to decide what to do with unsaved changes.
@@ -60,6 +61,10 @@ pub struct ForgeApp {
     settings_open: bool,
     /// The settings file was saved from the editor; reload it next frame.
     settings_reload_pending: bool,
+    terminal: Option<Terminal>,
+    terminal_open: bool,
+    /// Give the terminal keyboard focus on the next frame.
+    focus_terminal: bool,
 }
 
 impl ForgeApp {
@@ -84,6 +89,9 @@ impl ForgeApp {
             settings_path: Settings::default_path(),
             settings_open: false,
             settings_reload_pending: false,
+            terminal: None,
+            terminal_open: false,
+            focus_terminal: false,
         };
         app.reload_settings(&cc.egui_ctx);
         app
@@ -146,6 +154,69 @@ impl ForgeApp {
         };
         self.settings.font_size = size.clamp(settings::MIN_FONT_SIZE, settings::MAX_FONT_SIZE);
         self.settings_changed(ctx);
+    }
+
+    // ---- terminal ------------------------------------------------------
+
+    fn toggle_terminal(&mut self, ctx: &egui::Context) {
+        self.terminal_open = !self.terminal_open;
+        if self.terminal_open {
+            self.start_terminal(ctx);
+        }
+    }
+
+    /// Starts the shell if it isn't running, and focuses the terminal.
+    fn start_terminal(&mut self, ctx: &egui::Context) {
+        if self.terminal.is_none() {
+            let cwd = self.workspace.as_ref().map(|ws| ws.root.path.as_path());
+            match Terminal::spawn(self.settings.terminal_shell.as_deref(), cwd, ctx) {
+                Ok(t) => self.terminal = Some(t),
+                Err(e) => self.status = format!("Error: {e:#}"),
+            }
+        }
+        self.focus_terminal = true;
+    }
+
+    fn terminal_panel(&mut self, ui: &mut egui::Ui) {
+        let mut close = false;
+        let mut restart = false;
+        let exited = self.terminal.as_mut().is_none_or(Terminal::has_exited);
+        if !exited {
+            // The PTY doesn't always report EOF when the shell exits, so poll for it.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(500));
+        }
+        ui.horizontal(|ui| {
+            ui.strong("TERMINAL");
+            if exited {
+                ui.weak("— process exited");
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                close = ui
+                    .small_button("×")
+                    .on_hover_text("Hide (Ctrl+`)")
+                    .clicked();
+                restart = ui
+                    .small_button("⟳")
+                    .on_hover_text("Restart shell")
+                    .clicked();
+            });
+        });
+        let font = TextStyle::Monospace.resolve(ui.style());
+        let focus = std::mem::take(&mut self.focus_terminal);
+        if let Some(terminal) = &mut self.terminal {
+            terminal.ui(ui, &font, focus);
+        }
+        if exited && ui.input(|i| i.key_pressed(egui::Key::Enter)) && self.terminal.is_some() {
+            restart = true;
+        }
+        if restart {
+            self.terminal = None;
+            self.start_terminal(&ui.ctx().clone());
+        }
+        if close {
+            self.terminal_open = false;
+        }
     }
 
     /// Opens the settings file in an editor tab, creating it with defaults if needed.
@@ -481,6 +552,12 @@ impl ForgeApp {
                 self.settings.line_numbers = !self.settings.line_numbers;
                 self.settings_changed(ctx);
             }
+            Command::ToggleTerminal => self.toggle_terminal(ctx),
+            Command::RestartTerminal => {
+                self.terminal = None;
+                self.terminal_open = true;
+                self.start_terminal(ctx);
+            }
             Command::IncreaseFontSize => self.change_font_size(ctx, 1.0),
             Command::DecreaseFontSize => self.change_font_size(ctx, -1.0),
             Command::ResetFontSize => self.change_font_size(ctx, 0.0),
@@ -549,6 +626,7 @@ impl ForgeApp {
                     &[ShowPalette],
                     &[ToggleWordWrap, ToggleLineNumbers],
                     &[IncreaseFontSize, DecreaseFontSize, ResetFontSize],
+                    &[ToggleTerminal, RestartTerminal],
                     &[OpenSettings, OpenSettingsFile],
                 ],
             ),
@@ -930,6 +1008,13 @@ impl eframe::App for ForgeApp {
 
         egui::Panel::top("menu_bar").show(ui, |ui| self.menu_bar(ui));
         egui::Panel::bottom("status_bar").show(ui, |ui| self.status_bar(ui));
+        if self.terminal_open {
+            egui::Panel::bottom("terminal")
+                .resizable(true)
+                .default_size(240.0)
+                .min_size(80.0)
+                .show(ui, |ui| self.terminal_panel(ui));
+        }
         egui::Panel::left("explorer")
             .resizable(true)
             .default_size(240.0)
