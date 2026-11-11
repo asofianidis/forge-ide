@@ -2,6 +2,9 @@
 
 mod app;
 mod editor;
+mod settings;
+mod theme;
+mod updater;
 mod workspace;
 
 use app::ForgeApp;
