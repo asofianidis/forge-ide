@@ -143,7 +143,7 @@ using your own sign-in and subscription: [Claude Code](https://docs.anthropic.co
 [Codex](https://github.com/openai/codex) (`codex`). Forge never sees an API key.
 
 - **Threads**: each conversation works in the open folder and is listed in the sidebar for that
-  folder. Threads open as tabs and show the agent's replies, tool calls (expand for output) and
+  folder. The text model names each thread from its first message (rename it by hand any time). Threads open as tabs and show the agent's replies, tool calls (expand for output) and
   cost. Later messages resume the same CLI session. Stop a running turn at any time.
 - **Default models** are set in **Settings** (Ctrl+,): the *Default AI model* (and access) new
   threads start with, and the *Commit & PR text model*.

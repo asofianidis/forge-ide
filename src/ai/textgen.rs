@@ -106,6 +106,45 @@ impl TextGenerator {
         let text = self.generate(cwd, &prompt)?;
         split_title(&text).ok_or_else(|| "the model's reply had no title".to_owned())
     }
+
+    /// A short title for a conversation that starts with `prompt`.
+    pub fn thread_title(&self, cwd: &Path, prompt: &str) -> Result<String, String> {
+        let text = self.generate(cwd, &title_prompt(prompt))?;
+        clean_title(&text).ok_or_else(|| "the model's reply had no title".to_owned())
+    }
+}
+
+pub fn title_prompt(prompt: &str) -> String {
+    let mut request: String = prompt.chars().take(4000).collect();
+    if request.len() < prompt.len() {
+        request.push('…');
+    }
+    format!(
+        "You name conversations in a list of coding-assistant threads. Below, inside \
+         <request> tags, is the first message someone sent to a coding agent. Do NOT \
+         answer it or carry it out; only name it.\n\n\
+         Reply with a title of 2 to 6 words in sentence case that names the task, \
+         like \"Fix login redirect loop\", \"Add dark mode toggle\" or \"Explain the \
+         git flow module\". No quotes, no label, no trailing period, nothing else.\n\n\
+         <request>\n{request}\n</request>"
+    )
+}
+
+/// The first line of a reply, without quotes, labels or a trailing period.
+pub fn clean_title(text: &str) -> Option<String> {
+    let text = clean(text);
+    let line = text.lines().find(|l| !l.trim().is_empty())?.trim();
+    let line = line.trim_start_matches('#').trim();
+    let line = line.strip_prefix("Title:").unwrap_or(line).trim();
+    let line = line
+        .trim_matches(|c| matches!(c, '"' | '\'' | '`' | '*' | '“' | '”'))
+        .trim()
+        .trim_end_matches('.')
+        .trim();
+    if line.is_empty() {
+        return None;
+    }
+    Some(super::provider::first_line(line, 60))
 }
 
 fn cut(diff: &str) -> String {
@@ -214,6 +253,24 @@ mod tests {
         assert_eq!(clean("```\nFix bug\n```"), "Fix bug");
         assert_eq!(clean("```text\nFix bug\n\nBody\n```\n"), "Fix bug\n\nBody");
         assert_eq!(clean("  Plain  "), "Plain");
+    }
+
+    #[test]
+    fn cleans_titles() {
+        assert_eq!(
+            clean_title("\"Fix login redirect bug.\"\n"),
+            Some("Fix login redirect bug".into())
+        );
+        assert_eq!(
+            clean_title("Title: Add dark mode"),
+            Some("Add dark mode".into())
+        );
+        assert_eq!(
+            clean_title("```\n# Explain flow.rs\n```"),
+            Some("Explain flow.rs".into())
+        );
+        assert_eq!(clean_title("  \n"), None);
+        assert!(title_prompt(&"x".repeat(5000)).contains('…'));
     }
 
     #[test]

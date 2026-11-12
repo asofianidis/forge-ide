@@ -89,6 +89,9 @@ pub struct Thread {
     /// Seconds since the Unix epoch.
     pub created: u64,
     pub updated: u64,
+    /// Renamed by hand, so a generated title must not replace it.
+    #[serde(default)]
+    pub title_locked: bool,
 }
 
 pub fn now() -> u64 {
@@ -115,6 +118,7 @@ impl Thread {
             messages: Vec::new(),
             created: t,
             updated: t,
+            title_locked: false,
         }
     }
 

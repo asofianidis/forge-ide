@@ -52,6 +52,8 @@ pub struct Ai {
     /// Last finished git flow: (succeeded, message, PR URL).
     flow_result: Option<(bool, String, Option<String>)>,
     status: Vec<String>,
+    /// Titles being written by the text model: (thread id, result).
+    title_tasks: Vec<(String, crate::task::Pending<Result<String, String>>)>,
 }
 
 impl Ai {
@@ -71,6 +73,7 @@ impl Ai {
             flow: None,
             flow_result: None,
             status: Vec::new(),
+            title_tasks: Vec::new(),
         }
     }
 
@@ -188,8 +191,14 @@ impl Ai {
         self.save();
     }
 
-    /// Sends `text` to the thread's agent.
-    pub fn send(&mut self, id: &str, text: String) -> Result<(), String> {
+    /// Sends `text` to the thread's agent. On a thread's first message,
+    /// `titler` (the text model) names the thread in the background.
+    pub fn send(
+        &mut self,
+        id: &str,
+        text: String,
+        titler: Option<TextGenerator>,
+    ) -> Result<(), String> {
         if self.runs.contains_key(id) {
             return Err("the agent is still working on the last message".to_owned());
         }
@@ -216,6 +225,19 @@ impl Ai {
             &text,
         );
         let run = Run::start(&ctx, &exe, provider, &t.folder, args, stdin)?;
+        let first = !t.messages.iter().any(|m| matches!(m, Message::User { .. }));
+        if first
+            && !t.title_locked
+            && let Some(r#gen) = titler
+        {
+            let folder = t.folder.clone();
+            let prompt = text.clone();
+            let task =
+                crate::task::Pending::spawn(&ctx, move || r#gen.thread_title(&folder, &prompt));
+            self.title_tasks.push((id.to_owned(), task));
+        }
+        let t = self.thread_mut(id).ok_or("thread not found")?;
+        // A placeholder until the generated title arrives.
         t.set_title_from(&text);
         t.messages.push(Message::User { text });
         t.updated = thread::now();
@@ -279,12 +301,30 @@ impl Ai {
             self.ctx
                 .request_repaint_after(std::time::Duration::from_millis(500));
         }
+        // Generated titles. Failures keep the placeholder.
+        let mut titled = false;
+        self.title_tasks.retain(|(id, task)| {
+            let Some(result) = task.try_take() else {
+                return true;
+            };
+            if let Ok(title) = result
+                && let Some(t) = self.threads.iter_mut().find(|t| &t.id == id)
+                && !t.title_locked
+            {
+                t.title = title;
+                titled = true;
+            }
+            false
+        });
+        if titled {
+            self.dirty = true;
+        }
         let any = !finished.is_empty();
         for id in finished {
             self.runs.remove(&id);
             self.dirty = true;
         }
-        if any {
+        if any || titled {
             self.save();
         }
         any
@@ -371,10 +411,12 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(100));
             }
         };
+        let titler = ai.text_generator(&AiSettings::default());
         ai.send(
             &id,
             "Create a file named hello.txt containing exactly the word forge. Then reply DONE."
                 .into(),
+            titler,
         )
         .unwrap();
         wait(&mut ai);
@@ -392,6 +434,7 @@ mod tests {
         ai.send(
             &id,
             "What was the name of the file you created? Reply with just the name.".into(),
+            None,
         )
         .unwrap();
         wait(&mut ai);
@@ -406,6 +449,18 @@ mod tests {
             })
             .unwrap();
         assert!(last.contains("hello.txt"), "didn't resume: {last}");
+        // The generated title replaces the first-line placeholder.
+        let start = Instant::now();
+        while !ai.title_tasks.is_empty() && start.elapsed() < Duration::from_secs(60) {
+            ai.poll();
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let title = ai.thread(&id).unwrap().title.clone();
+        eprintln!("thread title: {title}");
+        assert!(
+            !title.starts_with("Create a file named"),
+            "title not generated: {title}"
+        );
 
         let r#gen = ai.text_generator(&AiSettings::default()).unwrap();
         let msg = r#gen

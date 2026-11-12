@@ -176,6 +176,7 @@ impl Ai {
                             if enter && !name.trim().is_empty() {
                                 if let Some(t) = self.thread_mut(&rid) {
                                     t.title = name.trim().to_owned();
+                                    t.title_locked = true;
                                 }
                                 self.dirty = true;
                                 self.save();
@@ -646,7 +647,8 @@ impl Ai {
         match send {
             Some(Some(text)) => {
                 self.drafts.remove(id);
-                if let Err(e) = self.send(id, text.trim().to_owned())
+                let titler = self.text_generator(settings);
+                if let Err(e) = self.send(id, text.trim().to_owned(), titler)
                     && let Some(t) = self.thread_mut(id)
                 {
                     t.messages.push(Message::Error { text: e });
