@@ -5,6 +5,8 @@ use egui::{Color32, RichText, Sense, Ui, UiBuilder, vec2};
 
 use super::model::{CheckOutcome, PrSummary, rollup};
 use super::{Connection, GitHub, NewPr, PrFilter, PrState};
+use crate::git::suggest::PrText;
+use crate::task::Pending;
 use crate::theme::UiColors;
 use crate::ui::fmt;
 use crate::ui::icons::{self, Icon};
@@ -24,6 +26,11 @@ pub struct BranchContext {
 
 pub enum ListAction {
     Open(u64),
+    /// Work out a title and description for a PR into this base branch;
+    /// answer with [`PrListPanel::set_generate_task`].
+    GenerateText {
+        base: String,
+    },
 }
 
 #[derive(Default)]
@@ -32,6 +39,8 @@ pub struct PrListPanel {
     form: NewPr,
     /// Branch the form was prefilled for.
     form_branch: Option<String>,
+    generate_task: Option<Pending<Result<PrText, String>>>,
+    generate_error: Option<String>,
 }
 
 pub fn state_color(state: &str, draft: bool, colors: &UiColors) -> Color32 {
@@ -77,6 +86,14 @@ impl PrListPanel {
     /// Opens the "new pull request" form.
     pub fn start_create(&mut self) {
         self.creating = true;
+    }
+
+    /// Fills the form's title and description when `task` finishes.
+    pub fn set_generate_task(&mut self, task: Option<Pending<Result<PrText, String>>>) {
+        self.generate_error = task
+            .is_none()
+            .then(|| "Source control isn't ready".to_owned());
+        self.generate_task = task;
     }
 
     pub fn show(
@@ -171,7 +188,9 @@ impl PrListPanel {
         });
 
         if self.creating {
-            self.create_form(ui, gh, branch, colors);
+            if let Some(base) = self.create_form(ui, gh, branch, colors) {
+                action = Some(ListAction::GenerateText { base });
+            }
             ui.separator();
         }
 
@@ -310,17 +329,30 @@ impl PrListPanel {
         Some(num)
     }
 
+    /// Draws the form; returns a base branch when the user asks for a
+    /// generated title and description.
     fn create_form(
         &mut self,
         ui: &mut Ui,
         gh: &mut GitHub,
         branch: &BranchContext,
         colors: &UiColors,
-    ) {
+    ) -> Option<String> {
         let Some(head) = branch.branch.clone() else {
             ui.label(RichText::new("Check out a branch to create a pull request.").weak());
-            return;
+            return None;
         };
+        let mut generate = None;
+        if let Some(result) = crate::task::poll(&mut self.generate_task) {
+            match result {
+                Ok(text) => {
+                    self.form.title = text.title;
+                    self.form.body = text.body;
+                    self.generate_error = None;
+                }
+                Err(e) => self.generate_error = Some(e),
+            }
+        }
         if self.form_branch.as_deref() != Some(head.as_str()) {
             self.form = NewPr {
                 title: branch.last_subject.clone().unwrap_or_default(),
@@ -349,6 +381,31 @@ impl PrListPanel {
                 );
                 ui.end_row();
             });
+        ui.horizontal(|ui| {
+            if self.generate_task.is_some() {
+                ui.spinner();
+                ui.label(RichText::new("Summarizing commits…").small().weak());
+                return;
+            }
+            let base = self.form.base.trim().to_owned();
+            if ui
+                .add_enabled(
+                    !base.is_empty(),
+                    egui::Button::new(RichText::new("Generate title & description").small()),
+                )
+                .on_hover_text(format!(
+                    "Fill in the title and description from this branch's commits and \
+                     changed files compared to {base}. Replaces what's there."
+                ))
+                .clicked()
+            {
+                self.generate_error = None;
+                generate = Some(base);
+            }
+        });
+        if let Some(e) = &self.generate_error {
+            ui.label(RichText::new(e).small().color(colors.error.0));
+        }
         ui.add(
             egui::TextEdit::singleline(&mut self.form.title)
                 .hint_text("Title (empty: fill from commits)")
@@ -402,6 +459,7 @@ impl PrListPanel {
                 self.creating = false;
             }
         });
+        generate
     }
 }
 

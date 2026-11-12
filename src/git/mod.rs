@@ -8,6 +8,8 @@ pub mod graph;
 pub mod line_changes;
 mod panel;
 pub mod status;
+pub mod suggest;
+pub mod worktree;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -18,6 +20,7 @@ use crate::task::{self, Pending};
 use diff::FileDiff;
 pub use panel::{PanelAction, ScmPanel, change_color as panel_change_color};
 use status::{Change, Entry, Status};
+pub use worktree::Worktree;
 
 /// How often status is re-read while the window has focus.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(3);
@@ -167,6 +170,15 @@ pub struct Stash {
     pub time: i64,
 }
 
+/// What a new worktree checks out.
+#[derive(Debug, Clone)]
+pub enum WorktreeHead {
+    /// Create `name` from `base` (HEAD when `None`).
+    NewBranch { name: String, base: Option<String> },
+    /// An existing local or remote branch.
+    Existing(String),
+}
+
 /// Full details of one commit, for the commit view.
 #[derive(Debug, Clone)]
 pub struct CommitDetail {
@@ -236,6 +248,8 @@ pub struct SourceControl {
     remotes_task: Option<Pending<Result<Vec<String>, String>>>,
     pub tags: Vec<Tag>,
     tags_task: Option<Pending<Result<Vec<Tag>, String>>>,
+    pub worktrees: Vec<Worktree>,
+    worktrees_task: Option<Pending<Result<Vec<Worktree>, String>>>,
 
     ops: VecDeque<Op>,
     running: Option<(String, Pending<Result<String, String>>)>,
@@ -268,6 +282,8 @@ impl SourceControl {
             remotes_task: None,
             tags: Vec::new(),
             tags_task: None,
+            worktrees: Vec::new(),
+            worktrees_task: None,
             ops: VecDeque::new(),
             running: None,
             events: Vec::new(),
@@ -288,6 +304,7 @@ impl SourceControl {
         self.stashes.clear();
         self.remotes.clear();
         self.tags.clear();
+        self.worktrees.clear();
         self.ops.clear();
         self.revision += 1;
         let Some(folder) = folder.map(Path::to_path_buf) else {
@@ -382,6 +399,13 @@ impl SourceControl {
             let g = git.clone();
             self.tags_task = Some(Pending::spawn(&self.ctx, move || load_tags(&g)));
         }
+        if self.worktrees_task.is_none() {
+            let g = git.clone();
+            self.worktrees_task = Some(Pending::spawn(&self.ctx, move || {
+                let out = g.run(&["worktree", "list", "--porcelain"])?;
+                Ok(worktree::parse(&out, Some(g.cwd())))
+            }));
+        }
         if self.remotes_task.is_none() {
             self.remotes_task = Some(Pending::spawn(&self.ctx, move || {
                 Ok(git
@@ -452,6 +476,9 @@ impl SourceControl {
         }
         if let Some(Ok(tags)) = task::poll(&mut self.tags_task) {
             self.tags = tags;
+        }
+        if let Some(Ok(worktrees)) = task::poll(&mut self.worktrees_task) {
+            self.worktrees = worktrees;
         }
         if let Some(Ok(remotes)) = task::poll(&mut self.remotes_task) {
             self.remotes = remotes;
@@ -995,6 +1022,241 @@ impl SourceControl {
     }
 
     // ---- reads (not queued) ----------------------------------------------
+
+    // ---- worktrees -------------------------------------------------------
+
+    /// Adds a worktree at `path`. See [`WorktreeHead`] for what it checks out.
+    pub fn add_worktree(&mut self, path: PathBuf, head: WorktreeHead) {
+        let shown = path.display().to_string();
+        let local_exists = |name: &str| self.branches.iter().any(|b| !b.remote && b.name == name);
+        let mut args = vec!["worktree".to_owned(), "add".to_owned()];
+        let rest: Vec<String> = match head {
+            WorktreeHead::NewBranch { name, base } => {
+                let mut v = vec!["-b".to_owned(), name, shown.clone()];
+                v.extend(base.filter(|b| !b.trim().is_empty()));
+                v
+            }
+            WorktreeHead::Existing(name) => {
+                // A remote branch without a local copy gets a tracking branch.
+                match self
+                    .branches
+                    .iter()
+                    .find(|b| b.remote && b.name == name)
+                    .and_then(|b| b.name.split_once('/'))
+                    .map(|(_, local)| local.to_owned())
+                    .filter(|local| !local_exists(local))
+                {
+                    Some(local) => {
+                        vec![
+                            "--track".to_owned(),
+                            "-b".to_owned(),
+                            local,
+                            shown.clone(),
+                            name,
+                        ]
+                    }
+                    None => vec![shown.clone(), name],
+                }
+            }
+        };
+        args.extend(rest);
+        self.queue(format!("Add worktree {shown}"), move |git| {
+            let out = git.output(&args, None)?;
+            if out.success {
+                Ok(format!("created {shown}"))
+            } else {
+                out.into_result()
+            }
+        });
+    }
+
+    pub fn remove_worktree(&mut self, path: PathBuf, force: bool) {
+        let shown = path.display().to_string();
+        self.queue(format!("Remove worktree {shown}"), move |git| {
+            let mut args = vec!["worktree", "remove"];
+            if force {
+                args.push("--force");
+            }
+            args.push(&shown);
+            git.run(&args)
+        });
+    }
+
+    pub fn lock_worktree(&mut self, path: PathBuf, lock: bool) {
+        let shown = path.display().to_string();
+        let verb = if lock { "lock" } else { "unlock" };
+        self.queue(
+            format!("{} worktree {shown}", if lock { "Lock" } else { "Unlock" }),
+            move |git| git.run(&["worktree", verb, &shown]),
+        );
+    }
+
+    /// Forgets worktrees whose folders were deleted.
+    pub fn prune_worktrees(&mut self) {
+        self.queue("Prune worktrees", |git| {
+            let out = git.output(&["worktree", "prune", "--verbose"], None)?;
+            if !out.success {
+                return out.into_result();
+            }
+            let n = out
+                .stdout
+                .lines()
+                .chain(out.stderr.lines())
+                .filter(|l| !l.is_empty())
+                .count();
+            Ok(if n == 0 {
+                "nothing to prune".to_owned()
+            } else {
+                format!("pruned {n}")
+            })
+        });
+    }
+
+    // ---- generated text --------------------------------------------------
+
+    /// A commit message for what the commit button would commit right now:
+    /// the staged changes, or every change when nothing is staged.
+    pub fn suggest_commit_message(&self) -> Option<Pending<Result<String, String>>> {
+        let git = self.git.clone()?;
+        let staged_only = self.status.staged().next().is_some();
+        let unborn = self.status.branch.is_unborn();
+        let untracked: Vec<String> = if staged_only {
+            Vec::new()
+        } else {
+            self.status
+                .entries
+                .iter()
+                .filter(|e| e.is_untracked())
+                .map(|e| e.path.clone())
+                .collect()
+        };
+        let subjects: Vec<String> = self.log.iter().map(|c| c.subject.clone()).collect();
+        Some(Pending::spawn(&self.ctx, move || {
+            const COMMON: [&str; 5] = [
+                "--no-color",
+                "--no-ext-diff",
+                "-M",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+            ];
+            let mut args = vec!["diff"];
+            if staged_only || unborn {
+                args.push("--cached");
+            } else {
+                args.push("HEAD");
+            }
+            args.extend(COMMON);
+            let mut files = diff::parse(&git.run(&args)?);
+            // Untracked files aren't in any diff; read a few for their content.
+            for (i, path) in untracked.iter().enumerate() {
+                let parsed = if i < 40 {
+                    let mut a = vec!["diff", "--no-index"];
+                    a.extend(COMMON);
+                    a.extend(["--", "/dev/null", path.as_str()]);
+                    git.output(&a, None)
+                        .ok()
+                        .map(|o| diff::parse(&o.stdout))
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                if parsed.is_empty() {
+                    files.push(diff::FileDiff {
+                        old_path: None,
+                        new_path: Some(path.clone()),
+                        status: diff::FileStatus::Added,
+                        binary: false,
+                        header: Vec::new(),
+                        hunks: Vec::new(),
+                    });
+                } else {
+                    files.extend(parsed);
+                }
+            }
+            if files.is_empty() {
+                return Err("there are no changes to describe".to_owned());
+            }
+            let subjects: Vec<&str> = subjects.iter().map(String::as_str).collect();
+            Ok(suggest::commit_message(&files, &subjects))
+        }))
+    }
+
+    /// Title and description for a pull request from HEAD into `base`
+    /// (a branch name; the remote's copy is preferred when it exists).
+    pub fn suggest_pr_text(&self, base: &str) -> Option<Pending<Result<suggest::PrText, String>>> {
+        let git = self.git.clone()?;
+        let base = base.trim().to_owned();
+        let remote = self.default_remote();
+        let branch = self.status.branch.head.clone().unwrap_or_default();
+        Some(Pending::spawn(&self.ctx, move || {
+            let verify = |r: &str| {
+                git.output(
+                    &[
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        &format!("{r}^{{commit}}"),
+                    ],
+                    None,
+                )
+                .is_ok_and(|o| o.success)
+            };
+            let base_ref = remote
+                .map(|r| format!("{r}/{base}"))
+                .filter(|r| verify(r))
+                .or_else(|| verify(&base).then(|| base.clone()))
+                .ok_or_else(|| format!("couldn't find the base branch “{base}”"))?;
+            let range = format!("{base_ref}..HEAD");
+            let log = git.run(&[
+                "log",
+                "--no-merges",
+                "--reverse",
+                "--format=%s%x1f%b%x1e",
+                &range,
+            ])?;
+            let commits: Vec<suggest::BranchCommit> = log
+                .split('\x1e')
+                .filter_map(|rec| {
+                    let (subject, body) = rec.trim_start_matches('\n').split_once('\x1f')?;
+                    Some(suggest::BranchCommit {
+                        subject: subject.trim().to_owned(),
+                        body: body.trim().to_owned(),
+                    })
+                })
+                .filter(|c| !c.subject.is_empty())
+                .collect();
+            let diff = git.run(&[
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "-M",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                &format!("{base_ref}...HEAD"),
+            ])?;
+            let files = diff::parse(&diff);
+            if commits.is_empty() && files.is_empty() {
+                return Err(format!("this branch has no changes compared to {base_ref}"));
+            }
+            let root = git.cwd();
+            let template = [
+                ".github/pull_request_template.md",
+                ".github/PULL_REQUEST_TEMPLATE.md",
+                "pull_request_template.md",
+                "PULL_REQUEST_TEMPLATE.md",
+                "docs/pull_request_template.md",
+                "docs/PULL_REQUEST_TEMPLATE.md",
+            ]
+            .iter()
+            .find_map(|p| std::fs::read_to_string(root.join(p)).ok());
+            Ok(suggest::pr_text(
+                &branch,
+                &commits,
+                &files,
+                template.as_deref(),
+            ))
+        }))
+    }
 
     /// Commit history matching `query`, for the history view.
     pub fn load_history(&self, query: LogQuery) -> Option<Pending<Result<Vec<Commit>, String>>> {

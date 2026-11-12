@@ -1,10 +1,15 @@
 //! The Source Control sidebar: branch and sync controls, the commit box,
 //! staged / unstaged / conflicted files, stashes, branches and history.
 
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
 use egui::{Color32, Key, KeyboardShortcut, Modifiers, RichText, Sense, Ui, UiBuilder, vec2};
 
 use super::status::{self, Change, Entry};
-use super::{Branch, RepoState, SourceControl};
+use super::worktree;
+use super::{Branch, RepoState, SourceControl, WorktreeHead};
+use crate::task::Pending;
 use crate::theme::UiColors;
 use crate::ui::fmt;
 use crate::ui::icons::{self, Icon};
@@ -27,7 +32,39 @@ pub enum PanelAction {
     OpenHistory,
     /// Open the interactive rebase tab for the current branch.
     OpenRebase,
+    /// Open a folder (a worktree) in this window.
+    OpenFolder(PathBuf),
+    /// Open a folder in a new Forge window.
+    OpenFolderInNewWindow(PathBuf),
+    /// Show a folder in the system file manager.
+    RevealPath(PathBuf),
 }
+
+/// Where to open a worktree once it has been created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenIn {
+    Nowhere,
+    ThisWindow,
+    NewWindow,
+}
+
+/// The "New Worktree" dialog.
+struct NewWorktree {
+    new_branch: bool,
+    branch: String,
+    /// Base for a new branch; empty means HEAD.
+    base: String,
+    /// Existing branch to check out.
+    existing: String,
+    path: String,
+    /// The user changed the folder, so stop deriving it from the branch.
+    path_edited: bool,
+    open: OpenIn,
+}
+
+/// How long to wait for a new worktree to show up before giving up on
+/// opening it.
+const OPEN_WORKTREE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Actions that need a confirmation dialog first.
 #[derive(Debug, Clone)]
@@ -37,6 +74,7 @@ enum Confirm {
     ForcePush,
     DropStash(String),
     DeleteTag(String),
+    RemoveWorktree(PathBuf),
 }
 
 /// Deferred changes collected while drawing (status is borrowed then).
@@ -62,6 +100,13 @@ pub struct ScmPanel {
     pending_action: Option<PanelAction>,
     /// Loading HEAD's message to prefill an amend.
     amend_task: Option<crate::task::Pending<Option<String>>>,
+    /// Working out a commit message from the diff.
+    generate_task: Option<Pending<Result<String, String>>>,
+    generate_error: Option<String>,
+    new_worktree: Option<NewWorktree>,
+    /// A worktree being created, to open once it appears.
+    open_when_ready: Option<(PathBuf, OpenIn, Instant)>,
+    remove_worktree_force: bool,
 }
 
 pub fn change_color(change: Change, colors: &UiColors) -> Color32 {
@@ -81,6 +126,9 @@ impl ScmPanel {
         colors: &UiColors,
     ) -> Option<PanelAction> {
         let mut action = self.pending_action.take();
+        if action.is_none() {
+            action = self.take_created_worktree(sc);
+        }
         self.title_bar(ui, sc, colors);
 
         match &sc.state {
@@ -125,6 +173,7 @@ impl ScmPanel {
                 self.changes(ui, sc, colors, &mut action, &mut deferred);
                 self.stashes(ui, sc, colors);
                 self.branches(ui, sc, colors);
+                self.worktrees(ui, sc, colors, &mut action);
                 self.tags(ui, sc, colors);
                 self.history(ui, sc, colors, &mut action);
             });
@@ -136,6 +185,7 @@ impl ScmPanel {
                 RowAction::Resolve(p, theirs) => sc.resolve_with(p, theirs),
             }
         }
+        self.new_worktree_dialog(ui, sc);
         self.confirm_dialog(ui, sc);
         action
     }
@@ -224,6 +274,17 @@ impl ScmPanel {
         }
         if ui.button("Commit Graph").clicked() {
             self.pending_action = Some(PanelAction::OpenHistory);
+        }
+        ui.separator();
+        if ui.button("New Worktree…").clicked() {
+            self.start_new_worktree(sc, None);
+        }
+        if ui
+            .button("Prune Worktrees")
+            .on_hover_text("Forget worktrees whose folders were deleted")
+            .clicked()
+        {
+            sc.prune_worktrees();
         }
         ui.separator();
         let has_commits = !sc.status.branch.is_unborn();
@@ -402,7 +463,51 @@ impl ScmPanel {
                 .desired_rows(3)
                 .desired_width(f32::INFINITY),
         );
-        message_guide(ui, &self.message, colors);
+        if let Some(result) = crate::task::poll(&mut self.generate_task) {
+            match result {
+                Ok(message) => {
+                    self.message = message;
+                    self.generate_error = None;
+                }
+                Err(e) => self.generate_error = Some(e),
+            }
+        }
+        egui::Sides::new().shrink_left().show(
+            ui,
+            |ui| message_guide(ui, &self.message, colors),
+            |ui| {
+                if self.generate_task.is_some() {
+                    ui.spinner();
+                    return;
+                }
+                let has_changes = !sc.status.entries.is_empty();
+                let what = if sc.status.staged().next().is_some() {
+                    "the staged changes"
+                } else {
+                    "all changes"
+                };
+                let tip = if self.message.trim().is_empty() {
+                    format!("Write a message describing {what}")
+                } else {
+                    format!("Replace the message with one describing {what}")
+                };
+                if ui
+                    .add_enabled(
+                        has_changes,
+                        egui::Button::new(RichText::new("Generate").small()),
+                    )
+                    .on_hover_text(tip)
+                    .on_disabled_hover_text("There are no changes to describe")
+                    .clicked()
+                {
+                    self.generate_error = None;
+                    self.generate_task = sc.suggest_commit_message();
+                }
+            },
+        );
+        if let Some(e) = &self.generate_error {
+            ui.label(RichText::new(e).small().color(colors.error.0));
+        }
 
         let staged = sc.status.staged().count();
         let changed = sc.status.entries.len();
@@ -687,6 +792,14 @@ impl ScmPanel {
                         if !b.track.is_empty() {
                             ui.label(RichText::new(&b.track).small().weak());
                         }
+                        let elsewhere = sc
+                            .worktrees
+                            .iter()
+                            .find(|w| !w.current && w.branch.as_deref() == Some(b.name.as_str()));
+                        if let Some(w) = elsewhere {
+                            ui.label(RichText::new("worktree").small().color(colors.link.0))
+                                .on_hover_text(format!("Checked out in {}", w.path.display()));
+                        }
                         if hovered && !b.current {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -716,6 +829,416 @@ impl ScmPanel {
         if let Some(n) = merge {
             sc.merge_branch(n);
         }
+    }
+
+    fn worktrees(
+        &mut self,
+        ui: &mut Ui,
+        sc: &mut SourceControl,
+        colors: &UiColors,
+        action: &mut Option<PanelAction>,
+    ) {
+        if sc.worktrees.is_empty() {
+            return;
+        }
+        let mut create = false;
+        let mut chosen: Option<PanelAction> = None;
+        let mut remove = None;
+        let mut lock = None;
+        let mut prune = false;
+        section(
+            ui,
+            "Worktrees",
+            sc.worktrees.len(),
+            false,
+            colors,
+            |ui| {
+                if icons::button(ui, Icon::Plus, "New worktree").clicked() {
+                    create = true;
+                }
+            },
+            |ui| {
+                if sc.worktrees.len() == 1 {
+                    ui.label(
+                        RichText::new(
+                            "Worktrees let you check out another branch in its own folder.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
+                for w in &sc.worktrees {
+                    let resp = hover_row(ui, 36.0, |ui, hovered| {
+                        icons::label(
+                            ui,
+                            Icon::Files,
+                            if w.current {
+                                colors.accent.0
+                            } else {
+                                colors.text_muted.0
+                            },
+                            14.0,
+                        );
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            ui.horizontal(|ui| {
+                                let name = RichText::new(w.name());
+                                ui.add(
+                                    egui::Label::new(if w.current { name.strong() } else { name })
+                                        .truncate(),
+                                );
+                                if w.current {
+                                    ui.label(RichText::new("open").small().color(colors.accent.0));
+                                } else if w.main {
+                                    ui.label(RichText::new("main").small().weak());
+                                }
+                            });
+                            let mut detail = vec![w.describe_head()];
+                            if w.locked.is_some() {
+                                detail.push("locked".to_owned());
+                            }
+                            if w.prunable.is_some() {
+                                detail.push("missing".to_owned());
+                            }
+                            ui.label(RichText::new(detail.join(" · ")).small().color(
+                                if w.prunable.is_some() {
+                                    colors.warning.0
+                                } else {
+                                    colors.text_muted.0
+                                },
+                            ));
+                        });
+                        if hovered && !w.current && w.prunable.is_none() {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.spacing_mut().item_spacing.x = 2.0;
+                                    if !w.main
+                                        && icons::button(ui, Icon::Close, "Remove worktree…")
+                                            .clicked()
+                                    {
+                                        remove = Some(w.path.clone());
+                                    }
+                                    if icons::button(ui, Icon::External, "Open in new window")
+                                        .clicked()
+                                    {
+                                        chosen = Some(PanelAction::OpenFolderInNewWindow(
+                                            w.path.clone(),
+                                        ));
+                                    }
+                                },
+                            );
+                        }
+                    });
+                    if resp.clicked() && !w.current && w.prunable.is_none() {
+                        chosen = Some(PanelAction::OpenFolder(w.path.clone()));
+                    }
+                    let mut tip = w.path.display().to_string();
+                    if let Some(reason) = w.locked.as_deref().filter(|r| !r.is_empty()) {
+                        tip.push_str(&format!("\nLocked: {reason}"));
+                    }
+                    if let Some(reason) = &w.prunable {
+                        tip.push_str(&format!("\nMissing: {reason}"));
+                    }
+                    if !w.current {
+                        tip.push_str("\nClick to open in this window");
+                    }
+                    let resp = resp.on_hover_text(tip);
+                    resp.context_menu(|ui| {
+                        let exists = w.prunable.is_none();
+                        if ui
+                            .add_enabled(exists && !w.current, egui::Button::new("Open"))
+                            .clicked()
+                        {
+                            chosen = Some(PanelAction::OpenFolder(w.path.clone()));
+                        }
+                        if ui
+                            .add_enabled(exists, egui::Button::new("Open in New Window"))
+                            .clicked()
+                        {
+                            chosen = Some(PanelAction::OpenFolderInNewWindow(w.path.clone()));
+                        }
+                        if ui
+                            .add_enabled(exists, egui::Button::new(reveal_label()))
+                            .clicked()
+                        {
+                            chosen = Some(PanelAction::RevealPath(w.path.clone()));
+                        }
+                        if ui.button("Copy Path").clicked() {
+                            ui.ctx().copy_text(w.path.display().to_string());
+                        }
+                        if !w.main {
+                            ui.separator();
+                            let locked = w.locked.is_some();
+                            if ui
+                                .button(if locked { "Unlock" } else { "Lock" })
+                                .on_hover_text("A locked worktree can't be removed or pruned")
+                                .clicked()
+                            {
+                                lock = Some((w.path.clone(), !locked));
+                            }
+                            if w.prunable.is_some() {
+                                if ui.button("Prune Missing Worktrees").clicked() {
+                                    prune = true;
+                                }
+                            } else if ui
+                                .add_enabled(!w.current, egui::Button::new("Remove…"))
+                                .on_disabled_hover_text("Open another worktree first")
+                                .clicked()
+                            {
+                                remove = Some(w.path.clone());
+                            }
+                        }
+                    });
+                }
+            },
+        );
+        if create {
+            self.start_new_worktree(sc, None);
+        }
+        if let Some(path) = remove {
+            self.remove_worktree_force = false;
+            self.confirm = Some(Confirm::RemoveWorktree(path));
+        }
+        if let Some((path, l)) = lock {
+            sc.lock_worktree(path, l);
+        }
+        if prune {
+            sc.prune_worktrees();
+        }
+        if chosen.is_some() {
+            *action = chosen;
+        }
+    }
+
+    /// Opens the "New Worktree" dialog, optionally for an existing branch.
+    fn start_new_worktree(&mut self, sc: &SourceControl, existing: Option<String>) {
+        let base = sc.status.branch.head.clone().unwrap_or_default();
+        self.new_worktree = Some(NewWorktree {
+            new_branch: existing.is_none(),
+            branch: String::new(),
+            base,
+            existing: existing.unwrap_or_default(),
+            path: String::new(),
+            path_edited: false,
+            open: OpenIn::NewWindow,
+        });
+    }
+
+    fn new_worktree_dialog(&mut self, ui: &mut Ui, sc: &mut SourceControl) {
+        let Some(form) = &mut self.new_worktree else {
+            return;
+        };
+        let main = sc
+            .worktrees
+            .first()
+            .map(|w| w.path.clone())
+            .or_else(|| sc.root().map(Path::to_path_buf));
+        // Branches that can be checked out: not already in a worktree.
+        let taken: Vec<&str> = sc
+            .worktrees
+            .iter()
+            .filter_map(|w| w.branch.as_deref())
+            .collect();
+        let available: Vec<&Branch> = sc
+            .branches
+            .iter()
+            .filter(|b| !b.name.ends_with("/HEAD"))
+            .filter(|b| b.remote || !taken.contains(&b.name.as_str()))
+            .collect();
+
+        let mut done = None;
+        egui::Modal::new(egui::Id::unique("new_worktree")).show(ui.ctx(), |ui| {
+            ui.set_width(380.0);
+            ui.heading("New Worktree");
+            ui.label(
+                RichText::new(
+                    "Check out a branch in a separate folder, so you can work on it \
+                               without stashing or switching here.",
+                )
+                .small()
+                .weak(),
+            );
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut form.new_branch, true, "New branch");
+                ui.radio_value(&mut form.new_branch, false, "Existing branch");
+            });
+            egui::Grid::new("new_worktree_grid")
+                .num_columns(2)
+                .spacing([8.0, 6.0])
+                .show(ui, |ui| {
+                    if form.new_branch {
+                        ui.label("Branch");
+                        let field = ui.add(
+                            egui::TextEdit::singleline(&mut form.branch)
+                                .hint_text("feature/my-change")
+                                .desired_width(f32::INFINITY),
+                        );
+                        if form.branch.is_empty() && !ui.memory(|m| m.focused().is_some()) {
+                            field.request_focus();
+                        }
+                        ui.end_row();
+                        ui.label("From");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut form.base)
+                                .hint_text("HEAD")
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.end_row();
+                    } else {
+                        ui.label("Branch");
+                        let shown = if form.existing.is_empty() {
+                            "Choose a branch…".to_owned()
+                        } else {
+                            form.existing.clone()
+                        };
+                        egui::ComboBox::from_id_salt("worktree_existing")
+                            .selected_text(shown)
+                            .width(ui.available_width())
+                            .height(300.0)
+                            .show_ui(ui, |ui| {
+                                for b in &available {
+                                    ui.selectable_value(
+                                        &mut form.existing,
+                                        b.name.clone(),
+                                        &b.name,
+                                    );
+                                }
+                            });
+                        ui.end_row();
+                    }
+                    let branch = if form.new_branch {
+                        form.branch.trim().to_owned()
+                    } else {
+                        // `origin/feature` checks out as `feature`.
+                        let name = form.existing.as_str();
+                        sc.branches
+                            .iter()
+                            .find(|b| b.remote && b.name == name)
+                            .and_then(|_| name.split_once('/'))
+                            .map_or(name, |(_, local)| local)
+                            .to_owned()
+                    };
+                    if !form.path_edited
+                        && let Some(main) = &main
+                    {
+                        form.path = worktree::default_path(main, &branch)
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default();
+                    }
+                    ui.label("Folder");
+                    ui.horizontal(|ui| {
+                        let browse_width = 70.0;
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut form.path)
+                                    .desired_width(ui.available_width() - browse_width),
+                            )
+                            .changed()
+                        {
+                            form.path_edited = true;
+                        }
+                        if ui.button("Browse…").clicked() {
+                            let mut dialog = rfd::FileDialog::new()
+                                .set_title("Choose where to put the worktree folder");
+                            if let Some(parent) = main.as_deref().and_then(Path::parent) {
+                                dialog = dialog.set_directory(parent);
+                            }
+                            if let Some(dir) = dialog.pick_folder() {
+                                let slug = worktree::folder_slug(&branch);
+                                let path = if slug.is_empty() { dir } else { dir.join(slug) };
+                                form.path = path.display().to_string();
+                                form.path_edited = true;
+                            }
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("Then");
+                    egui::ComboBox::from_id_salt("worktree_open")
+                        .selected_text(match form.open {
+                            OpenIn::NewWindow => "Open in a new window",
+                            OpenIn::ThisWindow => "Open in this window",
+                            OpenIn::Nowhere => "Don't open it",
+                        })
+                        .width(ui.available_width())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut form.open,
+                                OpenIn::NewWindow,
+                                "Open in a new window",
+                            );
+                            ui.selectable_value(
+                                &mut form.open,
+                                OpenIn::ThisWindow,
+                                "Open in this window",
+                            );
+                            ui.selectable_value(&mut form.open, OpenIn::Nowhere, "Don't open it");
+                        });
+                    ui.end_row();
+                });
+
+            let problem = new_worktree_problem(form, sc);
+            if let Some(p) = &problem {
+                ui.label(RichText::new(p).small().color(ui.visuals().warn_fg_color));
+            }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        problem.is_none() && sc.busy().is_none(),
+                        egui::Button::new("Create"),
+                    )
+                    .clicked()
+                    || (problem.is_none() && ui.input(|i| i.key_pressed(Key::Enter)))
+                {
+                    done = Some(true);
+                }
+                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                    done = Some(false);
+                }
+            });
+        });
+        match done {
+            Some(true) => {
+                let form = self.new_worktree.take().expect("dialog is open");
+                let path = PathBuf::from(form.path.trim());
+                let head = if form.new_branch {
+                    let base = form.base.trim();
+                    WorktreeHead::NewBranch {
+                        name: form.branch.trim().to_owned(),
+                        base: (!base.is_empty()).then(|| base.to_owned()),
+                    }
+                } else {
+                    WorktreeHead::Existing(form.existing)
+                };
+                sc.add_worktree(path.clone(), head);
+                if form.open != OpenIn::Nowhere {
+                    self.open_when_ready = Some((path, form.open, Instant::now()));
+                }
+            }
+            Some(false) => self.new_worktree = None,
+            None => {}
+        }
+    }
+
+    /// Opens a just-created worktree once git reports it.
+    fn take_created_worktree(&mut self, sc: &SourceControl) -> Option<PanelAction> {
+        let (path, how, started) = self.open_when_ready.as_ref()?;
+        if started.elapsed() > OPEN_WORKTREE_TIMEOUT {
+            self.open_when_ready = None;
+            return None;
+        }
+        sc.request_repaint_after(Duration::from_millis(250));
+        let created = sc.worktrees.iter().find(|w| same_path(&w.path, path))?;
+        let path = created.path.clone();
+        let action = match how {
+            OpenIn::ThisWindow => PanelAction::OpenFolder(path),
+            OpenIn::NewWindow => PanelAction::OpenFolderInNewWindow(path),
+            OpenIn::Nowhere => return None,
+        };
+        self.open_when_ready = None;
+        Some(action)
     }
 
     fn history(
@@ -992,6 +1515,14 @@ impl ScmPanel {
             Confirm::DropStash(name) => {
                 ("Drop Stash", format!("Permanently delete {name}?"), "Drop")
             }
+            Confirm::RemoveWorktree(path) => (
+                "Remove Worktree",
+                format!(
+                    "Remove the worktree at “{}”? Its folder is deleted; the branch is kept.",
+                    path.display()
+                ),
+                "Remove",
+            ),
             Confirm::DeleteTag(name) => (
                 "Delete Tag",
                 format!(
@@ -1014,6 +1545,12 @@ impl ScmPanel {
             if let Confirm::DeleteTag(_) = &confirm {
                 ui.checkbox(&mut self.delete_tag_remote, "Also delete it on the remote");
             }
+            if let Confirm::RemoveWorktree(_) = &confirm {
+                ui.checkbox(
+                    &mut self.remove_worktree_force,
+                    "Even if it has uncommitted changes (they will be lost)",
+                );
+            }
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui
@@ -1034,6 +1571,9 @@ impl ScmPanel {
                     Confirm::DeleteBranch(name) => sc.delete_branch(name, false),
                     Confirm::ForcePush => sc.push(true),
                     Confirm::DropStash(name) => sc.stash_drop(name),
+                    Confirm::RemoveWorktree(path) => {
+                        sc.remove_worktree(path, self.remove_worktree_force)
+                    }
                     Confirm::DeleteTag(name) => {
                         if self.delete_tag_remote {
                             sc.delete_remote_tag(name.clone());
@@ -1296,4 +1836,48 @@ fn message_guide(ui: &mut Ui, message: &str, colors: &UiColors) {
             }),
     )
     .on_hover_text("Git convention: subject ≤ 50 characters, blank line, body wrapped at 72");
+}
+
+/// Why the "New Worktree" form can't be submitted yet, if anything.
+fn new_worktree_problem(form: &NewWorktree, sc: &SourceControl) -> Option<String> {
+    if form.new_branch {
+        let name = form.branch.trim();
+        if name.is_empty() {
+            return Some("Name the new branch.".to_owned());
+        }
+        if name.contains(char::is_whitespace) || name.contains("..") || name.ends_with('/') {
+            return Some("That isn't a valid branch name.".to_owned());
+        }
+        if sc.branches.iter().any(|b| !b.remote && b.name == name) {
+            return Some(format!("A branch named “{name}” already exists."));
+        }
+    } else if form.existing.is_empty() {
+        return Some("Choose a branch.".to_owned());
+    }
+    let path = form.path.trim();
+    if path.is_empty() {
+        return Some("Choose a folder.".to_owned());
+    }
+    let path = Path::new(path);
+    if !path.is_absolute() {
+        return Some("Use a full path for the folder.".to_owned());
+    }
+    if path.exists() && path.read_dir().map_or(true, |mut d| d.next().is_some()) {
+        return Some("That folder already exists and isn't empty.".to_owned());
+    }
+    None
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
+}
+
+fn reveal_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Reveal in Finder"
+    } else if cfg!(target_os = "windows") {
+        "Reveal in File Explorer"
+    } else {
+        "Open Containing Folder"
+    }
 }

@@ -332,14 +332,29 @@ impl ForgeApp {
 
     fn open_folder_dialog(&mut self) {
         if let Some(path) = rfd::FileDialog::new().pick_folder() {
-            self.status = format!("Opened folder {}", path.display());
-            self.source_control.open(Some(&path));
-            self.github.open(Some(&path));
-            self.panes.clear();
-            self.active_pane = None;
-            self.editor_git.clear();
-            self.workspace = Some(Workspace::open(path));
+            self.open_folder(path);
         }
+    }
+
+    fn open_folder(&mut self, path: PathBuf) {
+        self.status = format!("Opened folder {}", path.display());
+        self.source_control.open(Some(&path));
+        self.github.open(Some(&path));
+        self.panes.clear();
+        self.active_pane = None;
+        self.editor_git.clear();
+        self.workspace = Some(Workspace::open(path));
+    }
+
+    /// Starts another Forge process with `path` open.
+    fn open_folder_in_new_window(&mut self, path: &Path) {
+        let result = std::env::current_exe()
+            .map_err(anyhow::Error::from)
+            .and_then(|exe| Ok(std::process::Command::new(exe).arg(path).spawn()?));
+        self.status = match result {
+            Ok(_) => format!("Opened {} in a new window", path.display()),
+            Err(e) => format!("Error: couldn't open a new window: {e:#}"),
+        };
     }
 
     /// Opens a repository-relative path from source control in the editor.
@@ -819,16 +834,28 @@ impl ForgeApp {
                     }
                     Some(PanelAction::OpenHistory) => self.open_history(None),
                     Some(PanelAction::OpenRebase) => self.open_rebase(None),
+                    Some(PanelAction::OpenFolder(path)) => self.open_folder(path),
+                    Some(PanelAction::OpenFolderInNewWindow(path)) => {
+                        self.open_folder_in_new_window(&path)
+                    }
+                    Some(PanelAction::RevealPath(path)) => {
+                        if let Err(e) = open_path(&path) {
+                            self.status = format!("Error: {e:#}");
+                        }
+                    }
                     None => {}
                 }
             }
             SidebarView::PullRequests => {
                 ui.add_space(4.0);
                 let branch = self.branch_context();
-                if let Some(ListAction::Open(n)) =
-                    self.pr_panel.show(ui, &mut self.github, &branch, &colors)
-                {
-                    self.open_pull_request(n);
+                match self.pr_panel.show(ui, &mut self.github, &branch, &colors) {
+                    Some(ListAction::Open(n)) => self.open_pull_request(n),
+                    Some(ListAction::GenerateText { base }) => {
+                        let task = self.source_control.suggest_pr_text(&base);
+                        self.pr_panel.set_generate_task(task);
+                    }
+                    None => {}
                 }
             }
         }
