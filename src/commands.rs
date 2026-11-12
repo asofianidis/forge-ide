@@ -49,6 +49,8 @@ pub enum Command {
     LanguageServers,
     RestartLanguageServers,
     ToggleFormatOnSave,
+    ToggleTerminal,
+    RestartTerminal,
     CheckForUpdates,
 }
 
@@ -115,6 +117,8 @@ impl Command {
         Command::LanguageServers,
         Command::RestartLanguageServers,
         Command::ToggleFormatOnSave,
+        Command::ToggleTerminal,
+        Command::RestartTerminal,
         Command::CheckForUpdates,
     ];
 
@@ -163,6 +167,8 @@ impl Command {
             Command::LanguageServers => "Language Servers…",
             Command::RestartLanguageServers => "Restart Language Servers",
             Command::ToggleFormatOnSave => "Format on Save",
+            Command::ToggleTerminal => "Toggle Terminal",
+            Command::RestartTerminal => "Restart Shell",
             Command::CheckForUpdates => "Check for Updates",
         }
     }
@@ -181,6 +187,7 @@ impl Command {
             | ShowProblems | ToggleBlame | NextChange | PreviousChange | FileHistory
             | RepositoryHistory | SelectTheme | ReloadThemes | OpenThemesFolder => "View",
             LanguageServers | RestartLanguageServers | ToggleFormatOnSave => "Tools",
+            ToggleTerminal | RestartTerminal => "Terminal",
             CheckForUpdates => "Help",
         }
     }
@@ -243,6 +250,8 @@ impl Command {
             Command::PreviousProblem => &const { one(shortcut(Modifiers::SHIFT, Key::F8)) },
             Command::ShowProblems => &const { one(shortcut(CMD_SHIFT, Key::M)) },
             Command::PreviousChange => &const { one(shortcut(ALT_SHIFT, Key::F5)) },
+            // Ctrl+` on every platform, as in other editors.
+            Command::ToggleTerminal => &const { one(shortcut(Modifiers::CTRL, Key::Backtick)) },
             _ => &[],
         }
     }
@@ -319,5 +328,9 @@ mod tests {
         let unique: HashSet<_> = Command::ALL.iter().collect();
         assert_eq!(unique.len(), Command::ALL.len());
         assert_eq!(Command::Find.palette_label(), "Edit: Find");
+        assert_eq!(
+            Command::RestartTerminal.palette_label(),
+            "Terminal: Restart Shell"
+        );
     }
 }

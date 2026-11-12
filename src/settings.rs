@@ -21,6 +21,10 @@ pub struct Settings {
     pub auto_update: Option<bool>,
     /// Format files with their language server when saving.
     pub format_on_save: bool,
+    /// Shell for the integrated terminal, with optional arguments (e.g. `"bash --login"`).
+    /// Defaults to PowerShell on Windows and `$SHELL` elsewhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_shell: Option<String>,
     /// Recently opened folders, most recent first.
     pub recent_folders: Vec<PathBuf>,
     /// Open tabs per folder, most recently used first.
@@ -121,6 +125,7 @@ mod tests {
         assert_eq!(s.theme.as_deref(), Some("Blossom"));
         assert_eq!(s.auto_update, None);
         assert!(s.recent_folders.is_empty());
+        assert_eq!(s.terminal_shell, None);
         let s: Settings = toml::from_str("").unwrap();
         assert!(s.theme.is_none());
     }
@@ -147,6 +152,7 @@ mod tests {
     fn sessions_round_trip_through_toml() {
         let mut s = Settings {
             theme: Some("Blossom".into()),
+            terminal_shell: Some("bash --login".into()),
             ..Settings::default()
         };
         s.add_recent_folder(Path::new("/code/a"));
@@ -164,6 +170,7 @@ mod tests {
         assert_eq!(back.recent_folders, s.recent_folders);
         assert_eq!(back.sessions, s.sessions);
         assert_eq!(back.theme, s.theme);
+        assert_eq!(back.terminal_shell, s.terminal_shell);
     }
 
     #[test]

@@ -7,6 +7,7 @@ mod language;
 mod pickers;
 mod search_panel;
 mod session;
+mod terminal_panel;
 
 use std::collections::HashSet;
 use std::ops::Range;
@@ -44,6 +45,7 @@ use find_bar::FindBar;
 use language::{EditorFrame, LanguageUi};
 use pickers::{FileMatches, PickerMode};
 use search_panel::SearchPanel;
+use terminal_panel::TerminalPanel;
 
 /// Actions from the merge conflict bar above the editor.
 enum ConflictBarAction {
@@ -141,6 +143,8 @@ pub struct ForgeApp {
     watcher: Option<FsWatcher>,
     /// New / Rename / Delete dialog from the file tree.
     explorer_dialog: Option<ExplorerDialog>,
+    /// Integrated terminal panel below the editor.
+    terminal: TerminalPanel,
 }
 
 impl ForgeApp {
@@ -220,6 +224,7 @@ impl ForgeApp {
             saved_session: None,
             watcher: None,
             explorer_dialog: None,
+            terminal: TerminalPanel::default(),
         };
         if let Some(folder) = folder {
             app.folder_opened(&folder);
@@ -811,8 +816,9 @@ impl ForgeApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        if self.picker.open || self.go_to_line.is_some() {
-            // Let the dialog handle Escape; other shortcuts still work.
+        let terminal_focused = self.terminal_has_focus(ctx);
+        if self.picker.open || self.go_to_line.is_some() || terminal_focused {
+            // Let the dialog (or the shell) handle Escape; other shortcuts still work.
         } else if self.find.open && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
             self.close_find(ctx);
         }
@@ -829,6 +835,11 @@ impl ForgeApp {
                     && self.go_to_line.is_none()));
         for (cmd, shortcut) in Command::shortcut_table() {
             if cmd.edits_text() && !editor_focused {
+                continue;
+            }
+            // In the terminal, keys without Cmd/Ctrl (F8, Alt+F5, …) and
+            // plain-Ctrl ones (Ctrl+R, Ctrl+G on macOS) belong to the shell.
+            if terminal_focused && cmd != Command::ToggleTerminal && !shortcut.modifiers.command {
                 continue;
             }
             if ctx.input_mut(|i| i.consume_shortcut(&shortcut)) {
@@ -911,6 +922,8 @@ impl ForgeApp {
             Command::NextProblem => self.go_to_problem(ctx, true),
             Command::PreviousProblem => self.go_to_problem(ctx, false),
             Command::ShowProblems => self.show_problems(),
+            Command::ToggleTerminal => self.toggle_terminal(ctx),
+            Command::RestartTerminal => self.restart_terminal(ctx),
             Command::CheckForUpdates => self.check_for_updates(ctx),
         }
     }
@@ -1050,6 +1063,10 @@ impl ForgeApp {
                 {
                     self.update_settings(|s| s.format_on_save = on);
                 }
+            });
+            ui.menu_button("Terminal", |ui| {
+                self.menu_item(ui, ToggleTerminal);
+                self.menu_item(ui, RestartTerminal);
             });
             ui.menu_button("Help", |ui| {
                 self.menu_item(ui, CheckForUpdates);
@@ -2028,6 +2045,14 @@ impl eframe::App for ForgeApp {
                 .default_size(300.0)
                 .size_range(200.0..=640.0)
                 .show(ui, |ui| self.sidebar(ui));
+        }
+        if self.terminal.open {
+            egui::Panel::bottom("terminal")
+                .frame(panel_frame)
+                .resizable(true)
+                .default_size(240.0)
+                .size_range(80.0..=f32::INFINITY)
+                .show(ui, |ui| self.terminal_panel(ui));
         }
 
         let bg = self.highlighter.background();
