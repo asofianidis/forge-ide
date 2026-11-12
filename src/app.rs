@@ -1,14 +1,16 @@
 //! Top-level application state and UI layout.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use egui::{Key, KeyboardShortcut, Modifiers, TextStyle};
 
 use crate::editor::{Document, Highlighter, gutter};
+use crate::lsp::{ServerBrowser, ServerManager};
 use crate::settings::Settings;
 use crate::theme::{self, Theme};
 use crate::updater::{self, UpdateState, Updater};
-use crate::workspace::{FileNode, Workspace};
+use crate::workspace::{FileKinds, FileNode, Workspace};
 
 const SHORTCUT_NEW: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::N);
 const SHORTCUT_OPEN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::O);
@@ -26,6 +28,10 @@ pub struct ForgeApp {
     status: String,
     /// 1-based (line, column) of the cursor in the active document.
     cursor: (usize, usize),
+    servers: ServerManager,
+    server_browser: ServerBrowser,
+    /// Languages whose "install a language server" hint the user dismissed.
+    dismissed_hints: HashSet<&'static str>,
     settings: Settings,
     updater: Updater,
     /// Update state seen last frame, to report transitions in the status bar.
@@ -66,6 +72,9 @@ impl ForgeApp {
             themes,
             status: theme_errors_status(&errors).unwrap_or_else(|| "Ready".to_owned()),
             cursor: (1, 1),
+            servers: ServerManager::new(cc.egui_ctx.clone()),
+            server_browser: ServerBrowser::default(),
+            dismissed_hints: HashSet::new(),
             settings,
             updater,
             last_update_state: UpdateState::Idle,
@@ -312,6 +321,19 @@ impl ForgeApp {
         }
     }
 
+    /// File kinds from the workspace scan plus any open tabs.
+    fn project_file_kinds(&self) -> FileKinds {
+        let mut kinds = self
+            .workspace
+            .as_ref()
+            .map(|ws| ws.file_kinds.clone())
+            .unwrap_or_default();
+        for doc in self.documents.iter().filter(|d| d.path.is_some()) {
+            kinds.insert_file(&doc.title());
+        }
+        kinds
+    }
+
     // ---- panels --------------------------------------------------------
 
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
@@ -383,6 +405,12 @@ impl ForgeApp {
                     }
                 });
             });
+            ui.menu_button("Tools", |ui| {
+                if ui.button("Language Servers…").clicked() {
+                    self.server_browser.open = true;
+                    ui.close();
+                }
+            });
             ui.menu_button("Help", |ui| {
                 let busy = matches!(
                     self.updater.state(),
@@ -438,6 +466,7 @@ impl ForgeApp {
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(&self.status);
+            self.language_server_hint(ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 self.update_indicator(ui);
                 if let Some(doc) = self.documents.get(self.active) {
@@ -447,6 +476,40 @@ impl ForgeApp {
                 }
             });
         });
+    }
+
+    /// Offers to install a language server when the active file has none.
+    fn language_server_hint(&mut self, ui: &mut egui::Ui) {
+        let Some(doc) = self.documents.get(self.active).filter(|d| d.path.is_some()) else {
+            return;
+        };
+        let Some(spec) = self
+            .servers
+            .suggestions_for_file(&doc.title())
+            .into_iter()
+            .next()
+        else {
+            return;
+        };
+        let language = spec.languages[0];
+        if self.dismissed_hints.contains(language) {
+            return;
+        }
+        ui.separator();
+        if ui
+            .link(format!("💡 Get a {language} language server"))
+            .on_hover_text("Browse language servers that add completion and diagnostics")
+            .clicked()
+        {
+            self.server_browser.open_with_query(language);
+        }
+        if ui
+            .small_button("×")
+            .on_hover_text("Don't suggest again")
+            .clicked()
+        {
+            self.dismissed_hints.insert(language);
+        }
     }
 
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
@@ -598,6 +661,7 @@ fn file_tree(ui: &mut egui::Ui, node: &mut FileNode, is_root: bool, clicked: &mu
 impl eframe::App for ForgeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.handle_shortcuts(&ui.ctx().clone());
+        self.servers.poll();
         self.poll_updater();
 
         let panel_frame =
@@ -622,5 +686,11 @@ impl eframe::App for ForgeApp {
                 ui.separator();
                 self.editor(ui);
             });
+
+        if self.server_browser.open {
+            let kinds = self.project_file_kinds();
+            self.server_browser
+                .show(&ui.ctx().clone(), &mut self.servers, &kinds);
+        }
     }
 }

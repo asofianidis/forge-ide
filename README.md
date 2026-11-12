@@ -12,6 +12,9 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
 - Line-number gutter with current-line highlight
 - Cursor line/column in the status bar
 - Native open/save dialogs (via [rfd](https://github.com/PolyMeilex/rfd))
+- Language server browser (**Tools → Language Servers…**): finds servers for the
+  languages in your project, shows which are installed, and installs missing ones
+  with one click via the language's own toolchain (rustup, npm, go, pipx, …)
 - Themes: built-in **Blossom** (default) and **Blossom Light**, plus custom TOML themes
 - Automatic updates from GitHub releases
 
@@ -100,7 +103,12 @@ src/
 ├── settings.rs          # persisted preferences (settings.toml)
 ├── theme.rs             # built-in + custom themes
 ├── updater.rs           # self-update from GitHub releases
-├── workspace.rs         # file tree / project explorer
+├── workspace.rs         # file tree / project explorer, file-type scan
+├── lsp/
+│   ├── catalog.rs       # known language servers and their install commands
+│   ├── detect.rs        # finding installed servers / package managers
+│   ├── install.rs       # background install jobs
+│   └── browser.rs       # "Language Servers" window
 └── editor/
     ├── document.rs      # open file buffer, load/save, dirty tracking
     ├── gutter.rs        # line-number gutter
@@ -115,6 +123,7 @@ src/
 - [ ] Command palette
 - [ ] Unsaved-changes prompt on close
 - [ ] Integrated terminal
+- [x] Language server discovery and installation
 - [ ] LSP client (diagnostics, completion, go to definition)
 - [x] Themes
 - [ ] Settings UI
