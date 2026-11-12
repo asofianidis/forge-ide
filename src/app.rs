@@ -5,6 +5,7 @@ mod explorer;
 mod find_bar;
 mod language;
 mod pickers;
+mod preferences;
 mod search_panel;
 mod session;
 
@@ -89,6 +90,8 @@ pub struct ForgeApp {
     /// Languages whose "install a language server" hint the user dismissed.
     dismissed_hints: HashSet<&'static str>,
     settings: Settings,
+    /// The Settings window is showing.
+    settings_open: bool,
     updater: Updater,
     /// Update state seen last frame, to report transitions in the status bar.
     last_update_state: UpdateState,
@@ -164,6 +167,10 @@ impl ForgeApp {
             style.spacing.button_padding = egui::vec2(10.0, 4.0);
             style.spacing.menu_margin = egui::Margin::same(8);
         });
+        // Ctrl+= / Ctrl+- / Ctrl+0 change the editor font size instead of
+        // zooming the whole UI.
+        cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        Self::apply_font_size(&cc.egui_ctx, settings.font_size);
         themes[idx].apply(&cc.egui_ctx);
         crate::ui::diff_style::set_theme(themes[idx].syntect_theme());
 
@@ -198,6 +205,7 @@ impl ForgeApp {
             language: LanguageUi::default(),
             dismissed_hints: HashSet::new(),
             settings,
+            settings_open: false,
             updater,
             last_update_state: UpdateState::Idle,
             manual_update_check: false,
@@ -322,14 +330,20 @@ impl ForgeApp {
 
     // ---- themes --------------------------------------------------------
 
-    fn set_theme(&mut self, ctx: &egui::Context, idx: usize) {
+    /// Makes `themes[idx]` the active theme without saving the choice.
+    fn activate_theme(&mut self, ctx: &egui::Context, idx: usize) {
         self.theme = idx;
         let theme = &self.themes[idx];
         theme.apply(ctx);
         self.highlighter.set_theme(theme.syntect_theme());
         crate::ui::diff_style::set_theme(theme.syntect_theme());
-        self.status = format!("Theme: {}", theme.name);
-        let name = theme.name.clone();
+    }
+
+    /// Switches to `themes[idx]` and remembers the choice.
+    fn set_theme(&mut self, ctx: &egui::Context, idx: usize) {
+        self.activate_theme(ctx, idx);
+        let name = self.themes[idx].name.clone();
+        self.status = format!("Theme: {name}");
         self.update_settings(|s| s.theme = Some(name));
     }
 
@@ -652,6 +666,10 @@ impl ForgeApp {
                 self.status = format!("Saved {}", doc.title());
                 if let Some(path) = &doc.path {
                     self.lsp.did_save(path, &doc.text);
+                    if Settings::path().as_deref() == Some(path.as_path()) {
+                        let ctx = self.egui_ctx.clone();
+                        self.reload_settings(&ctx);
+                    }
                 }
                 true
             }
@@ -899,6 +917,12 @@ impl ForgeApp {
                 continue;
             }
             if ctx.input_mut(|i| i.consume_shortcut(&shortcut)) {
+                // On macOS, Option+letter also types a character (Option+Z is
+                // "Ω"); drop it so the shortcut doesn't edit the text too.
+                let m = shortcut.modifiers;
+                if m.alt && !(m.ctrl || m.command || m.mac_cmd) {
+                    ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Text(_))));
+                }
                 self.run_command(ctx, cmd);
             }
         }
@@ -922,6 +946,8 @@ impl ForgeApp {
                     None => self.status = "Save the file first".to_owned(),
                 }
             }
+            Command::OpenSettings => self.settings_open = true,
+            Command::OpenSettingsFile => self.open_settings_file(),
             Command::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             Command::Find => {
                 self.active_pane = None;
@@ -961,6 +987,11 @@ impl ForgeApp {
                 self.open_history(rel);
             }
             Command::RepositoryHistory => self.open_history(None),
+            Command::ToggleWordWrap => self.toggle_word_wrap(),
+            Command::ToggleLineNumbers => self.toggle_line_numbers(),
+            Command::IncreaseFontSize => self.change_font_size(ctx, Some(1.0)),
+            Command::DecreaseFontSize => self.change_font_size(ctx, Some(-1.0)),
+            Command::ResetFontSize => self.change_font_size(ctx, None),
             Command::SelectTheme => self.open_theme_picker(),
             Command::ReloadThemes => self.reload_themes(ctx),
             Command::OpenThemesFolder => self.open_themes_folder(),
@@ -1021,6 +1052,17 @@ impl ForgeApp {
         }
     }
 
+    /// A checkbox menu entry for a toggle command, showing its shortcut on hover.
+    fn menu_checkbox(&mut self, ui: &mut egui::Ui, cmd: Command, value: &mut bool, text: &str) {
+        let mut response = ui.checkbox(value, text);
+        if let Some(s) = cmd.shortcuts().first() {
+            response = response.on_hover_text(ui.ctx().format_shortcut(s));
+        }
+        if response.changed() {
+            self.pending_commands.push(cmd);
+        }
+    }
+
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         use Command::*;
         egui::MenuBar::new().ui(ui, |ui| {
@@ -1035,6 +1077,9 @@ impl ForgeApp {
                 self.menu_item(ui, CloseTab);
                 ui.separator();
                 self.menu_item(ui, RevealActiveFile);
+                ui.separator();
+                self.menu_item(ui, OpenSettings);
+                self.menu_item(ui, OpenSettingsFile);
                 ui.separator();
                 self.menu_item(ui, Quit);
             });
@@ -1096,6 +1141,14 @@ impl ForgeApp {
                 }
                 self.menu_item(ui, FileHistory);
                 self.menu_item(ui, RepositoryHistory);
+                ui.separator();
+                let mut wrap = self.settings.word_wrap;
+                self.menu_checkbox(ui, ToggleWordWrap, &mut wrap, "Word Wrap");
+                let mut numbers = self.settings.line_numbers;
+                self.menu_checkbox(ui, ToggleLineNumbers, &mut numbers, "Line Numbers");
+                for cmd in [IncreaseFontSize, DecreaseFontSize, ResetFontSize] {
+                    self.menu_item(ui, cmd);
+                }
                 ui.separator();
                 ui.menu_button("Theme", |ui| {
                     let mut chosen = None;
@@ -1617,7 +1670,9 @@ impl ForgeApp {
         let highlighter = &mut self.highlighter;
         let font = TextStyle::Monospace.resolve(ui.style());
         let digit_width = ui.fonts_mut(|f| f.glyph_width(&font, '0'));
-        let gutter_width = gutter::width(doc.line_count(), digit_width);
+        let line_numbers = self.settings.line_numbers;
+        let word_wrap = self.settings.word_wrap;
+        let gutter_width = gutter::width(doc.line_count(), digit_width, line_numbers);
         let current_line = self.cursor.0;
         let mut scroll_to = self.scroll_to.take();
         let reveal = self.reveal.take();
@@ -1682,11 +1737,18 @@ impl ForgeApp {
                         r.x_range()
                     });
                     let underlay = ui.painter().add(Shape::Noop);
+                    // Wrapping lays the text out to the visible width; otherwise
+                    // long lines extend and the area scrolls sideways.
+                    let desired_width = if word_wrap {
+                        ui.available_width()
+                    } else {
+                        f32::INFINITY
+                    };
                     let output = egui::TextEdit::multiline(&mut doc.text)
                         .id(id)
                         .code_editor()
                         .lock_focus(true)
-                        .desired_width(f32::INFINITY)
+                        .desired_width(desired_width)
                         .desired_rows(40)
                         .frame(frame)
                         .layouter(&mut layouter)
@@ -1783,6 +1845,7 @@ impl ForgeApp {
                         &output,
                         current_line,
                         &font,
+                        line_numbers,
                         changes.as_ref().map(|c| (c, &mark_colors)),
                     );
                     if !found_conflicts.is_empty()
@@ -2193,6 +2256,7 @@ impl eframe::App for ForgeApp {
             self.server_browser.show(&ctx, &mut self.servers, &kinds);
         }
 
+        self.settings_window(&ctx);
         self.show_picker(&ctx);
         self.go_to_line_dialog(&ctx);
         self.rename_dialog(&ctx);

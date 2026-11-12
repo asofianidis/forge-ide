@@ -15,6 +15,8 @@ pub enum Command {
     SaveAs,
     CloseTab,
     RevealActiveFile,
+    OpenSettings,
+    OpenSettingsFile,
     Quit,
     Find,
     Replace,
@@ -46,6 +48,11 @@ pub enum Command {
     PreviousChange,
     FileHistory,
     RepositoryHistory,
+    ToggleWordWrap,
+    ToggleLineNumbers,
+    IncreaseFontSize,
+    DecreaseFontSize,
+    ResetFontSize,
     SelectTheme,
     ReloadThemes,
     OpenThemesFolder,
@@ -85,6 +92,8 @@ impl Command {
         Command::SaveAs,
         Command::CloseTab,
         Command::RevealActiveFile,
+        Command::OpenSettings,
+        Command::OpenSettingsFile,
         Command::Quit,
         Command::Find,
         Command::Replace,
@@ -116,6 +125,11 @@ impl Command {
         Command::PreviousChange,
         Command::FileHistory,
         Command::RepositoryHistory,
+        Command::ToggleWordWrap,
+        Command::ToggleLineNumbers,
+        Command::IncreaseFontSize,
+        Command::DecreaseFontSize,
+        Command::ResetFontSize,
         Command::SelectTheme,
         Command::ReloadThemes,
         Command::OpenThemesFolder,
@@ -136,6 +150,8 @@ impl Command {
             Command::SaveAs => "Save As…",
             Command::CloseTab => "Close Tab",
             Command::RevealActiveFile => REVEAL_LABEL,
+            Command::OpenSettings => "Settings…",
+            Command::OpenSettingsFile => "Open Settings File (TOML)",
             Command::Quit => "Quit",
             Command::Find => "Find",
             Command::Replace => "Replace",
@@ -167,6 +183,11 @@ impl Command {
             Command::PreviousChange => "Previous Change",
             Command::FileHistory => "File History",
             Command::RepositoryHistory => "Repository History",
+            Command::ToggleWordWrap => "Toggle Word Wrap",
+            Command::ToggleLineNumbers => "Toggle Line Numbers",
+            Command::IncreaseFontSize => "Increase Font Size",
+            Command::DecreaseFontSize => "Decrease Font Size",
+            Command::ResetFontSize => "Reset Font Size",
             Command::SelectTheme => "Color Theme…",
             Command::ReloadThemes => "Reload Themes",
             Command::OpenThemesFolder => "Open Themes Folder",
@@ -182,14 +203,15 @@ impl Command {
         use Command::*;
         match self {
             NewFile | OpenFile | OpenFolder | OpenRecent | Save | SaveAs | CloseTab
-            | RevealActiveFile | Quit => "File",
+            | RevealActiveFile | OpenSettings | OpenSettingsFile | Quit => "File",
             Find | Replace | FindInProject | ToggleComment | Indent | Outdent | DuplicateLine
             | MoveLineUp | MoveLineDown | TriggerSuggest | RenameSymbol | FormatDocument => "Edit",
             QuickOpen | GoToLine | NextTab | PreviousTab | GoToDefinition | FindReferences
             | NextProblem | PreviousProblem | NextChange | PreviousChange => "Go",
             ShowCommandPalette | ShowExplorer | ShowSourceControl | ShowPullRequests
-            | ShowProblems | ToggleBlame | FileHistory | RepositoryHistory | SelectTheme
-            | ReloadThemes | OpenThemesFolder => "View",
+            | ShowProblems | ToggleBlame | FileHistory | RepositoryHistory | ToggleWordWrap
+            | ToggleLineNumbers | IncreaseFontSize | DecreaseFontSize | ResetFontSize
+            | SelectTheme | ReloadThemes | OpenThemesFolder => "View",
             LanguageServers | RestartLanguageServers | ToggleFormatOnSave => "Tools",
             CheckForUpdates => "Help",
         }
@@ -257,6 +279,15 @@ impl Command {
             Command::PreviousProblem => &const { one(shortcut(Modifiers::SHIFT, Key::F8)) },
             Command::ShowProblems => &const { one(shortcut(CMD_SHIFT, Key::M)) },
             Command::PreviousChange => &const { one(shortcut(ALT_SHIFT, Key::F5)) },
+            Command::OpenSettings => &const { one(shortcut(CMD, Key::Comma)) },
+            Command::ToggleWordWrap => &const { one(shortcut(ALT, Key::Z)) },
+            // Cmd+= and Cmd+Shift+= (Cmd++) both make the text bigger. These
+            // replace egui's whole-UI keyboard zoom, which is turned off.
+            Command::IncreaseFontSize => {
+                &const { [shortcut(CMD, Key::Equals), shortcut(CMD, Key::Plus)] }
+            }
+            Command::DecreaseFontSize => &const { one(shortcut(CMD, Key::Minus)) },
+            Command::ResetFontSize => &const { one(shortcut(CMD, Key::Num0)) },
             _ => &[],
         }
     }
@@ -352,5 +383,6 @@ mod tests {
         let unique: HashSet<_> = Command::ALL.iter().collect();
         assert_eq!(unique.len(), Command::ALL.len());
         assert_eq!(Command::Find.palette_label(), "Edit: Find");
+        assert_eq!(Command::OpenSettings.palette_label(), "File: Settings");
     }
 }
