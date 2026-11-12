@@ -88,6 +88,42 @@ pub fn paint(
     }
 }
 
+/// Screen rects of the laid-out rows, with the 1-based line each belongs to
+/// and whether it is the first row of that line.
+pub fn rows(output: &TextEditOutput) -> impl Iterator<Item = (usize, bool, Rect)> + '_ {
+    let mut line = 1;
+    let mut starts_line = true;
+    output.galley.rows.iter().map(move |row| {
+        let rect = row.rect().translate(output.galley_pos.to_vec2());
+        let item = (line, starts_line, rect);
+        starts_line = row.ends_with_newline;
+        if starts_line {
+            line += 1;
+        }
+        item
+    })
+}
+
+/// Screen rect of all rows of 1-based `line`, full editor width.
+pub fn line_rect(output: &TextEditOutput, line: usize) -> Option<Rect> {
+    let frame = output.response.response.rect;
+    rows(output)
+        .filter(|(l, _, _)| *l == line)
+        .map(|(_, _, r)| Rect::from_x_y_ranges(frame.x_range(), r.y_range()))
+        .reduce(|a, b| a.union(b))
+}
+
+/// The line whose change marker is at `pos`, if `pos` is on the marker strip.
+pub fn marker_hit(output: &TextEditOutput, pos: egui::Pos2) -> Option<usize> {
+    let separator_x = output.galley_pos.x - PADDING / 2.0;
+    if !(separator_x - 7.0..=separator_x + 2.0).contains(&pos.x) {
+        return None;
+    }
+    rows(output)
+        .find(|(_, _, r)| r.y_range().contains(pos.y))
+        .map(|(l, _, _)| l)
+}
+
 fn paint_mark(
     painter: &egui::Painter,
     mark: Option<Mark>,

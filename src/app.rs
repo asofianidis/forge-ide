@@ -1,20 +1,19 @@
 //! Top-level application state and UI layout.
 
-use std::collections::{HashMap, HashSet};
-use std::hash::{Hash as _, Hasher as _};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use egui::{Key, KeyboardShortcut, Modifiers, RichText, TextStyle};
 
+use crate::editor::conflicts::{self, Resolution};
+use crate::editor::scm::{self, EditorAction, EditorGit, Peek};
 use crate::editor::{Document, Highlighter, gutter};
-use crate::git::line_changes::{self, LineChanges};
 use crate::git::status::Change;
 use crate::git::{self, PanelAction, ScmPanel, SourceControl};
 use crate::github::{BranchContext, GhEvent, GitHub, ListAction, PrListPanel};
 use crate::lsp::{ServerBrowser, ServerManager};
 use crate::panes::{ChangesPane, CommitPane, Pane, PaneAction};
 use crate::settings::Settings;
-use crate::task::{self, Pending};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::activity::{self, SidebarView};
 use crate::ui::icons::{self, Icon};
@@ -32,14 +31,17 @@ const SHORTCUT_SCM: KeyboardShortcut =
 const SHORTCUT_PRS: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::P);
 
-/// Committed content of an open file, for the gutter change markers.
-struct GutterBase {
-    /// Source control revision the content was loaded at.
-    revision: u64,
-    task: Option<Pending<Option<String>>>,
-    content: Option<String>,
-    /// Markers computed for the buffer text with this hash.
-    cache: Option<(u64, LineChanges)>,
+const SHORTCUT_BLAME: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::ALT), Key::B);
+const SHORTCUT_NEXT_CHANGE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::ALT, Key::F5);
+const SHORTCUT_PREV_CHANGE: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::ALT.plus(Modifiers::SHIFT), Key::F5);
+
+/// Actions from the merge conflict bar above the editor.
+enum ConflictBarAction {
+    AcceptAll(Resolution),
+    Next,
+    MarkResolved,
 }
 
 pub struct ForgeApp {
@@ -74,7 +76,12 @@ pub struct ForgeApp {
     panes: Vec<Pane>,
     /// When set, the central area shows this pane instead of a document.
     active_pane: Option<usize>,
-    gutter_bases: HashMap<PathBuf, GutterBase>,
+    /// Change markers, blame and change peek for open files.
+    editor_git: EditorGit,
+    /// Move the cursor to (and scroll to) this 1-based line next frame.
+    goto_line: Option<usize>,
+    /// Requested jump to the next (+1) or previous (-1) change.
+    change_nav: Option<i8>,
 }
 
 impl ForgeApp {
@@ -98,6 +105,7 @@ impl ForgeApp {
             style.spacing.menu_margin = egui::Margin::same(8);
         });
         themes[idx].apply(&cc.egui_ctx);
+        crate::ui::diff_style::set_theme(themes[idx].syntect_theme());
 
         let workspace = root.filter(|p| p.is_dir()).map(Workspace::open);
         let folder = workspace.as_ref().map(|w| w.root.path.clone());
@@ -110,7 +118,9 @@ impl ForgeApp {
             sidebar_open: true,
             panes: Vec::new(),
             active_pane: None,
-            gutter_bases: HashMap::new(),
+            editor_git: EditorGit::default(),
+            goto_line: None,
+            change_nav: None,
             workspace,
             documents: vec![Document::untitled()],
             active: 0,
@@ -235,6 +245,7 @@ impl ForgeApp {
         let theme = &self.themes[idx];
         theme.apply(ctx);
         self.highlighter.set_theme(theme.syntect_theme());
+        crate::ui::diff_style::set_theme(theme.syntect_theme());
         self.status = format!("Theme: {}", theme.name);
         self.settings.theme = Some(theme.name.clone());
         self.save_settings();
@@ -248,6 +259,7 @@ impl ForgeApp {
         let theme = &self.themes[self.theme];
         theme.apply(ctx);
         self.highlighter.set_theme(theme.syntect_theme());
+        crate::ui::diff_style::set_theme(theme.syntect_theme());
         self.status = theme_errors_status(&errors)
             .unwrap_or_else(|| format!("Loaded {} themes", self.themes.len()));
     }
@@ -323,7 +335,7 @@ impl ForgeApp {
             self.github.open(Some(&path));
             self.panes.clear();
             self.active_pane = None;
-            self.gutter_bases.clear();
+            self.editor_git.clear();
             self.workspace = Some(Workspace::open(path));
         }
     }
@@ -432,44 +444,6 @@ impl ForgeApp {
         }
     }
 
-    /// Gutter markers for the active document, loading the committed
-    /// version in the background as needed.
-    fn active_line_changes(&mut self) -> Option<LineChanges> {
-        let sc = &self.source_control;
-        if !sc.is_ready() {
-            return None;
-        }
-        let doc = self.documents.get(self.active)?;
-        let path = doc.path.clone()?;
-        let rel = sc.rel_path(&path)?;
-        if sc.status.find(&rel).is_some_and(|e| e.is_untracked()) {
-            return None;
-        }
-        let revision = sc.revision;
-        let base = self.gutter_bases.entry(path).or_insert_with(|| GutterBase {
-            revision: u64::MAX,
-            task: None,
-            content: None,
-            cache: None,
-        });
-        if base.task.is_none() && base.revision != revision {
-            base.revision = revision;
-            base.task = sc.load_head_content(&rel);
-        }
-        if let Some(content) = task::poll(&mut base.task) {
-            base.content = content;
-            base.cache = None;
-        }
-        let content = base.content.as_deref()?;
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        doc.text.hash(&mut hasher);
-        let hash = hasher.finish();
-        if base.cache.as_ref().is_none_or(|(h, _)| *h != hash) {
-            base.cache = Some((hash, line_changes::compute(content, &doc.text)));
-        }
-        base.cache.as_ref().map(|(_, c)| c.clone())
-    }
-
     fn save_active(&mut self) {
         let Some(doc) = self.documents.get_mut(self.active) else {
             return;
@@ -517,6 +491,22 @@ impl ForgeApp {
                 i.consume_shortcut(&SHORTCUT_PRS),
             )
         });
+        let (blame, next_change, prev_change) = ctx.input_mut(|i| {
+            (
+                i.consume_shortcut(&SHORTCUT_BLAME),
+                i.consume_shortcut(&SHORTCUT_NEXT_CHANGE),
+                i.consume_shortcut(&SHORTCUT_PREV_CHANGE),
+            )
+        });
+        if blame {
+            self.editor_git.blame_on = !self.editor_git.blame_on;
+        }
+        if next_change {
+            self.change_nav = Some(1);
+        }
+        if prev_change {
+            self.change_nav = Some(-1);
+        }
         if explorer {
             self.show_sidebar(SidebarView::Explorer);
         }
@@ -624,6 +614,35 @@ impl ForgeApp {
                         self.show_sidebar(view);
                         ui.close();
                     }
+                }
+                ui.separator();
+                let mut blame = self.editor_git.blame_on;
+                if ui
+                    .add(egui::Checkbox::new(&mut blame, "Blame"))
+                    .on_hover_text(ctx.format_shortcut(&SHORTCUT_BLAME))
+                    .changed()
+                {
+                    self.editor_git.blame_on = blame;
+                }
+                if ui
+                    .add(
+                        egui::Button::new("Next Change")
+                            .shortcut_text(ctx.format_shortcut(&SHORTCUT_NEXT_CHANGE)),
+                    )
+                    .clicked()
+                {
+                    self.change_nav = Some(1);
+                    ui.close();
+                }
+                if ui
+                    .add(
+                        egui::Button::new("Previous Change")
+                            .shortcut_text(ctx.format_shortcut(&SHORTCUT_PREV_CHANGE)),
+                    )
+                    .clicked()
+                {
+                    self.change_nav = Some(-1);
+                    ui.close();
                 }
                 ui.separator();
                 ui.menu_button("Theme", |ui| {
@@ -973,22 +992,122 @@ impl ForgeApp {
     }
 
     fn editor(&mut self, ui: &mut egui::Ui) {
-        let changes = self.active_line_changes();
-        let ui_colors = &self.themes[self.theme].ui;
+        let colors = self.current_theme().ui.clone();
         let mark_colors = gutter::MarkColors {
-            added: ui_colors.added.0,
-            modified: ui_colors.modified.0,
-            deleted: ui_colors.deleted.0,
+            added: colors.added.0,
+            modified: colors.modified.0,
+            deleted: colors.deleted.0,
         };
-        let Some(doc) = self.documents.get_mut(self.active) else {
+        let Some(doc) = self.documents.get(self.active) else {
             return;
         };
+        let path = doc.path.clone();
+        let sc = &self.source_control;
+        let rel = path.as_deref().and_then(|p| sc.rel_path(p));
+        let (changes, blame) = match &path {
+            Some(p) => (
+                self.editor_git.changes(sc, p, &doc.text),
+                self.editor_git.blame(sc, p, &doc.text),
+            ),
+            None => (None, None),
+        };
+        let found_conflicts = if doc.text.contains("<<<<<<<") {
+            conflicts::find(&doc.text)
+        } else {
+            Vec::new()
+        };
+        let in_conflict = rel
+            .as_deref()
+            .and_then(|r| sc.status.find(r))
+            .is_some_and(|e| e.conflict.is_some());
+        let peek_idx = self
+            .editor_git
+            .peek
+            .as_ref()
+            .filter(|p| Some(&p.path) == path.as_ref())
+            .map(|p| p.hunk);
+
+        // Keyboard navigation between changes.
+        let mut action = None;
+        if let (Some(dir), Some(c)) = (self.change_nav.take(), &changes) {
+            let line = peek_idx
+                .and_then(|i| c.hunks.get(i))
+                .map_or(self.cursor.0, |h| h.start);
+            let idx = if dir > 0 {
+                c.next_after(line)
+            } else {
+                c.prev_before(line)
+            };
+            match idx {
+                Some(i) => action = Some(EditorAction::GoToChange(i)),
+                None => self.status = "No changes in this file".to_owned(),
+            }
+        }
+        if peek_idx.is_some() && ui.input(|i| i.key_pressed(Key::Escape)) {
+            action = Some(EditorAction::ClosePeek);
+        }
+
+        if !found_conflicts.is_empty() || in_conflict {
+            if let Some(bar) = conflict_bar(ui, found_conflicts.len(), &colors) {
+                match bar {
+                    ConflictBarAction::AcceptAll(how) => {
+                        let doc = &mut self.documents[self.active];
+                        doc.text = conflicts::resolve_all(&doc.text, how);
+                    }
+                    ConflictBarAction::Next => {
+                        let line = self.cursor.0;
+                        let next = found_conflicts
+                            .iter()
+                            .find(|c| c.start + 1 > line)
+                            .or(found_conflicts.first());
+                        self.goto_line = next.map(|c| c.start + 1);
+                    }
+                    ConflictBarAction::MarkResolved => {
+                        self.save_active();
+                        if let Some(r) = &rel {
+                            self.source_control.stage(vec![r.clone()]);
+                        }
+                    }
+                }
+            }
+            ui.add_space(2.0);
+        }
+        if self.editor_git.blame_on
+            && let Some(p) = &path
+        {
+            if let Some(e) = self.editor_git.blame_error(p) {
+                ui.colored_label(colors.warning.0, format!("Blame unavailable: {e}"));
+            } else if blame.is_none() && self.editor_git.blame_loading(p) {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new("Loading blame…").small().weak());
+                });
+            }
+        }
+
+        let doc = &mut self.documents[self.active];
         let extension = doc.extension().to_owned();
         let highlighter = &mut self.highlighter;
         let font = TextStyle::Monospace.resolve(ui.style());
         let digit_width = ui.fonts_mut(|f| f.glyph_width(&font, '0'));
         let gutter_width = gutter::width(doc.line_count(), digit_width);
         let current_line = self.cursor.0;
+        let editor_id = egui::Id::unique(("editor", self.active));
+
+        // Move the cursor for "go to change / conflict".
+        let mut scroll_line = None;
+        if let Some(line) = self.goto_line.take() {
+            let mut state =
+                egui::text_edit::TextEditState::load(ui.ctx(), editor_id).unwrap_or_default();
+            let idx = scm::line_start_char(&doc.text, line);
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::one(
+                    egui::text::CCursor::new(idx),
+                )));
+            state.store(ui.ctx(), editor_id);
+            scroll_line = Some(line);
+        }
 
         let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
             let mut job = highlighter.highlight(text.as_str(), &extension, font.clone());
@@ -996,39 +1115,193 @@ impl ForgeApp {
             ui.painter().layout_job(job)
         };
 
+        let mut peek_anchor = None;
+        let editor_rect = ui.available_rect_before_wrap();
         let output = egui::ScrollArea::both()
             .id_salt("editor_scroll")
             .auto_shrink(false)
             .show(ui, |ui| {
-                let output = egui::TextEdit::multiline(&mut doc.text)
-                    .id_salt(self.active)
-                    .code_editor()
-                    .lock_focus(true)
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(40)
-                    .margin(egui::Margin {
-                        left: gutter_width as i8,
-                        right: 4,
-                        top: 2,
-                        bottom: 2,
-                    })
-                    .layouter(&mut layouter)
-                    .show(ui);
-                gutter::paint(
-                    ui,
-                    &output,
-                    current_line,
-                    &font,
-                    changes.as_ref().map(|c| (c, &mark_colors)),
-                );
-                output
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    let blame_x = blame.as_ref().map(|_| {
+                        let (r, _) = ui.allocate_exact_size(
+                            egui::vec2(scm::BLAME_WIDTH, 1.0),
+                            egui::Sense::hover(),
+                        );
+                        r.x_range()
+                    });
+                    let output = egui::TextEdit::multiline(&mut doc.text)
+                        .id(editor_id)
+                        .code_editor()
+                        .lock_focus(true)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(40)
+                        .margin(egui::Margin {
+                            left: gutter_width as i8,
+                            right: 4,
+                            top: 2,
+                            bottom: 2,
+                        })
+                        .layouter(&mut layouter)
+                        .show(ui);
+                    gutter::paint(
+                        ui,
+                        &output,
+                        current_line,
+                        &font,
+                        changes.as_ref().map(|c| (c, &mark_colors)),
+                    );
+                    if !found_conflicts.is_empty()
+                        && let Some((c, how)) =
+                            scm::paint_conflicts(ui, &output, &found_conflicts, &colors)
+                    {
+                        action = Some(EditorAction::Resolve(c, how));
+                    }
+                    if let (Some(x), Some(b)) = (blame_x, &blame)
+                        && let Some(hash) = scm::paint_blame(ui, x, &output, b, &colors)
+                    {
+                        action = Some(EditorAction::OpenCommit(hash));
+                    }
+                    // Clicking a change marker opens the peek.
+                    if let Some(c) = &changes {
+                        let hover = ui
+                            .input(|i| i.pointer.hover_pos())
+                            .and_then(|p| gutter::marker_hit(&output, p))
+                            .and_then(|l| c.hunk_at(l));
+                        if hover.is_some() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if let Some(i) = hover
+                            && ui.input(|i| i.pointer.primary_clicked())
+                        {
+                            action = Some(if peek_idx == Some(i) {
+                                EditorAction::ClosePeek
+                            } else {
+                                EditorAction::GoToChange(i)
+                            });
+                        }
+                        if let Some(h) = peek_idx.and_then(|i| c.hunks.get(i)) {
+                            let last = h.start + h.len.max(1) - 1;
+                            peek_anchor = gutter::line_rect(&output, last);
+                        }
+                    }
+                    if let Some(line) = scroll_line
+                        && let Some(r) = gutter::line_rect(&output, line)
+                    {
+                        ui.scroll_to_rect(r, Some(egui::Align::Center));
+                    }
+                    output
+                })
+                .inner
             })
             .inner;
 
         if let Some(range) = output.cursor_range {
             self.cursor = doc.line_col(range.primary.index.into());
         }
+
+        // The change peek popup.
+        if let (Some(idx), Some(c), Some(anchor)) = (peek_idx, &changes, peek_anchor) {
+            let can_stage = if doc.is_dirty() {
+                Err("Save the file first")
+            } else {
+                Ok(())
+            };
+            let anchor =
+                egui::Rect::from_min_max(egui::pos2(output.galley_pos.x, anchor.top()), anchor.max);
+            if let Some(a) = scm::show_peek(
+                ui.ctx(),
+                anchor,
+                editor_rect,
+                c,
+                idx,
+                &doc.text,
+                can_stage,
+                &colors,
+            ) {
+                action = Some(a);
+            }
+        }
+
+        match action {
+            Some(EditorAction::Revert(h)) => {
+                doc.text = crate::git::line_changes::revert(&doc.text, &h);
+                self.editor_git.peek = None;
+                self.status = "Reverted change (save to keep it)".to_owned();
+            }
+            Some(EditorAction::Stage(h)) => {
+                if let Some(r) = rel {
+                    self.source_control.stage_change(r, h.start, h.len);
+                }
+                self.editor_git.peek = None;
+            }
+            Some(EditorAction::GoToChange(i)) => {
+                if let (Some(p), Some(h)) = (&path, changes.as_ref().and_then(|c| c.hunks.get(i))) {
+                    self.goto_line = Some(h.start);
+                    self.editor_git.peek = Some(Peek {
+                        path: p.clone(),
+                        hunk: i,
+                    });
+                }
+            }
+            Some(EditorAction::ClosePeek) => self.editor_git.peek = None,
+            Some(EditorAction::OpenCommit(hash)) => {
+                let pane = CommitPane::new(hash, &self.source_control);
+                self.open_pane(Pane::Commit(pane));
+            }
+            Some(EditorAction::Resolve(c, how)) => {
+                doc.text = conflicts::resolve(&doc.text, &c, how);
+            }
+            None => {}
+        }
     }
+}
+
+/// Banner above a file with merge conflicts.
+fn conflict_bar(ui: &mut egui::Ui, count: usize, colors: &UiColors) -> Option<ConflictBarAction> {
+    let mut action = None;
+    egui::Frame::new()
+        .fill(colors.warning.0.gamma_multiply(0.12))
+        .corner_radius(4)
+        .inner_margin(egui::Margin::symmetric(8, 4))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                if count == 0 {
+                    ui.label(
+                        RichText::new("All conflicts in this file are resolved.")
+                            .color(colors.added.0),
+                    );
+                    if ui
+                        .button("Save & Mark Resolved")
+                        .on_hover_text("Saves the file and stages it")
+                        .clicked()
+                    {
+                        action = Some(ConflictBarAction::MarkResolved);
+                    }
+                    return;
+                }
+                ui.label(
+                    RichText::new(format!("{count} merge conflict(s)"))
+                        .strong()
+                        .color(colors.warning.0),
+                );
+                if ui.small_button("Next Conflict").clicked() {
+                    action = Some(ConflictBarAction::Next);
+                }
+                ui.separator();
+                if ui.small_button("Accept All Current").clicked() {
+                    action = Some(ConflictBarAction::AcceptAll(Resolution::Current));
+                }
+                if ui.small_button("Accept All Incoming").clicked() {
+                    action = Some(ConflictBarAction::AcceptAll(Resolution::Incoming));
+                }
+                if ui.small_button("Accept All Both").clicked() {
+                    action = Some(ConflictBarAction::AcceptAll(Resolution::Both));
+                }
+            });
+        });
+    action
 }
 
 /// Formats theme loading errors for the status bar.

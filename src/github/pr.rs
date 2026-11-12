@@ -13,7 +13,7 @@ use crate::cli::Cli;
 use crate::git::diff::{self, DiffLine, FileDiff};
 use crate::task::{self, Pending};
 use crate::theme::UiColors;
-use crate::ui::diff_view::{self, DiffColors, DiffHooks, Side, line_anchor};
+use crate::ui::diff_view::{self, DiffColors, DiffHooks, LineRef, Side, line_anchor};
 use crate::ui::fmt;
 use crate::ui::icons::{self, Icon};
 use crate::ui::markdown;
@@ -1191,12 +1191,17 @@ impl PrPane {
             .default_size(230.0)
             .show(ui, |ui| {
                 ui.add_space(6.0);
-                ui.label(
-                    RichText::new(format!("{} files", files.len()))
-                        .small()
-                        .strong()
-                        .color(colors.text_muted.0),
-                );
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("{} files", files.len()))
+                            .small()
+                            .strong()
+                            .color(colors.text_muted.0),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        diff_view::layout_toggle(ui);
+                    });
+                });
                 egui::ScrollArea::vertical()
                     .id_salt(("pr_files_scroll", self.number))
                     .show(ui, |ui| {
@@ -1439,11 +1444,11 @@ impl FilesHooks<'_> {
 }
 
 impl DiffHooks for FilesHooks<'_> {
-    fn lines_clickable(&self) -> bool {
-        self.can_comment
+    fn can_click(&self, line: &DiffLine) -> bool {
+        self.can_comment && line_anchor(line).is_some()
     }
 
-    fn line_clicked(&mut self, file: &FileDiff, line: &DiffLine) {
+    fn line_clicked(&mut self, _at: LineRef, file: &FileDiff, line: &DiffLine, _shift: bool) {
         if let Some((side, n)) = line_anchor(line) {
             let same = self
                 .inline

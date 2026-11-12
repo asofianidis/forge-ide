@@ -114,6 +114,66 @@ impl FileDiff {
     }
 }
 
+impl FileDiff {
+    /// A patch with only the `selected` lines (indices into the hunk's
+    /// lines) of hunk `idx`, for `git apply`.
+    ///
+    /// Applied forward (staging), unselected additions are left out and
+    /// unselected removals become context. Applied with `--reverse`
+    /// (unstaging, discarding), it's the opposite: unselected additions
+    /// become context and unselected removals are left out. Returns `None`
+    /// when no changed line is selected.
+    pub fn lines_patch(&self, idx: usize, selected: &[usize], reverse: bool) -> Option<String> {
+        let hunk = self.hunks.get(idx)?;
+        let mut body = String::new();
+        let (mut old_count, mut new_count, mut changes) = (0, 0, 0);
+        for (i, line) in hunk.lines.iter().enumerate() {
+            let picked = selected.contains(&i);
+            let prefix = match (line.kind, picked, reverse) {
+                (LineKind::Context, _, _) => ' ',
+                (LineKind::Added, true, _) => '+',
+                (LineKind::Removed, true, _) => '-',
+                (LineKind::Added, false, false) | (LineKind::Removed, false, true) => continue,
+                (LineKind::Added, false, true) | (LineKind::Removed, false, false) => ' ',
+            };
+            match prefix {
+                '+' => {
+                    new_count += 1;
+                    changes += 1;
+                }
+                '-' => {
+                    old_count += 1;
+                    changes += 1;
+                }
+                _ => {
+                    old_count += 1;
+                    new_count += 1;
+                }
+            }
+            body.push(prefix);
+            body.push_str(&line.text);
+            body.push('\n');
+            if line.no_newline {
+                body.push_str("\\ No newline at end of file\n");
+            }
+        }
+        if changes == 0 {
+            return None;
+        }
+        let mut out = String::new();
+        for line in &self.header {
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "@@ -{},{old_count} +{},{new_count} @@\n",
+            hunk.old_start, hunk.new_start
+        ));
+        out.push_str(&body);
+        Some(out)
+    }
+}
+
 /// Parses a (possibly multi-file) unified diff. Text before the first
 /// `diff --git` line (e.g. a commit header) is ignored.
 pub fn parse(text: &str) -> Vec<FileDiff> {

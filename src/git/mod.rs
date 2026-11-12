@@ -2,6 +2,7 @@
 //! and history, all driven through the `git` command-line tool on
 //! background threads.
 
+pub mod blame;
 pub mod diff;
 pub mod line_changes;
 mod panel;
@@ -201,6 +202,10 @@ impl SourceControl {
 
     pub fn is_ready(&self) -> bool {
         self.state == RepoState::Ready
+    }
+
+    pub fn request_repaint_after(&self, delay: Duration) {
+        self.ctx.request_repaint_after(delay);
     }
 
     pub fn root(&self) -> Option<&Path> {
@@ -541,7 +546,7 @@ impl SourceControl {
     /// in reverse. Used for staging, unstaging and discarding single hunks.
     pub fn apply_patch(&mut self, label: &str, patch: String, cached: bool, reverse: bool) {
         self.queue(label.to_owned(), move |git| {
-            let mut args = vec!["apply", "--whitespace=nowarn"];
+            let mut args = vec!["apply", "--whitespace=nowarn", "--recount"];
             if cached {
                 args.push("--cached");
             }
@@ -550,6 +555,38 @@ impl SourceControl {
             }
             args.push("-");
             git.run_with_input(&args, &patch)
+        });
+    }
+
+    /// Stages one editor change: the lines `start..start + len` (1-based,
+    /// `len` 0 for a deletion above `start`) of the saved file `rel`.
+    pub fn stage_change(&mut self, rel: String, start: usize, len: usize) {
+        self.queue("Stage change", move |git| {
+            let out = git.run(&[
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                "--",
+                &rel,
+            ])?;
+            let files = diff::parse(&out);
+            let file = files.first().ok_or("no unstaged changes in this file")?;
+            for (h, hunk) in file.hunks.iter().enumerate() {
+                let picked = change_lines(hunk, start, len);
+                if picked.is_empty() {
+                    continue;
+                }
+                let patch = file
+                    .lines_patch(h, &picked, false)
+                    .ok_or("nothing to stage")?;
+                return git.run_with_input(
+                    &["apply", "--cached", "--recount", "--whitespace=nowarn", "-"],
+                    &patch,
+                );
+            }
+            Err("this change is already staged (or the file has unsaved edits)".into())
         });
     }
 
@@ -807,6 +844,24 @@ impl SourceControl {
         }))
     }
 
+    /// Who last changed each line of `contents` (the editor buffer for the
+    /// file at `rel`), so unsaved edits line up with what's on screen.
+    pub fn load_blame(
+        &self,
+        rel: &str,
+        contents: String,
+    ) -> Option<Pending<Result<blame::Blame, String>>> {
+        let git = self.git.clone()?;
+        let rel = rel.to_owned();
+        Some(Pending::spawn(&self.ctx, move || {
+            let out = git.run_with_input(
+                &["blame", "--porcelain", "--contents", "-", "--", &rel],
+                &contents,
+            )?;
+            Ok(blame::parse(&out))
+        }))
+    }
+
     /// The committed (HEAD) content of a file, `None` if it is not in HEAD.
     pub fn load_head_content(&self, rel: &str) -> Option<Pending<Option<String>>> {
         let git = self.git.clone()?;
@@ -816,6 +871,37 @@ impl SourceControl {
             out.success.then_some(out.stdout)
         }))
     }
+}
+
+/// Indices of the lines in `hunk` that make up the editor change at
+/// `start..start + len`: added lines in that range, plus the removed lines
+/// directly before it.
+fn change_lines(hunk: &diff::Hunk, start: usize, len: usize) -> Vec<usize> {
+    use diff::LineKind;
+    let start = start as u32;
+    let end = start + len as u32;
+    let mut picked = Vec::new();
+    for (i, line) in hunk.lines.iter().enumerate() {
+        match line.kind {
+            LineKind::Added => {
+                if line.new_no.is_some_and(|n| n >= start && n < end) {
+                    picked.push(i);
+                }
+            }
+            LineKind::Removed => {
+                // The new-file line this removal sits above.
+                let above = hunk.lines[i..]
+                    .iter()
+                    .find_map(|l| l.new_no)
+                    .unwrap_or(hunk.new_start + hunk.new_count);
+                if above == start {
+                    picked.push(i);
+                }
+            }
+            LineKind::Context => {}
+        }
+    }
+    picked
 }
 
 fn count_label(verb: &str, paths: &[String]) -> String {
@@ -973,6 +1059,21 @@ mod tests {
     }
 
     #[test]
+    fn change_lines_pick_one_editor_change() {
+        let d = diff::parse(
+            "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,6 +1,6 @@\n a\n-b\n+B\n c\n-d\n e\n+new\n f\n",
+        );
+        let hunk = &d[0].hunks[0];
+        // Modified line 2: the removal of "b" and the addition of "B".
+        assert_eq!(change_lines(hunk, 2, 1), [1, 2]);
+        // "d" was deleted above new line 4 ("e").
+        assert_eq!(change_lines(hunk, 4, 0), [4]);
+        // Added line 5.
+        assert_eq!(change_lines(hunk, 5, 1), [6]);
+        assert!(change_lines(hunk, 1, 1).is_empty());
+    }
+
+    #[test]
     fn decorations_propagate_to_parent_dirs() {
         let s = status::parse("1 .M N... 100644 100644 100644 a b src/deep/a.rs\0? src/new.rs\0");
         let d = decorations(&s);
@@ -1031,9 +1132,75 @@ mod tests {
         let cached = git.run(&["diff", "--cached"]).unwrap();
         assert!(cached.contains("+ten") && !cached.contains("+one"));
 
+        // Line staging: of the two lines added below, stage only the first.
+        git.run(&["add", "-A"]).unwrap();
+        git.run(&["commit", "-q", "-m", "second"]).unwrap();
+        std::fs::write(
+            dir.join("a.txt"),
+            "one\n2\nX\nY\n3\n4\n5\n6\n7\n8\n9\nten\n",
+        )
+        .unwrap();
+        let out = git
+            .run(&["diff", "--no-color", "--src-prefix=a/", "--dst-prefix=b/"])
+            .unwrap();
+        let files = diff::parse(&out);
+        let x = files[0].hunks[0]
+            .lines
+            .iter()
+            .position(|l| l.text == "X")
+            .unwrap();
+        let patch = files[0].lines_patch(0, &[x], false).unwrap();
+        git.run_with_input(&["apply", "--cached", "--recount", "-"], &patch)
+            .unwrap();
+        let cached = git.run(&["diff", "--cached"]).unwrap();
+        assert!(cached.contains("+X") && !cached.contains("+Y"), "{cached}");
+
+        // Unstage it again by selecting the line in the staged diff.
+        let out = git
+            .run(&[
+                "diff",
+                "--cached",
+                "--no-color",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+            ])
+            .unwrap();
+        let files = diff::parse(&out);
+        let x = files[0].hunks[0]
+            .lines
+            .iter()
+            .position(|l| l.text == "X")
+            .unwrap();
+        let patch = files[0].lines_patch(0, &[x], true).unwrap();
+        git.run_with_input(
+            &["apply", "--cached", "--recount", "--reverse", "-"],
+            &patch,
+        )
+        .unwrap();
+        assert!(git.run(&["diff", "--cached"]).unwrap().is_empty());
+
+        // Discard only Y from the work tree.
+        let out = git
+            .run(&["diff", "--no-color", "--src-prefix=a/", "--dst-prefix=b/"])
+            .unwrap();
+        let files = diff::parse(&out);
+        let y = files[0].hunks[0]
+            .lines
+            .iter()
+            .position(|l| l.text == "Y")
+            .unwrap();
+        let patch = files[0].lines_patch(0, &[y], true).unwrap();
+        git.run_with_input(&["apply", "--recount", "--reverse", "-"], &patch)
+            .unwrap();
+        let content = std::fs::read_to_string(dir.join("a.txt")).unwrap();
+        assert!(
+            content.contains("X\n") && !content.contains("Y\n"),
+            "{content}"
+        );
+
         let log = load_log(&git, None).unwrap();
-        assert_eq!(log.len(), 1);
-        assert_eq!(log[0].subject, "init");
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[1].subject, "init");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

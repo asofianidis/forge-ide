@@ -1,15 +1,17 @@
 //! Non-editor tabs in the main area: a file's working-tree/staged diff, a
 //! commit, and a GitHub pull request.
 
+use std::collections::BTreeSet;
+
 use egui::{RichText, Ui};
 
-use crate::git::diff::FileDiff;
+use crate::git::diff::{DiffLine, FileDiff, LineKind};
 use crate::git::status::Entry;
 use crate::git::{CommitDetail, SourceControl};
 use crate::github::PrPane;
 use crate::task::{self, Pending};
 use crate::theme::UiColors;
-use crate::ui::diff_view::{self, DiffColors, DiffHooks};
+use crate::ui::diff_view::{self, DiffColors, DiffHooks, LineRef};
 use crate::ui::fmt;
 use crate::ui::icons::{self, Icon};
 
@@ -74,6 +76,10 @@ pub struct ChangesPane {
     task: Option<Pending<Result<Vec<FileDiff>, String>>>,
     /// Source control revision the diff was loaded at.
     loaded_rev: Option<u64>,
+    /// Lines picked for staging, unstaging or discarding.
+    selection: BTreeSet<LineRef>,
+    /// Where a Shift+click range starts.
+    anchor: Option<LineRef>,
 }
 
 impl ChangesPane {
@@ -84,6 +90,8 @@ impl ChangesPane {
             files: None,
             task: None,
             loaded_rev: None,
+            selection: BTreeSet::new(),
+            anchor: None,
         }
     }
 
@@ -99,6 +107,11 @@ impl ChangesPane {
         colors: &UiColors,
     ) -> Option<PaneAction> {
         if let Some(result) = task::poll(&mut self.task) {
+            // Line numbers may have shifted, so a selection no longer applies.
+            if self.files.as_ref() != Some(&result) {
+                self.selection.clear();
+                self.anchor = None;
+            }
             self.files = Some(result);
         }
         // Reload whenever the repository changed (staging, edits, commits).
@@ -128,6 +141,8 @@ impl ChangesPane {
                         ui.spinner();
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        diff_view::layout_toggle(ui);
+                        ui.separator();
                         let other = if self.staged {
                             "Show Working Tree"
                         } else {
@@ -161,6 +176,24 @@ impl ChangesPane {
             self.staged = !self.staged;
             self.loaded_rev = None;
             self.files = None;
+            self.selection.clear();
+            self.anchor = None;
+        }
+        if !self.entry.is_untracked() {
+            let hint = if self.selection.is_empty() {
+                "Tip: click changed lines to stage just those (Shift+click selects a range)."
+                    .to_owned()
+            } else {
+                format!(
+                    "{} line(s) selected — use the buttons on the hunk header. Esc clears.",
+                    self.selection.len()
+                )
+            };
+            ui.label(RichText::new(hint).small().color(colors.text_muted.0));
+            if !self.selection.is_empty() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.selection.clear();
+                self.anchor = None;
+            }
         }
 
         let dc = DiffColors::from_theme(colors);
@@ -168,6 +201,8 @@ impl ChangesPane {
             staged: self.staged,
             untracked: self.entry.is_untracked(),
             requests: Vec::new(),
+            selection: &mut self.selection,
+            anchor: &mut self.anchor,
         };
         egui::ScrollArea::both()
             .id_salt(("changes", &self.entry.path, self.staged))
@@ -209,17 +244,95 @@ impl ChangesPane {
     }
 }
 
-/// Stage / unstage / discard individual hunks.
-struct LocalHooks {
+/// Stage / unstage / discard individual hunks or selected lines.
+struct LocalHooks<'a> {
     staged: bool,
     untracked: bool,
     /// (label, patch, cached, reverse)
     requests: Vec<(&'static str, String, bool, bool)>,
+    selection: &'a mut BTreeSet<LineRef>,
+    anchor: &'a mut Option<LineRef>,
 }
 
-impl DiffHooks for LocalHooks {
-    fn hunk_actions(&mut self, ui: &mut Ui, _file_idx: usize, hunk_idx: usize, file: &FileDiff) {
+impl DiffHooks for LocalHooks<'_> {
+    fn can_click(&self, line: &DiffLine) -> bool {
+        !self.untracked && line.kind != LineKind::Context
+    }
+
+    fn click_hint(&self) -> &'static str {
+        if self.staged {
+            "Click to select lines to unstage (Shift+click for a range)"
+        } else {
+            "Click to select lines to stage or discard (Shift+click for a range)"
+        }
+    }
+
+    fn is_selected(&self, at: LineRef) -> bool {
+        self.selection.contains(&at)
+    }
+
+    fn line_clicked(&mut self, at: LineRef, file: &FileDiff, _line: &DiffLine, shift: bool) {
+        match *self.anchor {
+            Some(a) if shift && a.file == at.file && a.hunk == at.hunk => {
+                // Select every changed line between the anchor and here.
+                let (lo, hi) = (a.line.min(at.line), a.line.max(at.line));
+                for (i, l) in file.hunks[at.hunk].lines.iter().enumerate() {
+                    if (lo..=hi).contains(&i) && l.kind != LineKind::Context {
+                        self.selection.insert(LineRef { line: i, ..at });
+                    }
+                }
+            }
+            _ => {
+                if !self.selection.remove(&at) {
+                    self.selection.insert(at);
+                }
+                *self.anchor = Some(at);
+            }
+        }
+    }
+
+    fn hunk_actions(&mut self, ui: &mut Ui, file_idx: usize, hunk_idx: usize, file: &FileDiff) {
         if self.untracked {
+            return;
+        }
+        let picked: Vec<usize> = self
+            .selection
+            .iter()
+            .filter(|r| r.file == file_idx && r.hunk == hunk_idx)
+            .map(|r| r.line)
+            .collect();
+        if !picked.is_empty() {
+            let n = picked.len();
+            let mut done = false;
+            if self.staged {
+                if ui.small_button(format!("Unstage {n} Line(s)")).clicked()
+                    && let Some(p) = file.lines_patch(hunk_idx, &picked, true)
+                {
+                    self.requests.push(("Unstage lines", p, true, true));
+                    done = true;
+                }
+            } else {
+                if ui.small_button(format!("Stage {n} Line(s)")).clicked()
+                    && let Some(p) = file.lines_patch(hunk_idx, &picked, false)
+                {
+                    self.requests.push(("Stage lines", p, true, false));
+                    done = true;
+                }
+                if ui
+                    .small_button(format!("Discard {n} Line(s)"))
+                    .on_hover_text("Revert just these lines in the working tree")
+                    .clicked()
+                    && let Some(p) = file.lines_patch(hunk_idx, &picked, true)
+                {
+                    self.requests.push(("Discard lines", p, false, true));
+                    done = true;
+                }
+            }
+            if done || ui.small_button("Clear").clicked() {
+                self.selection
+                    .retain(|r| !(r.file == file_idx && r.hunk == hunk_idx));
+                *self.anchor = None;
+            }
             return;
         }
         let Some(patch) = file.hunk_patch(hunk_idx) else {
@@ -311,6 +424,9 @@ impl CommitPane {
                     ui.label(format!("{} file(s)", detail.files.len()));
                     ui.label(RichText::new(format!("+{adds}")).color(colors.added.0));
                     ui.label(RichText::new(format!("−{dels}")).color(colors.deleted.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        diff_view::layout_toggle(ui);
+                    });
                 });
             });
         ui.separator();

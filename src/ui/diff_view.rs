@@ -1,12 +1,22 @@
 //! Renders parsed unified diffs: one collapsible section per file, hunks
-//! with old/new line numbers and colored added/removed lines.
+//! with old/new line numbers, syntax highlighting, word-level emphasis of
+//! what changed, and a unified or side-by-side (split) layout.
 //!
 //! Callers customize it through [`DiffHooks`]: buttons on file and hunk
-//! headers (stage hunk, open file, …) and content under individual lines
+//! headers (stage hunk, open file, …), clickable lines (selecting lines to
+//! stage, starting a review comment) and content under individual lines
 //! (inline review comments).
 
-use egui::{Align2, Color32, CursorIcon, FontId, Rect, RichText, Sense, TextStyle, Ui, pos2, vec2};
+use std::hash::{Hash as _, Hasher as _};
+use std::sync::Arc;
 
+use egui::text::{LayoutJob, TextFormat};
+use egui::{
+    Align2, Color32, CursorIcon, FontId, Painter, Pos2, Rect, RichText, Sense, TextStyle, Ui, pos2,
+    vec2,
+};
+
+use super::diff_style::{self, LineStyle};
 use crate::git::diff::{DiffLine, FileDiff, FileStatus, Hunk, LineKind};
 use crate::theme::UiColors;
 
@@ -37,17 +47,33 @@ pub fn line_anchor(line: &DiffLine) -> Option<(Side, u32)> {
     }
 }
 
+/// Position of a line within the diff being shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LineRef {
+    pub file: usize,
+    pub hunk: usize,
+    pub line: usize,
+}
+
 pub trait DiffHooks {
     /// Extra widgets on a file header (right-aligned).
     fn file_actions(&mut self, _ui: &mut Ui, _file_idx: usize, _file: &FileDiff) {}
-    /// Extra widgets on a hunk header (right-aligned).
+    /// Extra widgets on a hunk header, after the line ranges.
     fn hunk_actions(&mut self, _ui: &mut Ui, _file_idx: usize, _hunk_idx: usize, _file: &FileDiff) {
     }
-    /// Whether clicking a line does something (e.g. starts a comment).
-    fn lines_clickable(&self) -> bool {
+    /// Whether clicking `line` does something.
+    fn can_click(&self, _line: &DiffLine) -> bool {
         false
     }
-    fn line_clicked(&mut self, _file: &FileDiff, _line: &DiffLine) {}
+    /// Tooltip for clickable lines.
+    fn click_hint(&self) -> &'static str {
+        "Comment on this line"
+    }
+    fn line_clicked(&mut self, _at: LineRef, _file: &FileDiff, _line: &DiffLine, _shift: bool) {}
+    /// Whether `at` is selected (drawn highlighted).
+    fn is_selected(&self, _at: LineRef) -> bool {
+        false
+    }
     /// Content drawn under a line, such as a comment thread.
     fn after_line(&mut self, _ui: &mut Ui, _file: &FileDiff, _line: &DiffLine) {}
     /// Content drawn at the top of a file section (e.g. outdated comments).
@@ -61,6 +87,8 @@ impl DiffHooks for NoHooks {}
 pub struct DiffColors {
     pub added_bg: Color32,
     pub removed_bg: Color32,
+    pub added_emph: Color32,
+    pub removed_emph: Color32,
     pub added_fg: Color32,
     pub removed_fg: Color32,
     pub modified_fg: Color32,
@@ -68,13 +96,17 @@ pub struct DiffColors {
     pub muted: Color32,
     pub text: Color32,
     pub hover: Color32,
+    pub selected: Color32,
+    pub empty: Color32,
 }
 
 impl DiffColors {
     pub fn from_theme(c: &UiColors) -> Self {
         Self {
-            added_bg: c.added.0.gamma_multiply(0.16),
-            removed_bg: c.deleted.0.gamma_multiply(0.16),
+            added_bg: c.added.0.gamma_multiply(0.14),
+            removed_bg: c.deleted.0.gamma_multiply(0.14),
+            added_emph: c.added.0.gamma_multiply(0.38),
+            removed_emph: c.deleted.0.gamma_multiply(0.38),
             added_fg: c.added.0,
             removed_fg: c.deleted.0,
             modified_fg: c.modified.0,
@@ -82,6 +114,8 @@ impl DiffColors {
             muted: c.text_muted.0,
             text: c.text.0,
             hover: c.widget_hover.0.gamma_multiply(0.6),
+            selected: c.accent.0.gamma_multiply(0.30),
+            empty: c.border.0.gamma_multiply(0.25),
         }
     }
 }
@@ -104,6 +138,28 @@ pub fn status_color(status: FileStatus, colors: &DiffColors) -> Color32 {
     }
 }
 
+fn split_id() -> egui::Id {
+    egui::Id::unique("diff_split_view")
+}
+
+/// Whether diffs are shown side by side (shared by every diff view).
+pub fn is_split(ctx: &egui::Context) -> bool {
+    ctx.data_mut(|d| *d.get_persisted_mut_or_default::<bool>(split_id()))
+}
+
+/// Unified / Split switch for a diff view's toolbar.
+pub fn layout_toggle(ui: &mut Ui) {
+    let mut split = is_split(ui.ctx());
+    let before = split;
+    ui.selectable_value(&mut split, true, "Split")
+        .on_hover_text("Show old and new side by side");
+    ui.selectable_value(&mut split, false, "Unified")
+        .on_hover_text("Show removed and added lines interleaved");
+    if split != before {
+        ui.ctx().data_mut(|d| d.insert_persisted(split_id(), split));
+    }
+}
+
 /// Files with more changed lines than this start collapsed.
 const LARGE_FILE_LINES: usize = 1500;
 
@@ -122,6 +178,7 @@ pub fn show(
         ui.label(RichText::new("No changes.").weak());
         return;
     }
+    let split = is_split(ui.ctx());
     for (idx, file) in files.iter().enumerate() {
         let id = id_salt.with(("file", idx, file.path()));
         let lines: usize = file.hunks.iter().map(|h| h.lines.len()).sum();
@@ -138,7 +195,7 @@ pub fn show(
                 ui.set_min_width(ui.available_width());
                 state
                     .show_header(ui, |ui| file_header(ui, idx, file, colors, hooks))
-                    .body(|ui| file_body(ui, idx, file, colors, hooks))
+                    .body(|ui| file_body(ui, id, idx, file, colors, hooks, split))
             });
         if scroll_to == Some(idx) {
             header.response.scroll_to_me(Some(egui::Align::TOP));
@@ -181,12 +238,48 @@ fn file_header(
     });
 }
 
+type Styles = Arc<Vec<Vec<LineStyle>>>;
+
+/// Syntax and word styles for `file`, cached until its content or the
+/// theme changes.
+fn file_styles(ctx: &egui::Context, id: egui::Id, file: &FileDiff) -> Styles {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    diff_style::generation().hash(&mut h);
+    file.path().hash(&mut h);
+    for hunk in &file.hunks {
+        hunk.header.hash(&mut h);
+        for l in &hunk.lines {
+            l.text.hash(&mut h);
+        }
+    }
+    let key = h.finish();
+    let cache_id = id.with("styles");
+    if let Some((k, styles)) = ctx.data(|d| d.get_temp::<(u64, Styles)>(cache_id))
+        && k == key
+    {
+        return styles;
+    }
+    let styles = Arc::new(diff_style::style_file(file));
+    ctx.data_mut(|d| d.insert_temp(cache_id, (key, styles.clone())));
+    styles
+}
+
+struct Geometry {
+    num_w: f32,
+    row_h: f32,
+    char_w: f32,
+    font: FontId,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn file_body(
     ui: &mut Ui,
+    id: egui::Id,
     idx: usize,
     file: &FileDiff,
     colors: &DiffColors,
     hooks: &mut dyn DiffHooks,
+    split: bool,
 ) {
     hooks.file_preamble(ui, file);
     if file.binary {
@@ -201,6 +294,7 @@ fn file_body(
         ui.label(RichText::new(msg).weak());
         return;
     }
+    let styles = file_styles(ui.ctx(), id, file);
     let font = TextStyle::Monospace.resolve(ui.style());
     let char_w = ui.fonts_mut(|f| f.glyph_width(&font, '0'));
     let row_h = ui.fonts_mut(|f| f.row_height(&font)) + 3.0;
@@ -211,7 +305,12 @@ fn file_body(
         .max()
         .unwrap_or(1);
     let digits = max_no.max(1).ilog10() as f32 + 1.0;
-    let num_w = digits.max(3.0) * char_w + 10.0;
+    let g = Geometry {
+        num_w: digits.max(3.0) * char_w + 10.0,
+        row_h,
+        char_w,
+        font,
+    };
     let longest = file
         .hunks
         .iter()
@@ -219,19 +318,25 @@ fn file_body(
         .map(|l| display_len(&l.text))
         .max()
         .unwrap_or(0);
-    let content_w = num_w * 2.0 + 18.0 + longest as f32 * char_w + 16.0;
 
     ui.spacing_mut().item_spacing.y = 0.0;
     for (h_idx, hunk) in file.hunks.iter().enumerate() {
         hunk_header(ui, idx, h_idx, file, hunk, colors, hooks, row_h);
-        for line in &hunk.lines {
-            let geometry = RowGeometry {
-                num_w,
-                row_h,
-                width: content_w.max(ui.available_width()),
-            };
-            diff_row(ui, file, line, &geometry, &font, colors, hooks);
-            hooks.after_line(ui, file, line);
+        let st = &styles[h_idx];
+        if split {
+            split_rows(ui, idx, h_idx, file, hunk, st, &g, colors, hooks);
+        } else {
+            let width =
+                (g.num_w * 2.0 + 18.0 + longest as f32 * char_w + 16.0).max(ui.available_width());
+            for (i, line) in hunk.lines.iter().enumerate() {
+                let at = LineRef {
+                    file: idx,
+                    hunk: h_idx,
+                    line: i,
+                };
+                unified_row(ui, at, file, line, &st[i], width, &g, colors, hooks);
+                hooks.after_line(ui, file, line);
+            }
         }
     }
 }
@@ -275,55 +380,104 @@ fn hunk_header(
         });
 }
 
-struct RowGeometry {
-    num_w: f32,
-    row_h: f32,
-    width: f32,
+/// Background, sign, sign color and word-emphasis color for a line kind.
+fn kind_colors(kind: LineKind, colors: &DiffColors) -> (Color32, &'static str, Color32, Color32) {
+    match kind {
+        LineKind::Added => (colors.added_bg, "+", colors.added_fg, colors.added_emph),
+        LineKind::Removed => (
+            colors.removed_bg,
+            "−",
+            colors.removed_fg,
+            colors.removed_emph,
+        ),
+        LineKind::Context => (
+            Color32::TRANSPARENT,
+            " ",
+            colors.muted,
+            Color32::TRANSPARENT,
+        ),
+    }
 }
 
-fn diff_row(
-    ui: &mut Ui,
+/// Selection highlight, hover marker and clicks for one line's area.
+#[allow(clippy::too_many_arguments)]
+fn row_interaction(
+    ui: &Ui,
+    painter: &Painter,
+    response: &egui::Response,
+    area: Rect,
+    at: LineRef,
     file: &FileDiff,
     line: &DiffLine,
-    g: &RowGeometry,
-    font: &FontId,
+    gutter_x: f32,
     colors: &DiffColors,
     hooks: &mut dyn DiffHooks,
 ) {
-    let clickable = hooks.lines_clickable() && line_anchor(line).is_some();
-    let sense = if clickable {
-        Sense::click()
-    } else {
-        Sense::hover()
-    };
-    let (rect, response) = ui.allocate_exact_size(vec2(g.width, g.row_h), sense);
+    if hooks.is_selected(at) {
+        painter.rect_filled(area, 0, colors.selected);
+    }
+    if !hooks.can_click(line) {
+        return;
+    }
+    let hovered = response.hovered() && ui.rect_contains_pointer(area);
+    if hovered {
+        painter.rect_filled(area, 0, colors.hover);
+        // "+" marker in the gutter, as on GitHub.
+        let c = pos2(gutter_x, area.center().y);
+        let r = Rect::from_center_size(c, vec2(14.0, 14.0));
+        painter.rect_filled(r, 3, colors.added_fg.gamma_multiply(0.9));
+        painter.text(
+            c,
+            Align2::CENTER_CENTER,
+            "+",
+            FontId::monospace(11.0),
+            Color32::BLACK,
+        );
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    if hovered && response.clicked() {
+        let shift = ui.input(|i| i.modifiers.shift);
+        hooks.line_clicked(at, file, line, shift);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn unified_row(
+    ui: &mut Ui,
+    at: LineRef,
+    file: &FileDiff,
+    line: &DiffLine,
+    style: &LineStyle,
+    width: f32,
+    g: &Geometry,
+    colors: &DiffColors,
+    hooks: &mut dyn DiffHooks,
+) {
+    let (rect, response) = ui.allocate_exact_size(vec2(width, g.row_h), Sense::click());
     if !ui.is_rect_visible(rect) {
         return;
     }
-    let painter = ui.painter();
-    let (bg, sign, sign_color) = match line.kind {
-        LineKind::Added => (colors.added_bg, "+", colors.added_fg),
-        LineKind::Removed => (colors.removed_bg, "−", colors.removed_fg),
-        LineKind::Context => (Color32::TRANSPARENT, " ", colors.muted),
-    };
+    let painter = ui.painter().clone();
+    let (bg, sign, sign_color, emph) = kind_colors(line.kind, colors);
     painter.rect_filled(rect, 0, bg);
-    if clickable && response.hovered() {
-        painter.rect_filled(rect, 0, colors.hover);
-    }
+    let gutter_x = rect.left() + g.num_w * 2.0 - 2.0;
+    row_interaction(
+        ui, &painter, &response, rect, at, file, line, gutter_x, colors, hooks,
+    );
     let y = rect.top() + 1.5;
     let num = |n: Option<u32>| n.map(|n| n.to_string()).unwrap_or_default();
     painter.text(
         pos2(rect.left() + g.num_w - 6.0, y),
         Align2::RIGHT_TOP,
         num(line.old_no),
-        font.clone(),
+        g.font.clone(),
         colors.muted,
     );
     painter.text(
         pos2(rect.left() + g.num_w * 2.0 - 6.0, y),
         Align2::RIGHT_TOP,
         num(line.new_no),
-        font.clone(),
+        g.font.clone(),
         colors.muted,
     );
     let text_x = rect.left() + g.num_w * 2.0 + 4.0;
@@ -331,15 +485,17 @@ fn diff_row(
         pos2(text_x, y),
         Align2::LEFT_TOP,
         sign,
-        font.clone(),
+        g.font.clone(),
         sign_color,
     );
-    painter.text(
+    paint_code(
+        &painter,
         pos2(text_x + 14.0, y),
-        Align2::LEFT_TOP,
-        display_text(&line.text),
-        font.clone(),
+        &line.text,
+        style,
+        &g.font,
         colors.text,
+        emph,
     );
     if line.no_newline {
         painter.text(
@@ -350,31 +506,170 @@ fn diff_row(
             colors.muted,
         );
     }
-    if clickable {
-        if response.hovered() {
-            // "+" marker in the gutter, as on GitHub.
-            let c = pos2(rect.left() + g.num_w * 2.0 - 2.0, rect.center().y);
-            let r = Rect::from_center_size(c, vec2(14.0, 14.0));
-            painter.rect_filled(r, 3, colors.added_fg.gamma_multiply(0.9));
-            painter.text(
-                c,
-                Align2::CENTER_CENTER,
-                "+",
-                FontId::monospace(11.0),
-                Color32::BLACK,
-            );
+    if hooks.can_click(line) {
+        response.on_hover_text(hooks.click_hint());
+    }
+}
+
+/// Side-by-side rows: context on both sides, removed lines on the left
+/// paired with the added lines that replace them on the right.
+#[allow(clippy::too_many_arguments)]
+fn split_rows(
+    ui: &mut Ui,
+    file_idx: usize,
+    hunk_idx: usize,
+    file: &FileDiff,
+    hunk: &Hunk,
+    styles: &[LineStyle],
+    g: &Geometry,
+    colors: &DiffColors,
+    hooks: &mut dyn DiffHooks,
+) {
+    let kinds: Vec<LineKind> = hunk.lines.iter().map(|l| l.kind).collect();
+    let runs = diff_style::change_runs(&kinds);
+    let mut pairs: Vec<(Option<usize>, Option<usize>)> = Vec::new();
+    let mut run_iter = runs.iter();
+    let mut i = 0;
+    while i < kinds.len() {
+        if kinds[i] == LineKind::Context {
+            pairs.push((Some(i), Some(i)));
+            i += 1;
+            continue;
         }
-        let response = response
-            .on_hover_cursor(CursorIcon::PointingHand)
-            .on_hover_text("Comment on this line");
-        if response.clicked() {
-            hooks.line_clicked(file, line);
+        let Some((removed, added)) = run_iter.next() else {
+            break;
+        };
+        for k in 0..removed.len().max(added.len()) {
+            pairs.push((removed.get(k).copied(), added.get(k).copied()));
+        }
+        i += removed.len() + added.len();
+    }
+
+    let width = ui.available_width();
+    let half = (width / 2.0).floor();
+    for (left, right) in pairs {
+        let (rect, response) = ui.allocate_exact_size(vec2(width, g.row_h), Sense::click());
+        if ui.is_rect_visible(rect) {
+            let painter = ui.painter().clone();
+            let halves = [
+                (
+                    Rect::from_min_size(rect.min, vec2(half, rect.height())),
+                    left,
+                    true,
+                ),
+                (
+                    Rect::from_min_max(pos2(rect.left() + half, rect.top()), rect.max),
+                    right,
+                    false,
+                ),
+            ];
+            for (area, idx, is_left) in halves {
+                let p = painter.with_clip_rect(area.intersect(ui.clip_rect()));
+                let Some(i) = idx else {
+                    p.rect_filled(area, 0, colors.empty);
+                    continue;
+                };
+                let line = &hunk.lines[i];
+                let (bg, sign, sign_color, emph) = kind_colors(line.kind, colors);
+                p.rect_filled(area, 0, bg);
+                let at = LineRef {
+                    file: file_idx,
+                    hunk: hunk_idx,
+                    line: i,
+                };
+                let gutter_x = area.left() + g.num_w - 2.0;
+                row_interaction(
+                    ui, &p, &response, area, at, file, line, gutter_x, colors, hooks,
+                );
+                let y = area.top() + 1.5;
+                let no = if is_left { line.old_no } else { line.new_no };
+                p.text(
+                    pos2(area.left() + g.num_w - 6.0, y),
+                    Align2::RIGHT_TOP,
+                    no.map(|n| n.to_string()).unwrap_or_default(),
+                    g.font.clone(),
+                    colors.muted,
+                );
+                let text_x = area.left() + g.num_w + 4.0;
+                p.text(
+                    pos2(text_x, y),
+                    Align2::LEFT_TOP,
+                    sign,
+                    g.font.clone(),
+                    sign_color,
+                );
+                paint_code(
+                    &p,
+                    pos2(text_x + g.char_w + 6.0, y),
+                    &line.text,
+                    &styles[i],
+                    &g.font,
+                    colors.text,
+                    emph,
+                );
+            }
+            painter.vline(
+                rect.left() + half,
+                rect.y_range(),
+                egui::Stroke::new(1.0, colors.empty.gamma_multiply(2.0)),
+            );
+            let clickable = [left, right]
+                .into_iter()
+                .flatten()
+                .any(|i| hooks.can_click(&hunk.lines[i]));
+            if clickable {
+                response.on_hover_text(hooks.click_hint());
+            }
+        }
+        // Threads under the row: the removed line's, then the right side's.
+        if let Some(l) = left
+            && hunk.lines[l].kind == LineKind::Removed
+        {
+            hooks.after_line(ui, file, &hunk.lines[l]);
+        }
+        if let Some(r) = right {
+            hooks.after_line(ui, file, &hunk.lines[r]);
         }
     }
 }
 
-fn display_text(text: &str) -> String {
-    text.trim_end_matches('\r').replace('\t', "    ")
+/// Paints one line of code with syntax colors and word emphasis.
+fn paint_code(
+    painter: &Painter,
+    pos: Pos2,
+    text: &str,
+    style: &LineStyle,
+    font: &FontId,
+    default: Color32,
+    emph_bg: Color32,
+) {
+    let text = text.trim_end_matches('\r');
+    let mut cuts: Vec<usize> = vec![0, text.len()];
+    for (r, _) in &style.spans {
+        cuts.extend([r.start, r.end]);
+    }
+    for r in &style.emph {
+        cuts.extend([r.start, r.end]);
+    }
+    cuts.retain(|&c| c <= text.len() && text.is_char_boundary(c));
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut job = LayoutJob::default();
+    for w in cuts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let color = style
+            .spans
+            .iter()
+            .find(|(r, _)| r.start <= a && a < r.end)
+            .map_or(default, |(_, c)| *c);
+        let mut format = TextFormat::simple(font.clone(), color);
+        if style.emph.iter().any(|r| r.start <= a && a < r.end) {
+            format.background = emph_bg;
+        }
+        job.append(&text[a..b].replace('\t', "    "), 0.0, format);
+    }
+    let galley = painter.layout_job(job);
+    painter.galley(pos, galley, default);
 }
 
 fn display_len(text: &str) -> usize {

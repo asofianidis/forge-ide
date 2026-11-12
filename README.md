@@ -27,13 +27,25 @@ The **Source Control** view (Cmd/Ctrl+Shift+G) drives the `git` command line, so
 your existing config, hooks, credentials and SSH keys:
 
 - Staged, unstaged and merge-conflict files; click one to open its diff as a tab
-- Stage, unstage or discard whole files, or **individual hunks** from the diff view
+- Diffs with syntax highlighting, word-level highlights of what changed, and a **Unified / Split**
+  (side-by-side) toggle
+- Stage, unstage or discard whole files, **individual hunks**, or **selected lines** (click changed
+  lines in a diff, Shift+click for a range)
 - Commit (Cmd/Ctrl+Enter), Commit All when nothing is staged, Commit & Push, amend, undo last commit
 - Branch picker: switch, create, track remote branches; merge and delete from the Branches list
 - Push / pull / fetch / sync with ahead-behind counts; publish new branches; force push with lease
 - Stashes (stash, apply, pop, drop), commit history with full commit diffs
-- Conflict resolution: accept ours/theirs, mark resolved, abort merge
+- Merge conflicts: conflicted files open with the current and incoming blocks highlighted and
+  **Accept Current / Incoming / Both** actions on each conflict (or for the whole file), then
+  **Save & Mark Resolved**; also accept ours/theirs for a whole file and abort merge
 - Explorer colors and editor gutter markers for added, modified and deleted lines
+
+In the editor:
+
+- **Click a gutter marker** to peek at the change: see the lines it replaced, **Revert** it in the
+  buffer or **Stage** just that change. Alt+F5 / Shift+Alt+F5 jump to the next / previous change.
+- **Blame** (View → Blame, Cmd/Ctrl+Alt+B) shows who last changed each line and when, including
+  unsaved edits. Hover for the commit message; click to open the commit.
 
 The current branch and its pull request are also shown at the left of the status bar.
 
@@ -129,6 +141,8 @@ cargo run --release -- path/to/project
 | Explorer   | Ctrl+Shift+E |
 | Source Control | Ctrl+Shift+G |
 | Pull Requests  | Ctrl+Shift+P |
+| Toggle blame   | Ctrl+Alt+B |
+| Next / previous change | Alt+F5 / Shift+Alt+F5 |
 
 (Cmd instead of Ctrl on macOS.)
 
@@ -149,7 +163,8 @@ src/
 │   ├── mod.rs           # repository state and operations
 │   ├── status.rs        # `git status --porcelain=v2` parser
 │   ├── diff.rs          # unified diff parser, single-hunk patches
-│   ├── line_changes.rs  # gutter change markers
+│   ├── line_changes.rs  # gutter change markers and change hunks
+│   ├── blame.rs         # `git blame --porcelain` parser
 │   └── panel.rs         # Source Control sidebar
 ├── github/
 │   ├── mod.rs           # gh connection, PR list, creating PRs
@@ -158,7 +173,8 @@ src/
 │   └── pr.rs            # pull request tab
 ├── ui/
 │   ├── activity.rs      # activity bar
-│   ├── diff_view.rs     # diff rendering
+│   ├── diff_view.rs     # diff rendering (unified / split, line selection)
+│   ├── diff_style.rs    # diff syntax highlighting and word-level changes
 │   ├── markdown.rs      # Markdown for PR bodies and comments
 │   ├── icons.rs         # vector icons
 │   └── fmt.rs           # relative times
@@ -169,8 +185,10 @@ src/
 │   └── browser.rs       # "Language Servers" window
 └── editor/
     ├── document.rs      # open file buffer, load/save, dirty tracking
-    ├── gutter.rs        # line-number gutter
-    └── highlight.rs     # syntect → egui LayoutJob highlighting
+    ├── gutter.rs        # line-number gutter and change markers
+    ├── highlight.rs     # syntect → egui LayoutJob highlighting
+    ├── scm.rs           # change peek, blame column, conflict actions
+    └── conflicts.rs     # merge conflict parsing and resolution
 ```
 
 ## Roadmap
