@@ -1264,6 +1264,18 @@ impl ForgeApp {
 
         let mut peek_anchor = None;
         let editor_rect = ui.available_rect_before_wrap();
+        // The editor fills the whole central panel, so draw it without the default
+        // `TextEdit` frame: that frame outlines the widget on hover and, since the
+        // editor keeps focus, permanently in the selection stroke color.
+        let frame = egui::Frame::NONE
+            .fill(ui.visuals().text_edit_bg_color())
+            .inner_margin(egui::Margin {
+                left: gutter_width as i8,
+                right: 4,
+                top: 2,
+                bottom: 2,
+            });
+
         let output = egui::ScrollArea::both()
             .id_salt("editor_scroll")
             .auto_shrink(false)
@@ -1283,12 +1295,7 @@ impl ForgeApp {
                         .lock_focus(true)
                         .desired_width(f32::INFINITY)
                         .desired_rows(40)
-                        .margin(egui::Margin {
-                            left: gutter_width as i8,
-                            right: 4,
-                            top: 2,
-                            bottom: 2,
-                        })
+                        .frame(frame)
                         .layouter(&mut layouter)
                         .show(ui);
                     gutter::paint(
