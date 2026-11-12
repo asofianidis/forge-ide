@@ -23,6 +23,9 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
 - Quick open (fuzzy file search) and a command palette that reaches every menu action
 - Line editing: go to line, toggle comment, indent/outdent a selection (Tab / Shift+Tab
   work on multi-line selections), duplicate and move lines, matching-bracket highlighting
+- Typing aids: Enter keeps the line's indentation (one level deeper after an opening bracket, or
+  `:` in Python/YAML); brackets and quotes auto-close, wrap a selection, and step over their
+  closer; Backspace in an empty pair deletes both halves
 - Native open/save dialogs (via [rfd](https://github.com/PolyMeilex/rfd))
 - Language server browser (**Tools → Language Servers…**): finds servers for the
   languages in your project, shows which are installed, and installs missing ones
@@ -241,7 +244,7 @@ src/
 └── editor/
     ├── document.rs      # open file buffer, load/save, dirty tracking
     ├── find.rs          # in-file find / replace
-    ├── ops.rs           # comment, indent, duplicate/move lines, bracket matching
+    ├── ops.rs           # comment, indent, move lines, auto-indent/pairs, brackets
     ├── gutter.rs        # line-number gutter and change markers
     ├── highlight.rs     # syntect → egui LayoutJob highlighting
     ├── scm.rs           # change peek, blame column, conflict actions
