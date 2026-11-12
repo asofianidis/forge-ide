@@ -1687,6 +1687,7 @@ dependencies = [
  "trash",
  "url",
  "vt100",
+ "zip",
 ]
 
 [[package]]

@@ -27,6 +27,8 @@ pub enum Icon {
     Merge,
     History,
     Search,
+    Extensions,
+    Play,
 }
 
 /// Paints `icon` inside `rect` using `color`.
@@ -213,6 +215,28 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             poly(arc(c, 0.32, -2.6, 3.0));
             poly(vec![p(0.5, 0.32), p(0.5, 0.54), p(0.64, 0.62)]);
             poly(vec![p(0.10, 0.30), p(0.22, 0.38), p(0.30, 0.24)]);
+        }
+        Icon::Extensions => {
+            // Three blocks with a fourth lifted off the corner.
+            let block = |x: f32, y: f32| {
+                painter.rect_stroke(
+                    Rect::from_min_max(p(x, y), p(x + 0.28, y + 0.28)),
+                    1.0,
+                    stroke,
+                    egui::StrokeKind::Middle,
+                );
+            };
+            block(0.16, 0.56);
+            block(0.44, 0.56);
+            block(0.16, 0.28);
+            block(0.56, 0.16);
+        }
+        Icon::Play => {
+            painter.add(PathShape::convex_polygon(
+                vec![p(0.30, 0.20), p(0.80, 0.50), p(0.30, 0.80)],
+                Color32::TRANSPARENT,
+                PathStroke::new(w, color),
+            ));
         }
         Icon::External => {
             poly(vec![

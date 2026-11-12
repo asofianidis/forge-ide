@@ -37,6 +37,9 @@ pub struct Settings {
     /// Defaults to PowerShell on Windows and `$SHELL` elsewhere.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_shell: Option<String>,
+    /// Ids of installed extensions that are switched off.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub disabled_extensions: Vec<String>,
     /// Recently opened folders, most recent first.
     pub recent_folders: Vec<PathBuf>,
     /// Open tabs per folder, most recently used first.
@@ -71,6 +74,7 @@ impl Default for Settings {
             word_wrap: false,
             line_numbers: true,
             terminal_shell: None,
+            disabled_extensions: Vec::new(),
             recent_folders: Vec::new(),
             sessions: Vec::new(),
         }

@@ -6,7 +6,8 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
 
 ## Features
 
-- Activity bar with four sidebar views: **Explorer**, **Search**, **Source Control** and **Pull Requests**
+- Activity bar with five sidebar views: **Explorer**, **Search**, **Source Control**, **Pull Requests**
+  and **Extensions**
 - File explorer with lazily-loaded directory tree, colored by git status. Right-click to create
   files and folders (`a/b/c.rs` creates the folders in between), rename, delete (to the trash),
   reveal in Finder / File Explorer, or copy the path
@@ -49,6 +50,8 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
 - Themes: built-in **Blossom** (default) and **Blossom Light**, plus custom TOML themes
 - Settings window (Ctrl+,): color theme, font size, word wrap, line numbers, format on save,
   update checks. Changes apply and save immediately; the file can also be edited as TOML
+- Extensions installed from `.zip` files: commands that run any program with the open file or
+  selection (palette, shortcuts, on save) and color themes (see below)
 - Automatic updates from GitHub releases
 
 ## Language servers
@@ -229,6 +232,26 @@ the mouse wheel. Ctrl+C reaches the shell. When the shell exits the panel shows 
 press Enter, click the restart button or run **Terminal: Restart Shell** to start a new one.
 Ctrl+\` while the terminal has focus hides it (the shell keeps running).
 
+## Extensions
+
+The **Extensions** view (Cmd/Ctrl+Shift+X) lists installed extensions. Install one with **+**
+(or **Tools → Extensions → Install Extension from ZIP…**, or by dropping a `.zip` onto the
+window); Forge shows what it adds and which programs it runs before installing. Each extension
+can be disabled, uninstalled or shown in detail, and its commands run from the view, the command
+palette, **Tools → Extensions**, or their own shortcuts.
+
+An extension is a folder with an `extension.toml` manifest. It can add:
+
+- **Commands** that run a program (any language) with the file, selection or document and put
+  the output in the status bar, an output tab, the selection, or the whole document. Commands can
+  ask for input, apply only to some file types, and run automatically on save.
+- **Color themes**.
+
+Extensions live in `extensions/` in the config folder (or `$FORGE_EXTENSIONS_DIR`). See
+[`docs/extensions.md`](docs/extensions.md) to write one (also under **Tools → Extensions →
+Extension Authoring Guide**), and [`examples/extensions/text-tools`](examples/extensions/text-tools)
+for a complete example.
+
 ## Getting started
 
 Requires a recent stable Rust toolchain (edition 2024).
@@ -259,6 +282,7 @@ cargo run --release -- path/to/project
 | Show explorer          | Ctrl+Shift+E                            |
 | Source control         | Ctrl+Shift+G                            |
 | Pull requests          | Ctrl+Shift+R                            |
+| Extensions             | Ctrl+Shift+X                            |
 | Toggle blame           | Ctrl+Alt+B                              |
 | Next / previous change | Alt+F5 / Shift+Alt+F5                   |
 | Toggle line comment    | Ctrl+/                                  |
@@ -292,6 +316,7 @@ src/
 │   ├── language.rs      # diagnostics, hover, completion, definition, rename, formatting UI
 │   ├── find_bar.rs      # find / replace bar
 │   ├── search_panel.rs  # "Search" sidebar
+│   ├── extension_ui.rs  # Extensions view, running extension commands, install dialog
 │   ├── preferences.rs   # Settings window, font size / word wrap / line numbers
 │   ├── pickers.rs       # quick open, command palette, theme picker
 │   └── terminal_panel.rs # terminal panel: show / hide, restart
@@ -309,6 +334,12 @@ src/
 ├── updater.rs           # self-update from GitHub releases
 ├── watcher.rs           # file watching (notify), batching events for the UI
 ├── workspace.rs         # file tree / project explorer, file operations, file-type scan
+├── extensions/
+│   ├── mod.rs           # loading installed extensions, command lookup, shortcuts
+│   ├── manifest.rs      # extension.toml format, variables, keybinding parsing
+│   ├── install.rs       # installing from .zip, uninstalling
+│   ├── run.rs           # running a command as a process with a time limit
+│   └── panel.rs         # Extensions sidebar
 ├── git/
 │   ├── mod.rs           # repository state and operations
 │   ├── status.rs        # `git status --porcelain=v2` parser
@@ -363,6 +394,7 @@ src/
 - [x] Themes
 - [x] Git source control and GitHub pull requests
 - [x] Settings UI
+- [x] Extensions (commands and themes, installed from .zip)
 
 ## License
 

@@ -207,7 +207,7 @@ impl ForgeApp {
 
     /// Applies `edits` to a document, keeping its caret and selection on the
     /// same text.
-    fn edit_document(&mut self, ctx: &egui::Context, idx: usize, edits: &[CharEdit]) {
+    pub(super) fn edit_document(&mut self, ctx: &egui::Context, idx: usize, edits: &[CharEdit]) {
         let Some(doc) = self.documents.get_mut(idx) else {
             return;
         };

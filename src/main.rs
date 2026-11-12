@@ -4,6 +4,7 @@ mod app;
 mod cli;
 mod commands;
 mod editor;
+mod extensions;
 mod fuzzy;
 mod git;
 mod github;

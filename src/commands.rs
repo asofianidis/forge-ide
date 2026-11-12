@@ -44,6 +44,7 @@ pub enum Command {
     ShowExplorer,
     ShowSourceControl,
     ShowPullRequests,
+    ShowExtensions,
     ShowProblems,
     ToggleBlame,
     NextChange,
@@ -61,6 +62,10 @@ pub enum Command {
     LanguageServers,
     RestartLanguageServers,
     ToggleFormatOnSave,
+    InstallExtension,
+    ReloadExtensions,
+    OpenExtensionsFolder,
+    ExtensionGuide,
     ToggleTerminal,
     RestartTerminal,
     CheckForUpdates,
@@ -125,6 +130,7 @@ impl Command {
         Command::ShowExplorer,
         Command::ShowSourceControl,
         Command::ShowPullRequests,
+        Command::ShowExtensions,
         Command::ShowProblems,
         Command::ToggleBlame,
         Command::NextChange,
@@ -142,6 +148,10 @@ impl Command {
         Command::LanguageServers,
         Command::RestartLanguageServers,
         Command::ToggleFormatOnSave,
+        Command::InstallExtension,
+        Command::ReloadExtensions,
+        Command::OpenExtensionsFolder,
+        Command::ExtensionGuide,
         Command::ToggleTerminal,
         Command::RestartTerminal,
         Command::CheckForUpdates,
@@ -187,6 +197,7 @@ impl Command {
             Command::ShowExplorer => "Explorer",
             Command::ShowSourceControl => "Source Control",
             Command::ShowPullRequests => "Pull Requests",
+            Command::ShowExtensions => "Extensions",
             Command::ShowProblems => "Problems…",
             Command::ToggleBlame => "Toggle Blame",
             Command::NextChange => "Next Change",
@@ -204,6 +215,10 @@ impl Command {
             Command::LanguageServers => "Language Servers…",
             Command::RestartLanguageServers => "Restart Language Servers",
             Command::ToggleFormatOnSave => "Format on Save",
+            Command::InstallExtension => "Install Extension from ZIP…",
+            Command::ReloadExtensions => "Reload Extensions",
+            Command::OpenExtensionsFolder => "Open Extensions Folder",
+            Command::ExtensionGuide => "Extension Authoring Guide",
             Command::ToggleTerminal => "Toggle Terminal",
             Command::RestartTerminal => "Restart Shell",
             Command::CheckForUpdates => "Check for Updates",
@@ -222,10 +237,13 @@ impl Command {
             QuickOpen | GoToLine | NextTab | PreviousTab | GoToDefinition | FindReferences
             | NextProblem | PreviousProblem | NextChange | PreviousChange => "Go",
             ShowCommandPalette | ShowExplorer | ShowSourceControl | ShowPullRequests
-            | ShowProblems | ToggleBlame | FileHistory | RepositoryHistory | ToggleWordWrap
-            | ToggleLineNumbers | IncreaseFontSize | DecreaseFontSize | ResetFontSize
-            | SelectTheme | ReloadThemes | OpenThemesFolder => "View",
+            | ShowExtensions | ShowProblems | ToggleBlame | FileHistory | RepositoryHistory
+            | ToggleWordWrap | ToggleLineNumbers | IncreaseFontSize | DecreaseFontSize
+            | ResetFontSize | SelectTheme | ReloadThemes | OpenThemesFolder => "View",
             LanguageServers | RestartLanguageServers | ToggleFormatOnSave => "Tools",
+            InstallExtension | ReloadExtensions | OpenExtensionsFolder | ExtensionGuide => {
+                "Extensions"
+            }
             ToggleTerminal | RestartTerminal => "Terminal",
             CheckForUpdates => "Help",
         }
@@ -290,6 +308,7 @@ impl Command {
             Command::ShowSourceControl => &const { one(shortcut(CMD_SHIFT, Key::G)) },
             // Cmd+Shift+P is the command palette, as in other editors.
             Command::ShowPullRequests => &const { one(shortcut(CMD_SHIFT, Key::R)) },
+            Command::ShowExtensions => &const { one(shortcut(CMD_SHIFT, Key::X)) },
             Command::ToggleBlame => &const { one(shortcut(CMD_ALT, Key::B)) },
             Command::NextChange => &const { one(shortcut(ALT, Key::F5)) },
             // Ctrl+Space on every platform, as in other editors.
