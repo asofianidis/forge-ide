@@ -343,6 +343,138 @@ pub struct RepoInfo {
     pub default_branch_ref: DefaultBranch,
 }
 
+/// Someone who could be asked to review: a repository contributor and/or a
+/// user GitHub lists as assignable (has access to the repository).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Person {
+    pub login: String,
+    pub name: String,
+    /// Commits to the default branch (0 if not a contributor).
+    pub contributions: u64,
+    /// Has access to the repository, so a review request will succeed.
+    pub has_access: bool,
+}
+
+impl Person {
+    /// Secondary text for the picker: real name and why they're listed.
+    pub fn detail(&self) -> String {
+        let why = match (self.contributions, self.has_access) {
+            (0, _) => "has access".to_owned(),
+            (1, _) => "1 commit".to_owned(),
+            (n, _) => format!("{n} commits"),
+        };
+        if self.name.is_empty() {
+            why
+        } else {
+            format!("{} · {why}", self.name)
+        }
+    }
+}
+
+/// A row of `GET repos/{owner}/{repo}/contributors`.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Contributor {
+    pub login: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub contributions: u64,
+}
+
+/// GraphQL query for users who can be requested as reviewers.
+pub const ASSIGNABLE_QUERY: &str = "query($owner:String!,$repo:String!){repository(owner:$owner,\
+name:$repo){assignableUsers(first:100){nodes{login name}}}}";
+
+/// Extracts `(login, name)` pairs from the [`ASSIGNABLE_QUERY`] response.
+pub fn parse_assignable(json: &str) -> Vec<(String, String)> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    v.pointer("/data/repository/assignableUsers/nodes")
+        .and_then(|n| n.as_array())
+        .map(|nodes| {
+            nodes
+                .iter()
+                .filter_map(|n| {
+                    let login = n.get("login")?.as_str()?.to_owned();
+                    let name = n
+                        .get("name")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    Some((login, name))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Merges assignable users and contributors (bots dropped), most active
+/// contributors first.
+pub fn merge_people(
+    assignable: Vec<(String, String)>,
+    contributors: Vec<Contributor>,
+) -> Vec<Person> {
+    let mut people: Vec<Person> = assignable
+        .into_iter()
+        .map(|(login, name)| Person {
+            login,
+            name,
+            contributions: 0,
+            has_access: true,
+        })
+        .collect();
+    for c in contributors {
+        if c.kind == "Bot" || c.login.is_empty() {
+            continue;
+        }
+        match people
+            .iter_mut()
+            .find(|p| p.login.eq_ignore_ascii_case(&c.login))
+        {
+            Some(p) => p.contributions = c.contributions,
+            None => people.push(Person {
+                login: c.login,
+                name: String::new(),
+                contributions: c.contributions,
+                has_access: false,
+            }),
+        }
+    }
+    people.sort_by(|a, b| {
+        b.contributions
+            .cmp(&a.contributions)
+            .then_with(|| a.login.to_lowercase().cmp(&b.login.to_lowercase()))
+    });
+    people
+}
+
+/// People matching `query` (login or name, case-insensitive), skipping
+/// `exclude`d logins. Login prefix matches rank first.
+pub fn search_people<'a>(people: &'a [Person], query: &str, exclude: &[&str]) -> Vec<&'a Person> {
+    let q = query.trim().trim_start_matches('@').to_lowercase();
+    let mut hits: Vec<(u8, &Person)> = people
+        .iter()
+        .filter(|p| !exclude.iter().any(|e| e.eq_ignore_ascii_case(&p.login)))
+        .filter_map(|p| {
+            let login = p.login.to_lowercase();
+            let rank = if q.is_empty() || login.starts_with(&q) {
+                0
+            } else if login.contains(&q) {
+                1
+            } else if p.name.to_lowercase().contains(&q) {
+                2
+            } else {
+                return None;
+            };
+            Some((rank, p))
+        })
+        .collect();
+    // Stable sort keeps the contribution order within a rank.
+    hits.sort_by_key(|(rank, _)| *rank);
+    hits.into_iter().map(|(_, p)| p).collect()
+}
+
 /// Parses one or more concatenated JSON arrays (`gh api --paginate`
 /// prints one array per page) into a single list.
 pub fn parse_paginated<T: for<'de> Deserialize<'de>>(text: &str) -> Result<Vec<T>, String> {
@@ -379,6 +511,47 @@ mod tests {
         assert_eq!(rollup(c), Some(CheckOutcome::Fail));
         assert_eq!(pr.review_requests[1].display(), "core");
         assert_eq!(pr.files[0].additions, 13);
+    }
+
+    #[test]
+    fn merges_and_searches_people() {
+        let assignable = parse_assignable(
+            r#"{"data":{"repository":{"assignableUsers":{"nodes":[
+                {"login":"asofianidis","name":"Alex"},{"login":"MUDesigns","name":null}]}}}}"#,
+        );
+        let contributors = vec![
+            Contributor {
+                login: "asofianidis".into(),
+                kind: "User".into(),
+                contributions: 15,
+            },
+            Contributor {
+                login: "dependabot[bot]".into(),
+                kind: "Bot".into(),
+                contributions: 9,
+            },
+            Contributor {
+                login: "drive-by".into(),
+                kind: "User".into(),
+                contributions: 2,
+            },
+        ];
+        let people = merge_people(assignable, contributors);
+        let logins: Vec<_> = people.iter().map(|p| p.login.as_str()).collect();
+        assert_eq!(logins, ["asofianidis", "drive-by", "MUDesigns"]);
+        assert!(people[0].has_access && !people[1].has_access);
+        assert_eq!(people[0].detail(), "Alex · 15 commits");
+        assert_eq!(people[2].detail(), "has access");
+
+        // The author is excluded; login prefix beats a name match.
+        let hits = search_people(&people, "", &["asofianidis"]);
+        assert_eq!(hits.len(), 2);
+        let hits = search_people(&people, "@mu", &[]);
+        assert_eq!(hits[0].login, "MUDesigns");
+        let hits = search_people(&people, "alex", &[]);
+        assert_eq!(hits[0].login, "asofianidis");
+        assert!(search_people(&people, "zzz", &[]).is_empty());
+        assert!(parse_assignable("not json").is_empty());
     }
 
     #[test]

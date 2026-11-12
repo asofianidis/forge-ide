@@ -142,6 +142,10 @@ pub struct PrPane {
     inline: Option<InlineDraft>,
     reply: Option<(u64, String)>,
     reviewer_input: String,
+    /// People who can be requested as reviewers, loaded on first use.
+    people: Option<Vec<model::Person>>,
+    people_task: Option<Pending<Vec<model::Person>>>,
+    reviewer_picker_open: bool,
     merge_method: MergeMethod,
     delete_branch: bool,
     confirm: Option<Confirm>,
@@ -176,6 +180,9 @@ impl PrPane {
             inline: None,
             reply: None,
             reviewer_input: String::new(),
+            people: None,
+            people_task: None,
+            reviewer_picker_open: false,
             merge_method: MergeMethod::Squash,
             delete_branch: false,
             confirm: None,
@@ -211,6 +218,34 @@ impl PrPane {
         if self.diff.is_some() || self.tab == Tab::Files {
             self.load_diff();
         }
+    }
+
+    /// Loads assignable users and contributors for the reviewer picker.
+    /// Either source may fail (e.g. no permission); the other still helps.
+    fn load_people(&mut self) {
+        let cli = self.cli.clone();
+        self.people_task = Some(Pending::spawn(&self.ctx, move || {
+            let query = format!("query={}", model::ASSIGNABLE_QUERY);
+            let assignable = cli
+                .run(&[
+                    "api",
+                    "graphql",
+                    "-f",
+                    &query,
+                    "-F",
+                    "owner={owner}",
+                    "-F",
+                    "repo={repo}",
+                ])
+                .map(|out| model::parse_assignable(&out))
+                .unwrap_or_default();
+            let contributors = cli
+                .run(&["api", "repos/{owner}/{repo}/contributors?per_page=100"])
+                .ok()
+                .and_then(|out| serde_json::from_str(&out).ok())
+                .unwrap_or_default();
+            model::merge_people(assignable, contributors)
+        }));
     }
 
     fn load_comments(&mut self) {
@@ -280,6 +315,9 @@ impl PrPane {
                 }
                 Err(e) => self.diff_error = Some(e),
             }
+        }
+        if let Some(people) = task::poll(&mut self.people_task) {
+            self.people = Some(people);
         }
         if let Some(Ok(comments)) = task::poll(&mut self.comments_task) {
             self.threads = Threads::build(&comments);
@@ -676,26 +714,7 @@ impl PrPane {
             });
         }
         if d.state == "OPEN" {
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.reviewer_input)
-                        .hint_text("Request review: login")
-                        .desired_width(170.0),
-                );
-                let login = self
-                    .reviewer_input
-                    .trim()
-                    .trim_start_matches('@')
-                    .to_owned();
-                if ui
-                    .add_enabled(!login.is_empty(), egui::Button::new("Add").small())
-                    .clicked()
-                {
-                    self.reviewer_input.clear();
-                    let args = self.args(&["edit", "--add-reviewer", &login]);
-                    self.simple("Request review", false, args);
-                }
-            });
+            self.reviewer_picker(ui, d, colors);
         }
         if let Some((text, color)) = review_badge(&d.review_decision, colors) {
             ui.label(RichText::new(text).small().color(color));
@@ -718,6 +737,114 @@ impl PrPane {
                 label_chip(ui, &l.name, &l.color);
             }
         });
+    }
+
+    /// Search box listing repository contributors and users with access;
+    /// picking one requests their review.
+    fn reviewer_picker(&mut self, ui: &mut Ui, d: &PrDetail, colors: &UiColors) {
+        if self.people.is_none() && self.people_task.is_none() {
+            self.load_people();
+        }
+        let edit = ui.add(
+            egui::TextEdit::singleline(&mut self.reviewer_input)
+                .hint_text("Request review: search people")
+                .desired_width(f32::INFINITY),
+        );
+        if edit.gained_focus() || edit.changed() {
+            self.reviewer_picker_open = true;
+        }
+        let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.reviewer_picker_open = false;
+        }
+        if !self.reviewer_picker_open {
+            return;
+        }
+
+        // GitHub rejects the author, and already-requested people are listed above.
+        let mut exclude: Vec<&str> = vec![d.author.login.as_str()];
+        exclude.extend(d.review_requests.iter().map(|r| r.login.as_str()));
+        let query = self
+            .reviewer_input
+            .trim()
+            .trim_start_matches('@')
+            .to_owned();
+        let matches: Vec<model::Person> = self
+            .people
+            .as_deref()
+            .map(|people| {
+                model::search_people(people, &query, &exclude)
+                    .into_iter()
+                    .take(8)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let loading = self.people_task.is_some();
+        // Allow any login GitHub might accept, even if not in our lists.
+        let typed_login = !query.is_empty()
+            && query.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            && !matches.iter().any(|p| p.login.eq_ignore_ascii_case(&query));
+
+        let mut chosen = None;
+        let list = egui::Frame::new()
+            .fill(colors.surface.0)
+            .stroke(egui::Stroke::new(1.0, colors.border.0))
+            .corner_radius(6)
+            .inner_margin(4)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 2.0;
+                if loading {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new("Loading people…").small().weak());
+                    });
+                }
+                for p in &matches {
+                    let tip = if p.has_access {
+                        "Request a review"
+                    } else {
+                        "Contributor; the request fails if they no longer have access"
+                    };
+                    let row = egui::Button::new(RichText::new(&p.login).strong())
+                        .right_text(RichText::new(p.detail()).small().color(colors.text_muted.0))
+                        .frame(false)
+                        .truncate()
+                        .min_size(egui::vec2(ui.available_width(), 0.0));
+                    if ui.add(row).on_hover_text(tip).clicked() {
+                        chosen = Some(p.login.clone());
+                    }
+                }
+                if typed_login && ui.button(format!("Request review from @{query}")).clicked() {
+                    chosen = Some(query.clone());
+                }
+                if matches.is_empty() && !typed_login && !loading {
+                    ui.label(RichText::new("No matching people").small().weak());
+                }
+            });
+        if enter && chosen.is_none() {
+            chosen = matches
+                .first()
+                .map(|p| p.login.clone())
+                .or_else(|| typed_login.then(|| query.clone()));
+        }
+        // Clicking anywhere else closes the list.
+        let clicked_outside = ui.input(|i| {
+            i.pointer.any_pressed()
+                && i.pointer.interact_pos().is_some_and(|pos| {
+                    !edit.rect.contains(pos) && !list.response.rect.contains(pos)
+                })
+        });
+        if clicked_outside {
+            self.reviewer_picker_open = false;
+        }
+        if let Some(login) = chosen {
+            self.reviewer_input.clear();
+            self.reviewer_picker_open = false;
+            let args = self.args(&["edit", "--add-reviewer", &login]);
+            self.simple(&format!("Request review from {login}"), false, args);
+        }
     }
 
     fn timeline(&mut self, ui: &mut Ui, d: &PrDetail, colors: &UiColors) {
