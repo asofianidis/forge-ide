@@ -10,6 +10,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use egui::collapsing_header::CollapsingState;
 use egui::text::CCursor;
 use egui::{Galley, Key, Modifiers, Rect, RichText, Shape, Stroke, TextStyle, pos2};
 
@@ -31,6 +32,7 @@ use crate::search::FileIndex;
 use crate::settings::Settings;
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::activity::{self, SidebarView};
+use crate::ui::file_icons;
 use crate::ui::icons::{self, Icon};
 use crate::updater::{self, UpdateState, Updater};
 use crate::workspace::{FileKinds, FileNode, Workspace};
@@ -140,6 +142,7 @@ impl ForgeApp {
             updater.check(&cc.egui_ctx);
         }
 
+        egui_extras::install_image_loaders(&cc.egui_ctx);
         cc.egui_ctx.all_styles_mut(|style| {
             style.spacing.item_spacing = egui::vec2(8.0, 6.0);
             style.spacing.button_padding = egui::vec2(10.0, 4.0);
@@ -1874,16 +1877,29 @@ fn file_tree(
             name = name.strikethrough();
         }
     }
+    let dark = ui.visuals().dark_mode;
     if node.is_dir {
-        let header = egui::CollapsingHeader::new(name)
-            .id_salt(&node.path)
-            .default_open(is_root)
-            .show(ui, |ui| {
+        let id = ui.make_persistent_id(&node.path);
+        let state = CollapsingState::load_with_default_open(ui.ctx(), id, is_root);
+        let open = state.is_open();
+        let (_, header, _) = state
+            .show_header(ui, |ui| {
+                file_icons::show(ui, file_icons::folder(&node.name, open, is_root, dark));
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.add(egui::Button::selectable(false, name).frame_when_inactive(false))
+            })
+            .body(|ui| {
                 for child in node.children() {
                     file_tree(ui, child, false, clicked, history, decorate, colors);
                 }
             });
-        header.header_response.context_menu(|ui| {
+        // Clicking the name toggles the folder, like the arrow does.
+        if header.inner.clicked() {
+            let mut state = CollapsingState::load_with_default_open(ui.ctx(), id, is_root);
+            state.toggle(ui);
+            state.store(ui.ctx());
+        }
+        header.inner.context_menu(|ui| {
             if ui.button("Refresh").clicked() {
                 node.refresh();
                 ui.close();
@@ -1896,6 +1912,10 @@ fn file_tree(
     } else {
         let response = ui
             .horizontal(|ui| {
+                // Leave room for the arrow folders have, so icons line up.
+                ui.add_space(ui.spacing().indent);
+                file_icons::show(ui, file_icons::file(&node.name, dark));
+                ui.spacing_mut().item_spacing.x = 4.0;
                 let r = ui.selectable_label(false, name);
                 if let Some(c) = change {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
