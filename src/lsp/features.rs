@@ -500,11 +500,15 @@ mod tests {
 
     #[test]
     fn decodes_workspace_symbols() {
+        // A real path, so the URI converts back on every platform (a bare
+        // `file:///tmp/…` has no drive letter on Windows).
+        let file = std::env::temp_dir().join("foo.rs");
+        let uri = crate::lsp::text::path_to_uri(&file).unwrap();
         let response: WorkspaceSymbolResponse = serde_json::from_value(json!([
             { "name": "Foo", "kind": 23, "containerName": "",
-              "location": { "uri": "file:///tmp/foo.rs" } },
+              "location": { "uri": uri } },
             { "name": "bar", "kind": 12, "containerName": "Foo",
-              "location": { "uri": "file:///tmp/foo.rs",
+              "location": { "uri": uri,
                 "range": { "start": { "line": 3, "character": 4 }, "end": { "line": 3, "character": 7 } } } },
         ]))
         .unwrap();
@@ -514,6 +518,7 @@ mod tests {
         assert_eq!(symbols[1].container.as_deref(), Some("Foo"));
         assert_eq!(symbols[1].location.range.start.line, 3);
         assert_eq!(symbols[1].location.encoding, Encoding::Utf8);
+        assert_eq!(symbols[1].location.path, file);
     }
 
     #[test]
