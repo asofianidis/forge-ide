@@ -5,6 +5,7 @@ mod explorer;
 mod find_bar;
 mod language;
 mod pickers;
+mod preferences;
 mod search_panel;
 mod session;
 mod terminal_panel;
@@ -91,6 +92,8 @@ pub struct ForgeApp {
     /// Languages whose "install a language server" hint the user dismissed.
     dismissed_hints: HashSet<&'static str>,
     settings: Settings,
+    /// The Settings window is showing.
+    settings_open: bool,
     updater: Updater,
     /// Update state seen last frame, to report transitions in the status bar.
     last_update_state: UpdateState,
@@ -168,6 +171,10 @@ impl ForgeApp {
             style.spacing.button_padding = egui::vec2(10.0, 4.0);
             style.spacing.menu_margin = egui::Margin::same(8);
         });
+        // Ctrl+= / Ctrl+- / Ctrl+0 change the editor font size instead of
+        // zooming the whole UI.
+        cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        Self::apply_font_size(&cc.egui_ctx, settings.font_size);
         themes[idx].apply(&cc.egui_ctx);
         crate::ui::diff_style::set_theme(themes[idx].syntect_theme());
 
@@ -202,6 +209,7 @@ impl ForgeApp {
             language: LanguageUi::default(),
             dismissed_hints: HashSet::new(),
             settings,
+            settings_open: false,
             updater,
             last_update_state: UpdateState::Idle,
             manual_update_check: false,
@@ -327,14 +335,20 @@ impl ForgeApp {
 
     // ---- themes --------------------------------------------------------
 
-    fn set_theme(&mut self, ctx: &egui::Context, idx: usize) {
+    /// Makes `themes[idx]` the active theme without saving the choice.
+    fn activate_theme(&mut self, ctx: &egui::Context, idx: usize) {
         self.theme = idx;
         let theme = &self.themes[idx];
         theme.apply(ctx);
         self.highlighter.set_theme(theme.syntect_theme());
         crate::ui::diff_style::set_theme(theme.syntect_theme());
-        self.status = format!("Theme: {}", theme.name);
-        let name = theme.name.clone();
+    }
+
+    /// Switches to `themes[idx]` and remembers the choice.
+    fn set_theme(&mut self, ctx: &egui::Context, idx: usize) {
+        self.activate_theme(ctx, idx);
+        let name = self.themes[idx].name.clone();
+        self.status = format!("Theme: {name}");
         self.update_settings(|s| s.theme = Some(name));
     }
 
@@ -592,18 +606,75 @@ impl ForgeApp {
         let Some(doc) = self.documents.get_mut(idx) else {
             return false;
         };
-        let result = if doc.path.is_some() {
-            doc.save()
-        } else if let Some(path) = rfd::FileDialog::new().save_file() {
-            doc.save_as(path)
-        } else {
+        if doc.path.is_none() {
+            return self.save_as(idx);
+        }
+        let result = doc.save();
+        self.finish_save(idx, result)
+    }
+
+    /// Saves a document under a path picked in the save dialog. The tab then
+    /// follows the new path. Returns whether it was saved.
+    fn save_as(&mut self, idx: usize) -> bool {
+        let Some(doc) = self.documents.get(idx) else {
             return false;
         };
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(path) = &doc.path {
+            dialog = dialog.set_file_name(doc.title());
+            if let Some(dir) = path.parent() {
+                dialog = dialog.set_directory(dir);
+            }
+        } else if let Some(ws) = &self.workspace {
+            dialog = dialog.set_directory(&ws.root.path);
+        }
+        let Some(path) = dialog.save_file() else {
+            return false;
+        };
+        let path = std::path::absolute(&path).unwrap_or(path);
+        let doc = &mut self.documents[idx];
+        let old = doc.path.clone();
+        let result = doc.save_as(path.clone());
+        if result.is_err() {
+            // Keep pointing at the old file rather than one never written.
+            doc.path = old;
+            return self.finish_save(idx, result);
+        }
+        if let Some(dir) = path.parent() {
+            self.reload_tree_dir(dir);
+        }
+        self.finish_save(idx, result)
+    }
+
+    /// Save As for the active tab. A clean tab already showing the chosen
+    /// file is closed, since the file now holds this tab's text.
+    fn save_active_as(&mut self) {
+        self.active_pane = None;
+        if !self.save_as(self.active) {
+            return;
+        }
+        let path = self.documents[self.active].path.clone();
+        let mut i = self.documents.len();
+        while i > 0 {
+            i -= 1;
+            let other = &self.documents[i];
+            if i != self.active && other.path == path && !other.is_dirty() {
+                self.remove_tab(i);
+            }
+        }
+    }
+
+    fn finish_save(&mut self, idx: usize, result: anyhow::Result<()>) -> bool {
+        let doc = &self.documents[idx];
         let saved = match result {
             Ok(()) => {
                 self.status = format!("Saved {}", doc.title());
                 if let Some(path) = &doc.path {
                     self.lsp.did_save(path, &doc.text);
+                    if Settings::path().as_deref() == Some(path.as_path()) {
+                        let ctx = self.egui_ctx.clone();
+                        self.reload_settings(&ctx);
+                    }
                 }
                 true
             }
@@ -614,6 +685,20 @@ impl ForgeApp {
         };
         self.source_control.refresh();
         saved
+    }
+
+    /// Moves to the next or previous tab (files, then diff / history panes),
+    /// wrapping around at either end.
+    fn cycle_tab(&mut self, forward: bool) {
+        let docs = self.documents.len();
+        let current = self.active_pane.map_or(self.active, |p| docs + p);
+        match cycle(current, docs + self.panes.len(), forward) {
+            i if i < docs => {
+                self.active = i;
+                self.active_pane = None;
+            }
+            i => self.active_pane = Some(i - docs),
+        }
     }
 
     /// Closes a tab, first asking what to do with unsaved changes.
@@ -843,6 +928,12 @@ impl ForgeApp {
                 continue;
             }
             if ctx.input_mut(|i| i.consume_shortcut(&shortcut)) {
+                // On macOS, Option+letter also types a character (Option+Z is
+                // "Ω"); drop it so the shortcut doesn't edit the text too.
+                let m = shortcut.modifiers;
+                if m.alt && !(m.ctrl || m.command || m.mac_cmd) {
+                    ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Text(_))));
+                }
                 self.run_command(ctx, cmd);
             }
         }
@@ -855,6 +946,7 @@ impl ForgeApp {
             Command::OpenFolder => self.open_folder_dialog(),
             Command::OpenRecent => self.open_recent_picker(),
             Command::Save => self.save_active(),
+            Command::SaveAs => self.save_active_as(),
             Command::CloseTab => match self.active_pane {
                 Some(i) => self.close_pane(i),
                 None => self.close_tab(self.active),
@@ -865,6 +957,8 @@ impl ForgeApp {
                     None => self.status = "Save the file first".to_owned(),
                 }
             }
+            Command::OpenSettings => self.settings_open = true,
+            Command::OpenSettingsFile => self.open_settings_file(),
             Command::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             Command::Find => {
                 self.active_pane = None;
@@ -886,6 +980,8 @@ impl ForgeApp {
                 self.active_pane = None;
                 self.open_go_to_line();
             }
+            Command::NextTab => self.cycle_tab(true),
+            Command::PreviousTab => self.cycle_tab(false),
             Command::ShowCommandPalette => self.open_command_palette(),
             Command::ShowExplorer => self.show_sidebar(SidebarView::Explorer),
             Command::ShowSourceControl => self.show_sidebar(SidebarView::SourceControl),
@@ -902,6 +998,11 @@ impl ForgeApp {
                 self.open_history(rel);
             }
             Command::RepositoryHistory => self.open_history(None),
+            Command::ToggleWordWrap => self.toggle_word_wrap(),
+            Command::ToggleLineNumbers => self.toggle_line_numbers(),
+            Command::IncreaseFontSize => self.change_font_size(ctx, Some(1.0)),
+            Command::DecreaseFontSize => self.change_font_size(ctx, Some(-1.0)),
+            Command::ResetFontSize => self.change_font_size(ctx, None),
             Command::SelectTheme => self.open_theme_picker(),
             Command::ReloadThemes => self.reload_themes(ctx),
             Command::OpenThemesFolder => self.open_themes_folder(),
@@ -955,11 +1056,23 @@ impl ForgeApp {
                 UpdateState::Checking | UpdateState::Installing(_)
             ),
             Command::QuickOpen | Command::FindInProject => self.workspace.is_some(),
+            Command::NextTab | Command::PreviousTab => self.documents.len() + self.panes.len() > 1,
             _ => true,
         };
         if ui.add_enabled(enabled, button).clicked() {
             self.pending_commands.push(cmd);
             ui.close();
+        }
+    }
+
+    /// A checkbox menu entry for a toggle command, showing its shortcut on hover.
+    fn menu_checkbox(&mut self, ui: &mut egui::Ui, cmd: Command, value: &mut bool, text: &str) {
+        let mut response = ui.checkbox(value, text);
+        if let Some(s) = cmd.shortcuts().first() {
+            response = response.on_hover_text(ui.ctx().format_shortcut(s));
+        }
+        if response.changed() {
+            self.pending_commands.push(cmd);
         }
     }
 
@@ -973,9 +1086,13 @@ impl ForgeApp {
                 self.open_recent_menu(ui);
                 ui.separator();
                 self.menu_item(ui, Save);
+                self.menu_item(ui, SaveAs);
                 self.menu_item(ui, CloseTab);
                 ui.separator();
                 self.menu_item(ui, RevealActiveFile);
+                ui.separator();
+                self.menu_item(ui, OpenSettings);
+                self.menu_item(ui, OpenSettingsFile);
                 ui.separator();
                 self.menu_item(ui, Quit);
             });
@@ -1005,6 +1122,11 @@ impl ForgeApp {
                 ui.separator();
                 self.menu_item(ui, NextProblem);
                 self.menu_item(ui, PreviousProblem);
+                self.menu_item(ui, NextChange);
+                self.menu_item(ui, PreviousChange);
+                ui.separator();
+                self.menu_item(ui, NextTab);
+                self.menu_item(ui, PreviousTab);
             });
             ui.menu_button("View", |ui| {
                 self.menu_item(ui, ShowCommandPalette);
@@ -1030,10 +1152,16 @@ impl ForgeApp {
                 if checkbox.changed() {
                     self.editor_git.blame_on = blame;
                 }
-                self.menu_item(ui, NextChange);
-                self.menu_item(ui, PreviousChange);
                 self.menu_item(ui, FileHistory);
                 self.menu_item(ui, RepositoryHistory);
+                ui.separator();
+                let mut wrap = self.settings.word_wrap;
+                self.menu_checkbox(ui, ToggleWordWrap, &mut wrap, "Word Wrap");
+                let mut numbers = self.settings.line_numbers;
+                self.menu_checkbox(ui, ToggleLineNumbers, &mut numbers, "Line Numbers");
+                for cmd in [IncreaseFontSize, DecreaseFontSize, ResetFontSize] {
+                    self.menu_item(ui, cmd);
+                }
                 ui.separator();
                 ui.menu_button("Theme", |ui| {
                     let mut chosen = None;
@@ -1348,12 +1476,7 @@ impl ForgeApp {
                 ui.horizontal(|ui| {
                     for (idx, doc) in self.documents.iter().enumerate() {
                         let selected = idx == self.active && self.active_pane.is_none();
-                        let label = if doc.is_dirty() {
-                            format!("● {}", doc.title())
-                        } else {
-                            doc.title()
-                        };
-                        let text = egui::RichText::new(label).color(if selected {
+                        let text = egui::RichText::new(doc.title()).color(if selected {
                             colors.text.0
                         } else {
                             colors.text_muted.0
@@ -1381,11 +1504,12 @@ impl ForgeApp {
                             self.active = idx;
                             self.active_pane = None;
                         }
-                        if ui
-                            .add(egui::Button::new("×").small().frame(false))
-                            .on_hover_text("Close")
-                            .clicked()
-                        {
+                        if response.middle_clicked() {
+                            to_close = Some(idx);
+                        }
+                        let close =
+                            tab_close_button(ui, &colors, response.rect, selected, doc.is_dirty());
+                        if close.clicked() {
                             to_close = Some(idx);
                         }
                         ui.add_space(4.0);
@@ -1432,11 +1556,11 @@ impl ForgeApp {
                         if response.clicked() {
                             pane_clicked = Some(idx);
                         }
-                        if ui
-                            .add(egui::Button::new("×").small().frame(false))
-                            .on_hover_text("Close")
-                            .clicked()
-                        {
+                        if response.middle_clicked() {
+                            pane_to_close = Some(idx);
+                        }
+                        let close = tab_close_button(ui, &colors, response.rect, selected, false);
+                        if close.clicked() {
                             pane_to_close = Some(idx);
                         }
                         ui.add_space(4.0);
@@ -1563,7 +1687,9 @@ impl ForgeApp {
         let highlighter = &mut self.highlighter;
         let font = TextStyle::Monospace.resolve(ui.style());
         let digit_width = ui.fonts_mut(|f| f.glyph_width(&font, '0'));
-        let gutter_width = gutter::width(doc.line_count(), digit_width);
+        let line_numbers = self.settings.line_numbers;
+        let word_wrap = self.settings.word_wrap;
+        let gutter_width = gutter::width(doc.line_count(), digit_width, line_numbers);
         let current_line = self.cursor.0;
         let mut scroll_to = self.scroll_to.take();
         let reveal = self.reveal.take();
@@ -1628,11 +1754,18 @@ impl ForgeApp {
                         r.x_range()
                     });
                     let underlay = ui.painter().add(Shape::Noop);
+                    // Wrapping lays the text out to the visible width; otherwise
+                    // long lines extend and the area scrolls sideways.
+                    let desired_width = if word_wrap {
+                        ui.available_width()
+                    } else {
+                        f32::INFINITY
+                    };
                     let output = egui::TextEdit::multiline(&mut doc.text)
                         .id(id)
                         .code_editor()
                         .lock_focus(true)
-                        .desired_width(f32::INFINITY)
+                        .desired_width(desired_width)
                         .desired_rows(40)
                         .frame(frame)
                         .layouter(&mut layouter)
@@ -1729,6 +1862,7 @@ impl ForgeApp {
                         &output,
                         current_line,
                         &font,
+                        line_numbers,
                         changes.as_ref().map(|c| (c, &mark_colors)),
                     );
                     if !found_conflicts.is_empty()
@@ -1987,6 +2121,65 @@ fn open_path(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The close button that trails a tab.
+///
+/// The × is faint on idle background tabs and brightens when the tab is
+/// active or hovered; hovering the button itself gives it a rounded
+/// highlight. Unsaved tabs show a dot in this slot that turns into the ×
+/// on hover, so closing never requires hunting for a tiny glyph.
+fn tab_close_button(
+    ui: &mut egui::Ui,
+    colors: &UiColors,
+    tab_rect: Rect,
+    selected: bool,
+    dirty: bool,
+) -> egui::Response {
+    let size = egui::vec2(18.0, tab_rect.height().max(18.0));
+    let (slot, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let tab_hovered = ui.rect_contains_pointer(tab_rect.union(slot));
+    let hovered = response.hovered();
+    if ui.is_rect_visible(slot) {
+        let button = Rect::from_center_size(slot.center(), egui::vec2(18.0, 18.0));
+        let painter = ui.painter();
+        if hovered {
+            // Red circle signals a destructive action; darken it while pressed.
+            let fill = if response.is_pointer_button_down_on() {
+                colors.error.0.lerp_to_gamma(egui::Color32::BLACK, 0.2)
+            } else {
+                colors.error.0
+            };
+            painter.circle_filled(button.center(), button.width() / 2.0, fill);
+        }
+        if dirty && !hovered {
+            let color = if selected || tab_hovered {
+                colors.text.0
+            } else {
+                colors.text_muted.0
+            };
+            painter.circle_filled(button.center(), 3.5, color);
+        } else {
+            let color = if hovered {
+                egui::Color32::WHITE
+            } else if selected {
+                colors.text.0
+            } else if tab_hovered {
+                colors.text_muted.0
+            } else {
+                colors.text_muted.0.gamma_multiply(0.45)
+            };
+            icons::paint(painter, button.shrink(3.0), Icon::Close, color);
+        }
+    }
+    let tip = if selected {
+        let shortcut = Command::CloseTab.shortcuts()[0];
+        format!("Close ({})", ui.ctx().format_shortcut(&shortcut))
+    } else {
+        "Close".to_owned()
+    };
+    response.on_hover_text(tip)
+}
+
 impl eframe::App for ForgeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
@@ -2088,6 +2281,7 @@ impl eframe::App for ForgeApp {
             self.server_browser.show(&ctx, &mut self.servers, &kinds);
         }
 
+        self.settings_window(&ctx);
         self.show_picker(&ctx);
         self.go_to_line_dialog(&ctx);
         self.rename_dialog(&ctx);
@@ -2101,5 +2295,30 @@ impl eframe::App for ForgeApp {
 
     fn on_exit(&mut self) {
         self.persist_session(true);
+    }
+}
+
+/// The index after (or before) `current` among `len` items, wrapping around.
+fn cycle(current: usize, len: usize, forward: bool) -> usize {
+    match (len, forward) {
+        (0, _) => 0,
+        (_, true) => (current + 1) % len,
+        (_, false) => (current.min(len - 1) + len - 1) % len,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cycle;
+
+    #[test]
+    fn tab_cycling_wraps() {
+        assert_eq!(cycle(0, 3, true), 1);
+        assert_eq!(cycle(2, 3, true), 0);
+        assert_eq!(cycle(0, 3, false), 2);
+        assert_eq!(cycle(2, 3, false), 1);
+        assert_eq!(cycle(0, 1, true), 0);
+        assert_eq!(cycle(0, 1, false), 0);
+        assert_eq!(cycle(0, 0, true), 0);
     }
 }
