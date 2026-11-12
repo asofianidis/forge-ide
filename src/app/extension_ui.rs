@@ -11,6 +11,8 @@ use egui::{Id, Key, Modifiers, RichText};
 use super::{ForgeApp, open_path};
 use crate::editor::Document;
 use crate::editor::ops::Selection;
+use crate::editor::selection::{Cursor, Selections};
+use crate::editor::view::Reveal;
 use crate::extensions::install::{self, Package};
 use crate::extensions::panel::RunState;
 use crate::extensions::run::{self, Context, Invocation, RunOutput};
@@ -487,11 +489,7 @@ impl ForgeApp {
                     return;
                 }
                 // A diff or PR tab has no editor to act on.
-                (
-                    self.active_pane.is_none().then_some(self.active),
-                    input,
-                    true,
-                )
+                ((!self.pane_shown()).then_some(self.active), input, true)
             }
             Trigger::Save(idx) => (Some(idx), None, false),
         };
@@ -667,8 +665,7 @@ impl ForgeApp {
                 doc.set_text(&output.stdout);
                 doc.buffer.mark_saved();
                 self.documents.push(doc);
-                self.active = self.documents.len() - 1;
-                self.active_pane = None;
+                self.show_document(self.documents.len() - 1);
             }
             Output::ReplaceDocument | Output::ReplaceSelection | Output::Insert => {
                 self.apply_extension_edit(ctx, &run, output.stdout);
@@ -723,15 +720,18 @@ impl ForgeApp {
         let start = run.range.start;
         let end = start + text.chars().count();
         self.documents[idx].apply_edits([(run.range.clone(), text.as_str())]);
-        if idx == self.active && self.active_pane.is_none() {
+        if idx == self.active && !self.pane_shown() {
             let sel = if run.output == Output::Insert {
                 Selection::caret(end)
             } else {
                 Selection::new(start, end)
             };
-            self.set_selection(ctx, sel, true);
-            self.scroll_to = None;
-            self.reveal = Some(end);
+            self.set_selections(
+                ctx,
+                Selections::single(Cursor::new(sel.start, sel.end)),
+                Reveal::Cursor,
+                true,
+            );
         }
     }
 

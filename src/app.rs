@@ -5,6 +5,7 @@ mod editing;
 mod explorer;
 mod extension_ui;
 mod find_bar;
+mod groups;
 mod language;
 mod markdown_preview;
 mod pickers;
@@ -17,19 +18,19 @@ mod terminal_panel;
 mod views;
 
 use std::collections::HashSet;
-use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use egui::text::CCursor;
-use egui::{Galley, Key, Modifiers, Rect, RichText, Shape, Stroke, TextStyle, pos2};
+use egui::{Key, Modifiers, Rect, RichText, Shape, Stroke, TextStyle};
 
 use crate::commands::Command;
 use crate::editor::conflicts::{self, Resolution};
-use crate::editor::decorate;
 use crate::editor::find::Match;
+use crate::editor::folding::FoldSource;
 use crate::editor::ops;
 use crate::editor::scm::{self, EditorAction, EditorGit, Peek};
+use crate::editor::view::{EditorView, Reveal};
+use crate::editor::widget::{EditorConfig, EditorWidget};
 use crate::editor::{DiskEvent, DiskState, Document, Highlighter, gutter};
 use crate::extensions::{self, Extensions, install as extension_install};
 use crate::git::{self, PanelAction, ScmPanel, SourceControl};
@@ -49,10 +50,10 @@ use crate::updater::{self, UpdateState, Updater};
 use crate::watcher::FsWatcher;
 use crate::workspace::{FileKinds, Workspace};
 
-use editing::editor_id;
 use explorer::ExplorerDialog;
 use extension_ui::ExtensionUi;
 use find_bar::FindBar;
+use groups::EditorGroup;
 use language::{EditorFrame, LanguageUi};
 use pickers::{FileMatches, PickerMode};
 use search_panel::SearchPanel;
@@ -71,7 +72,8 @@ const DISK_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Something waiting on the user to save or discard unsaved changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingClose {
-    Tab(usize),
+    /// Closing the last tab of the document with this id.
+    Tab(u64),
     Window,
 }
 
@@ -91,8 +93,15 @@ enum CloseChoice {
 
 pub struct ForgeApp {
     workspace: Option<Workspace>,
+    /// Open documents, each once; tabs in `groups` show them.
     documents: Vec<Document>,
+    /// Index into `documents` of the focused tab's document (kept up to date
+    /// by `sync_active`).
     active: usize,
+    /// The editor area's groups (split editors), left to right.
+    groups: Vec<EditorGroup>,
+    /// Index of the focused group.
+    group: usize,
     highlighter: Highlighter,
     /// Built-in and custom themes; `theme` indexes into this.
     themes: Vec<Theme>,
@@ -129,10 +138,6 @@ pub struct ForgeApp {
     file_matches: FileMatches,
     /// Input of the open Go to Line dialog.
     go_to_line: Option<String>,
-    /// Character index to scroll the editor to on the next frame.
-    scroll_to: Option<usize>,
-    /// Character to scroll into view (minimally) after an edit.
-    reveal: Option<usize>,
     /// Unsaved-changes dialog being shown, if any.
     pending_close: Option<PendingClose>,
     /// Unsaved changes were saved or discarded, so the window may close.
@@ -146,9 +151,10 @@ pub struct ForgeApp {
     pr_panel: PrListPanel,
     sidebar_view: SidebarView,
     sidebar_open: bool,
-    /// Diff, commit and pull request tabs, shown after the documents.
+    /// Diff, commit and pull request tabs, shown after the documents in the
+    /// first editor group.
     panes: Vec<Pane>,
-    /// When set, the central area shows this pane instead of a document.
+    /// When set, the first group shows this pane instead of a document.
     active_pane: Option<usize>,
     /// Change markers, blame and change peek for open files.
     editor_git: EditorGit,
@@ -165,6 +171,10 @@ pub struct ForgeApp {
     explorer_dialog: Option<ExplorerDialog>,
     /// Integrated terminal panel below the editor.
     terminal: TerminalPanel,
+    /// Give the focused editor keyboard focus on the next frame.
+    focus_editor: bool,
+    /// Merge conflicts found per text version.
+    conflict_cache: Vec<(u64, Vec<conflicts::Conflict>)>,
     /// Installed extensions.
     extensions: Extensions,
     /// Extension commands running, dialogs and the Extensions view.
@@ -175,10 +185,6 @@ pub struct ForgeApp {
     keymap_source: std::collections::BTreeMap<String, crate::keymap::Keys>,
     /// The Keyboard Shortcuts window is showing, with this filter text.
     keybindings_filter: Option<String>,
-    /// Minimap of the active document.
-    minimap: crate::editor::minimap::Minimap,
-    /// Vertical editor scroll offset requested by the minimap, for next frame.
-    minimap_scroll: Option<f32>,
     /// Ids of the Markdown documents showing a preview beside the editor.
     markdown_preview: HashSet<u64>,
 }
@@ -228,6 +234,8 @@ impl ForgeApp {
             .map(|p| std::path::absolute(&p).unwrap_or(p));
         let workspace = root.map(Workspace::open);
         let folder = workspace.as_ref().map(|w| w.root.path.clone());
+        let first = Document::untitled();
+        let first_view = EditorView::new(first.id);
         let mut app = Self {
             source_control: SourceControl::new(cc.egui_ctx.clone(), folder.as_deref()),
             scm_panel: ScmPanel::default(),
@@ -241,8 +249,10 @@ impl ForgeApp {
             jump_to_line: None,
             change_nav: None,
             workspace,
-            documents: vec![Document::untitled()],
+            documents: vec![first],
             active: 0,
+            groups: vec![EditorGroup::new(vec![first_view])],
+            group: 0,
             highlighter: Highlighter::new(themes[idx].syntect_theme()),
             theme: idx,
             themes,
@@ -269,8 +279,6 @@ impl ForgeApp {
             file_index_generation: 0,
             file_matches: FileMatches::default(),
             go_to_line: None,
-            scroll_to: None,
-            reveal: None,
             pending_close: None,
             allow_close: false,
             last_disk_poll: Instant::now(),
@@ -280,13 +288,13 @@ impl ForgeApp {
             watcher: None,
             explorer_dialog: None,
             terminal: TerminalPanel::default(),
+            conflict_cache: Vec::new(),
+            focus_editor: true,
             extensions,
             ext: ExtensionUi::default(),
             keymap_source,
             keymap,
             keybindings_filter: None,
-            minimap: Default::default(),
-            minimap_scroll: None,
             markdown_preview: HashSet::new(),
         };
         if let Some(folder) = folder {
@@ -451,30 +459,33 @@ impl ForgeApp {
 
     fn new_file(&mut self) {
         self.documents.push(Document::untitled());
-        self.active = self.documents.len() - 1;
+        self.show_document(self.documents.len() - 1);
     }
 
     fn open_file(&mut self, path: &Path) {
-        self.active_pane = None;
+        if self.group == 0 {
+            self.active_pane = None;
+        }
         if let Some(idx) = self
             .documents
             .iter()
             .position(|d| d.path.as_deref() == Some(path))
         {
-            self.active = idx;
+            self.show_document(idx);
             return;
         }
         match Document::open(path) {
             Ok(doc) => {
                 // Replace a pristine untitled tab instead of piling up tabs.
-                if let [only] = self.documents.as_slice()
-                    && only.path.is_none()
-                    && only.text().is_empty()
-                {
-                    self.documents.clear();
-                }
+                let pristine = match self.documents.as_slice() {
+                    [only] if only.path.is_none() && only.text().is_empty() => Some(only.id),
+                    _ => None,
+                };
                 self.documents.push(doc);
-                self.active = self.documents.len() - 1;
+                self.show_document(self.documents.len() - 1);
+                if let Some(idx) = pristine.and_then(|id| self.doc_by_id(id)) {
+                    self.close_document(idx);
+                }
                 self.status = format!("Opened {}", path.display());
             }
             Err(e) => self.status = format!("Error: {e:#}"),
@@ -552,6 +563,9 @@ impl ForgeApp {
                 self.active_pane = Some(self.panes.len() - 1);
             }
         }
+        // Panes live in the first group.
+        self.group = 0;
+        self.sync_active();
     }
 
     /// Opens the history tab for the repository, or one path in it.
@@ -730,17 +744,20 @@ impl ForgeApp {
     /// Save As for the active tab. A clean tab already showing the chosen
     /// file is closed, since the file now holds this tab's text.
     fn save_active_as(&mut self) {
-        self.active_pane = None;
+        if self.group == 0 {
+            self.active_pane = None;
+        }
         if !self.save_as(self.active) {
             return;
         }
+        let id = self.documents[self.active].id;
         let path = self.documents[self.active].path.clone();
         let mut i = self.documents.len();
         while i > 0 {
             i -= 1;
             let other = &self.documents[i];
-            if i != self.active && other.path == path && !other.is_dirty() {
-                self.remove_tab(i);
+            if other.id != id && other.path == path && !other.is_dirty() {
+                self.close_document(i);
             }
         }
     }
@@ -769,39 +786,20 @@ impl ForgeApp {
         saved
     }
 
-    /// Moves to the next or previous tab (files, then diff / history panes),
-    /// wrapping around at either end.
+    /// Moves to the next or previous tab of the focused group (files, then
+    /// diff / history panes in the first group), wrapping around.
     fn cycle_tab(&mut self, forward: bool) {
-        let docs = self.documents.len();
-        let current = self.active_pane.map_or(self.active, |p| docs + p);
-        match cycle(current, docs + self.panes.len(), forward) {
-            i if i < docs => {
-                self.active = i;
-                self.active_pane = None;
-            }
-            i => self.active_pane = Some(i - docs),
-        }
-    }
-
-    /// Closes a tab, first asking what to do with unsaved changes.
-    fn close_tab(&mut self, idx: usize) {
-        match self.documents.get(idx) {
-            Some(doc) if doc.is_dirty() => self.pending_close = Some(PendingClose::Tab(idx)),
-            Some(_) => self.remove_tab(idx),
-            None => {}
-        }
-    }
-
-    fn remove_tab(&mut self, idx: usize) {
-        if idx < self.documents.len() {
-            let doc = self.documents.remove(idx);
-            self.markdown_preview.remove(&doc.id);
-        }
-        if self.documents.is_empty() {
-            self.documents.push(Document::untitled());
-        }
-        if self.active >= self.documents.len() || self.active > idx {
-            self.active = self.active.saturating_sub(1);
+        let g = &self.groups[self.group];
+        let tabs = g.tabs.len();
+        let panes = if self.group == 0 {
+            self.active_pane
+        } else {
+            None
+        };
+        let current = panes.map_or(g.active, |p| tabs + p);
+        match cycle(current, self.tab_count(), forward) {
+            i if i < tabs => self.select_tab(self.group, i),
+            i => self.active_pane = Some(i - tabs),
         }
     }
 
@@ -823,7 +821,7 @@ impl ForgeApp {
             return;
         };
         let dirty: Vec<usize> = match pending {
-            PendingClose::Tab(idx) => vec![idx],
+            PendingClose::Tab(id) => self.doc_by_id(id).into_iter().collect(),
             PendingClose::Window => (0..self.documents.len())
                 .filter(|&i| self.documents[i].is_dirty())
                 .collect(),
@@ -893,7 +891,11 @@ impl ForgeApp {
             return;
         }
         match pending {
-            PendingClose::Tab(idx) => self.remove_tab(idx),
+            PendingClose::Tab(id) => {
+                if let Some(idx) = self.doc_by_id(id) {
+                    self.close_document(idx);
+                }
+            }
             PendingClose::Window => {
                 self.allow_close = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -944,8 +946,8 @@ impl ForgeApp {
     }
 
     /// Banner above the editor when the active file changed or vanished on disk.
-    fn disk_banner(&mut self, ui: &mut egui::Ui) {
-        let Some(doc) = self.documents.get_mut(self.active) else {
+    fn disk_banner(&mut self, ui: &mut egui::Ui, idx: usize) {
+        let Some(doc) = self.documents.get_mut(idx) else {
             return;
         };
         let warning = ui.visuals().warn_fg_color;
@@ -990,13 +992,11 @@ impl ForgeApp {
         } else if self.find.open && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
             self.close_find(ctx);
         }
-        self.handle_tab(ctx);
-        self.handle_typing(ctx);
-
         // Editing shortcuts only apply when typing in the editor, so that
         // e.g. Alt+Up in the find field doesn't move lines.
         // A diff / PR / history tab hides the document, so it can't be edited.
-        let editor_focused = self.active_pane.is_none()
+        let pane_shown = self.pane_shown();
+        let editor_focused = !pane_shown
             && (self.editor_has_focus(ctx)
                 || (ctx.memory(|m| m.focused().is_none())
                     && !self.picker.open
@@ -1062,9 +1062,12 @@ impl ForgeApp {
             Command::OpenRecent => self.open_recent_picker(),
             Command::Save => self.save_active(),
             Command::SaveAs => self.save_active_as(),
-            Command::CloseTab => match self.active_pane {
+            Command::CloseTab => match self.active_pane.filter(|_| self.group == 0) {
                 Some(i) => self.close_pane(i),
-                None => self.close_tab(self.active),
+                None => {
+                    let g = self.group;
+                    self.close_tab_in(g, self.groups[g].active);
+                }
             },
             Command::RevealActiveFile => {
                 match self.documents.get(self.active).and_then(|d| d.path.clone()) {
@@ -1093,6 +1096,19 @@ impl ForgeApp {
             | Command::DuplicateLine
             | Command::MoveLineUp
             | Command::MoveLineDown => self.edit_command(ctx, cmd),
+            Command::AddCursorAbove
+            | Command::AddCursorBelow
+            | Command::AddNextOccurrence
+            | Command::SelectAllOccurrences
+            | Command::AddCursorsToLineEnds => self.cursor_command(ctx, cmd),
+            Command::Fold | Command::Unfold | Command::FoldAll | Command::UnfoldAll => {
+                self.fold_command(cmd)
+            }
+            Command::SplitEditor => self.split_editor(),
+            Command::MoveTabToNextGroup => self.move_tab_to_next_group(),
+            Command::FocusFirstGroup => self.focus_group(0),
+            Command::FocusSecondGroup => self.focus_group(1),
+            Command::FocusThirdGroup => self.focus_group(2),
             Command::QuickOpen => self.open_quick_open(ctx),
             Command::GoToLine => {
                 self.active_pane = None;
@@ -1188,7 +1204,7 @@ impl ForgeApp {
             ),
             Command::QuickOpen | Command::FindInProject => self.workspace.is_some(),
             Command::Undo | Command::Redo => {
-                self.active_pane.is_none()
+                !self.pane_shown()
                     && self.documents.get(self.active).is_some_and(|d| {
                         if cmd == Command::Undo {
                             d.buffer.can_undo()
@@ -1197,7 +1213,8 @@ impl ForgeApp {
                         }
                     })
             }
-            Command::NextTab | Command::PreviousTab => self.documents.len() + self.panes.len() > 1,
+            Command::NextTab | Command::PreviousTab => self.tab_count() > 1,
+            Command::MoveTabToNextGroup => self.groups.len() > 1 || self.groups[0].tabs.len() > 1,
             _ => true,
         };
         if ui.add_enabled(enabled, button).clicked() {
@@ -1264,6 +1281,21 @@ impl ForgeApp {
                     self.menu_item(ui, cmd);
                 }
             });
+            ui.menu_button("Selection", |ui| {
+                for cmd in [AddCursorAbove, AddCursorBelow, AddCursorsToLineEnds] {
+                    self.menu_item(ui, cmd);
+                }
+                ui.separator();
+                for cmd in [AddNextOccurrence, SelectAllOccurrences] {
+                    self.menu_item(ui, cmd);
+                }
+                ui.separator();
+                ui.label(
+                    RichText::new("Alt+click adds a cursor; Alt+Shift+drag selects a column")
+                        .small()
+                        .weak(),
+                );
+            });
             ui.menu_button("Go", |ui| {
                 self.menu_item(ui, QuickOpen);
                 self.menu_item(ui, GoToLine);
@@ -1308,6 +1340,14 @@ impl ForgeApp {
                 }
                 self.menu_item(ui, FileHistory);
                 self.menu_item(ui, RepositoryHistory);
+                ui.separator();
+                for cmd in [SplitEditor, MoveTabToNextGroup] {
+                    self.menu_item(ui, cmd);
+                }
+                ui.separator();
+                for cmd in [Fold, Unfold, FoldAll, UnfoldAll] {
+                    self.menu_item(ui, cmd);
+                }
                 ui.separator();
                 let mut wrap = self.settings.word_wrap;
                 self.menu_checkbox(ui, ToggleWordWrap, &mut wrap, "Word Wrap");
@@ -1659,18 +1699,29 @@ impl ForgeApp {
         }
     }
 
-    fn tab_bar(&mut self, ui: &mut egui::Ui) {
+    /// The tabs of group `gi` (and, in the first group, the panes).
+    fn tab_bar(&mut self, ui: &mut egui::Ui, gi: usize) {
         let mut to_close = None;
+        let mut clicked = None;
         let mut pane_clicked = None;
         let mut pane_to_close = None;
+        let mut split = None;
+        let mut move_next = None;
         let colors = self.current_theme().ui.clone();
+        let focused_group = gi == self.group;
+        let panes_shown = gi == 0 && self.active_pane.is_some();
+        let groups = self.groups.len();
         let close_shortcut = self.keymap.shortcut(Command::CloseTab).copied();
         egui::ScrollArea::horizontal()
-            .id_salt("tab_bar")
+            .id_salt(("tab_bar", gi))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    for (idx, doc) in self.documents.iter().enumerate() {
-                        let selected = idx == self.active && self.active_pane.is_none();
+                    let g = &self.groups[gi];
+                    for (idx, view) in g.tabs.iter().enumerate() {
+                        let Some(doc) = self.documents.iter().find(|d| d.id == view.doc) else {
+                            continue;
+                        };
+                        let selected = idx == g.active && !panes_shown;
                         let text = egui::RichText::new(doc.title()).color(if selected {
                             colors.text.0
                         } else {
@@ -1687,21 +1738,52 @@ impl ForgeApp {
                                 .stroke(egui::Stroke::NONE),
                         );
                         if selected {
-                            // Accent underline marks the active tab.
+                            // Accent underline marks the active tab (dimmed
+                            // in groups without focus).
                             let r = response.rect;
+                            let accent = if focused_group {
+                                colors.accent.0
+                            } else {
+                                colors.accent.0.gamma_multiply(0.4)
+                            };
                             ui.painter().hline(
                                 r.x_range().shrink(6.0),
                                 r.bottom() + 1.0,
-                                egui::Stroke::new(2.0, colors.accent.0),
+                                egui::Stroke::new(2.0, accent),
                             );
                         }
                         if response.clicked() {
-                            self.active = idx;
-                            self.active_pane = None;
+                            clicked = Some(idx);
                         }
                         if response.middle_clicked() {
                             to_close = Some(idx);
                         }
+                        response.context_menu(|ui| {
+                            if ui.button("Split Right").clicked() {
+                                split = Some(idx);
+                                ui.close();
+                            }
+                            let label = if groups > 1 {
+                                "Move to Next Group"
+                            } else {
+                                "Move to New Group"
+                            };
+                            if ui
+                                .add_enabled(
+                                    groups > 1 || g.tabs.len() > 1,
+                                    egui::Button::new(label),
+                                )
+                                .clicked()
+                            {
+                                move_next = Some(idx);
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui.button("Close").clicked() {
+                                to_close = Some(idx);
+                                ui.close();
+                            }
+                        });
                         let close = tab_close_button(
                             ui,
                             &colors,
@@ -1715,7 +1797,8 @@ impl ForgeApp {
                         }
                         ui.add_space(4.0);
                     }
-                    for (idx, pane) in self.panes.iter().enumerate() {
+                    let panes: &[Pane] = if gi == 0 { &self.panes } else { &[] };
+                    for (idx, pane) in panes.iter().enumerate() {
                         let selected = self.active_pane == Some(idx);
                         icons::label(
                             ui,
@@ -1775,28 +1858,169 @@ impl ForgeApp {
                     }
                 });
             });
+        if let Some(idx) = clicked {
+            self.select_tab(gi, idx);
+            self.focus_group(gi);
+        }
+        if let Some(idx) = split {
+            self.select_tab(gi, idx);
+            self.split_editor();
+        }
+        if let Some(idx) = move_next {
+            self.select_tab(gi, idx);
+            self.move_tab_to_next_group();
+        }
         if let Some(idx) = to_close {
-            self.close_tab(idx);
+            self.close_tab_in(gi, idx);
         }
         if let Some(idx) = pane_clicked {
+            self.group = 0;
             self.active_pane = Some(idx);
+            self.sync_active();
         }
         if let Some(idx) = pane_to_close {
             self.close_pane(idx);
         }
     }
 
-    fn editor(&mut self, ui: &mut egui::Ui) {
+    /// The editor area: the groups side by side, with draggable dividers.
+    fn editor_area(&mut self, ui: &mut egui::Ui, colors: &UiColors) {
+        let n = self.groups.len();
+        if n == 1 {
+            self.group_ui(ui, 0, colors);
+            return;
+        }
+        let rect = ui.available_rect_before_wrap();
+        let gap = 7.0;
+        let width = (rect.width() - gap * (n - 1) as f32).max(1.0);
+        let total: f32 = self.groups.iter().map(|g| g.weight).sum();
+        let pressed = ui.input(|i| i.pointer.primary_pressed());
+        let mut x = rect.left();
+        for gi in 0..n {
+            let w = width * self.groups[gi].weight / total;
+            let r = Rect::from_x_y_ranges(x..=x + w, rect.y_range());
+            let mut child = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(r)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+            );
+            child.set_clip_rect(r.intersect(ui.clip_rect()));
+            if pressed && child.rect_contains_pointer(r) && gi != self.group {
+                self.group = gi;
+                self.sync_active();
+            }
+            self.group_ui(&mut child, gi, colors);
+            x += w;
+            if gi + 1 < n {
+                let divider = Rect::from_x_y_ranges(x..=x + gap, rect.y_range());
+                let response = ui
+                    .interact(
+                        divider,
+                        egui::Id::unique(("group_divider", gi)),
+                        egui::Sense::drag(),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+                let stroke = if response.hovered() || response.dragged() {
+                    Stroke::new(2.0, colors.accent.0)
+                } else {
+                    Stroke::new(1.0, colors.border.0)
+                };
+                ui.painter()
+                    .vline(divider.center().x, rect.y_range(), stroke);
+                if response.dragged() {
+                    let dw = response.drag_delta().x / width * total;
+                    let min = total * 0.12;
+                    let (a, b) = (self.groups[gi].weight, self.groups[gi + 1].weight);
+                    let dw = dw.clamp(min - a, b - min);
+                    self.groups[gi].weight = a + dw;
+                    self.groups[gi + 1].weight = b - dw;
+                }
+                x += gap;
+            }
+        }
+        ui.allocate_rect(rect, egui::Sense::hover());
+    }
+
+    /// One group: its tabs and the active tab's editor (or pane).
+    fn group_ui(&mut self, ui: &mut egui::Ui, gi: usize, colors: &UiColors) {
+        let focused = gi == self.group;
+        if focused {
+            ui.horizontal(|ui| {
+                // Right-to-left so the preview toggle keeps its place at the
+                // end and the tabs scroll in the space left over.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.markdown_preview_button(ui);
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        self.tab_bar(ui, gi);
+                    });
+                });
+            });
+        } else {
+            self.tab_bar(ui, gi);
+        }
+        ui.separator();
+        if gi == 0
+            && let Some(i) = self.active_pane.filter(|&i| i < self.panes.len())
+        {
+            let action = self.panes[i].show(ui, &mut self.source_control, colors);
+            match action {
+                Some(PaneAction::OpenFile(rel)) => self.open_repo_file(&rel),
+                Some(PaneAction::OpenCommit(hash)) => {
+                    let pane = CommitPane::new(hash, &self.source_control);
+                    self.open_pane(Pane::Commit(pane));
+                }
+                Some(PaneAction::OpenRebase(base)) => self.open_rebase(base),
+                Some(PaneAction::Close) => self.close_pane(i),
+                None => {}
+            }
+            return;
+        }
+        let Some(doc_idx) = self.groups[gi]
+            .active_view()
+            .and_then(|v| self.doc_by_id(v.doc))
+        else {
+            return;
+        };
+        if focused {
+            self.markdown_preview_panel(ui);
+        }
+        self.disk_banner(ui, doc_idx);
+        if focused {
+            self.find_bar(ui);
+            self.breadcrumbs(ui);
+        }
+        self.editor(ui, gi, doc_idx);
+    }
+
+    /// Merge conflicts in document `idx`, cached per text version.
+    fn conflicts_in(&mut self, idx: usize) -> Vec<conflicts::Conflict> {
+        let doc = &self.documents[idx];
+        let version = doc.version();
+        if let Some((_, c)) = self.conflict_cache.iter().find(|(v, _)| *v == version) {
+            return c.clone();
+        }
+        let found = if doc.text().contains("<<<<<<<") {
+            conflicts::find(doc.text())
+        } else {
+            Vec::new()
+        };
+        if self.conflict_cache.len() >= 4 {
+            self.conflict_cache.remove(0);
+        }
+        self.conflict_cache.push((version, found.clone()));
+        found
+    }
+
+    /// The editor of group `gi`, showing document `doc_idx`.
+    fn editor(&mut self, ui: &mut egui::Ui, gi: usize, doc_idx: usize) {
         let colors = self.current_theme().ui.clone();
         let mark_colors = gutter::MarkColors {
             added: colors.added.0,
             modified: colors.modified.0,
             deleted: colors.deleted.0,
         };
-        let Some(doc) = self.documents.get(self.active) else {
-            return;
-        };
-        let id = editor_id(doc);
+        let focused = gi == self.group;
+        let doc = &self.documents[doc_idx];
         let path = doc.path.clone();
         let sc = &self.source_control;
         let rel = path.as_deref().and_then(|p| sc.rel_path(p));
@@ -1807,11 +2031,8 @@ impl ForgeApp {
             ),
             None => (None, None),
         };
-        let found_conflicts = if doc.text().contains("<<<<<<<") {
-            conflicts::find(doc.text())
-        } else {
-            Vec::new()
-        };
+        let found_conflicts = self.conflicts_in(doc_idx);
+        let sc = &self.source_control;
         let in_conflict = rel
             .as_deref()
             .and_then(|r| sc.status.find(r))
@@ -1820,12 +2041,12 @@ impl ForgeApp {
             .editor_git
             .peek
             .as_ref()
-            .filter(|p| Some(&p.path) == path.as_ref())
+            .filter(|p| focused && Some(&p.path) == path.as_ref())
             .map(|p| p.hunk);
 
         // Keyboard navigation between changes.
         let mut action = None;
-        if let (Some(dir), Some(c)) = (self.change_nav.take(), &changes) {
+        if focused && let (Some(dir), Some(c)) = (self.change_nav.take(), &changes) {
             let line = peek_idx
                 .and_then(|i| c.hunks.get(i))
                 .map_or(self.cursor.0, |h| h.start);
@@ -1847,19 +2068,21 @@ impl ForgeApp {
             if let Some(bar) = conflict_bar(ui, found_conflicts.len(), &colors) {
                 match bar {
                     ConflictBarAction::AcceptAll(how) => {
-                        let doc = &mut self.documents[self.active];
+                        let doc = &mut self.documents[doc_idx];
                         let resolved = conflicts::resolve_all(doc.text(), how);
                         doc.set_text(&resolved);
                     }
                     ConflictBarAction::Next => {
-                        let line = self.cursor.0;
+                        let line = if focused { self.cursor.0 } else { 0 };
                         let next = found_conflicts
                             .iter()
                             .find(|c| c.start + 1 > line)
                             .or(found_conflicts.first());
+                        self.focus_group(gi);
                         self.jump_to_line = next.map(|c| c.start + 1);
                     }
                     ConflictBarAction::MarkResolved => {
+                        self.focus_group(gi);
                         self.save_active();
                         if let Some(r) = &rel {
                             self.source_control.stage(vec![r.clone()]);
@@ -1884,25 +2107,33 @@ impl ForgeApp {
 
         let problems = path
             .as_deref()
-            .map(|p| self.lsp.problems(p, self.documents[self.active].text()))
+            .map(|p| self.lsp.problems(p, self.documents[doc_idx].text()))
             .unwrap_or_default();
         let can_define = path
             .as_deref()
             .is_some_and(|p| self.lsp.supports(p, Feature::Definition));
+        let fold_ranges = self.fold_ranges_for(doc_idx);
         let mut lsp_frame = EditorFrame::default();
 
-        let doc = &mut self.documents[self.active];
-        let extension = doc.extension().to_owned();
-        let highlighter = &mut self.highlighter;
+        // Move the cursor for "go to change / conflict".
+        if focused && let Some(line) = self.jump_to_line.take() {
+            let doc = &self.documents[doc_idx];
+            let at = doc.char_index(line, 1);
+            let sel = crate::editor::selection::Selections::single(
+                crate::editor::selection::Cursor::caret(at),
+            );
+            let g = &mut self.groups[gi];
+            if let Some(view) = g.tabs.get_mut(g.active) {
+                view.set_selections(&doc.buffer, sel, Reveal::Center);
+            }
+        }
+
         let font = TextStyle::Monospace.resolve(ui.style());
         let digit_width = ui.fonts_mut(|f| f.glyph_width(&font, '0'));
         let line_numbers = self.settings.line_numbers;
         let word_wrap = self.settings.word_wrap;
-        let gutter_width = gutter::width(doc.line_count(), digit_width, line_numbers);
-        let current_line = self.cursor.0;
-        let mut scroll_to = self.scroll_to.take();
-        let reveal = self.reveal.take();
-        let matches: &[Match] = if self.find.open {
+        let current_line = if focused { self.cursor.0 } else { 0 };
+        let matches: &[Match] = if focused && self.find.open {
             &self.find.matches
         } else {
             &[]
@@ -1912,48 +2143,21 @@ impl ForgeApp {
         let visuals = ui.visuals();
         let background = visuals.text_edit_bg_color();
         let accent = colors.accent.0;
+        let selection_color = visuals.selection.bg_fill;
         let hl = HighlightColors {
             find: accent.gamma_multiply(0.25),
             find_current: accent.gamma_multiply(0.55),
             bracket_fill: visuals.selection.bg_fill.gamma_multiply(0.35),
             bracket_stroke: Stroke::new(1.0, visuals.weak_text_color()),
         };
-
-        // Move the cursor for "go to change / conflict".
-        if let Some(line) = self.jump_to_line.take() {
-            let mut state = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
-            let idx = scm::line_start_char(doc.text(), line);
-            state
-                .cursor
-                .set_char_range(Some(egui::text::CCursorRange::one(CCursor::new(idx))));
-            state.store(ui.ctx(), id);
-            scroll_to = Some(idx);
-        }
-
-        // Semantic highlighting and inlay hints from the language server.
-        let mut views = path.as_ref().and_then(|p| self.language.views.get_mut(p));
-        let hint_color = self.settings.inlay_hints.then_some(colors.text_muted.0);
-        let hint_fill = colors.text_muted.0.gamma_multiply(0.14);
-
-        let mut peek_anchor = None;
         let editor_rect = ui.available_rect_before_wrap();
-        // The editor fills the whole central panel, so draw it without the default
-        // `TextEdit` frame: that frame outlines the widget on hover and, since the
-        // editor keeps focus, permanently in the selection stroke color. The
-        // background is painted separately, underneath the match highlights.
-        let frame = egui::Frame::NONE.inner_margin(egui::Margin {
-            left: gutter_width as i8,
-            right: 4,
-            top: 2,
-            bottom: 2,
-        });
-
+        ui.painter().rect_filled(editor_rect, 0.0, background);
         // The minimap takes the right edge, unless the editor is too narrow.
         let minimap_rect = (self.settings.minimap
             && editor_rect.width() > crate::editor::minimap::WIDTH * 4.0)
             .then(|| {
                 Rect::from_min_max(
-                    pos2(
+                    egui::pos2(
                         editor_rect.right() - crate::editor::minimap::WIDTH,
                         editor_rect.top(),
                     ),
@@ -1961,229 +2165,233 @@ impl ForgeApp {
                 )
             });
         let text_rect = match minimap_rect {
-            Some(m) => Rect::from_min_max(editor_rect.min, pos2(m.left(), editor_rect.bottom())),
+            Some(m) => {
+                Rect::from_min_max(editor_rect.min, egui::pos2(m.left(), editor_rect.bottom()))
+            }
             None => editor_rect,
         };
-        let mut area = egui::ScrollArea::both()
-            .id_salt("editor_scroll")
-            .auto_shrink(false);
-        if let Some(y) = self.minimap_scroll.take() {
-            area = area.vertical_scroll_offset(y);
+
+        // Semantic highlighting and inlay hints from the language server.
+        let hint_color = self.settings.inlay_hints.then_some(colors.text_muted.0);
+        let hint_fill = colors.text_muted.0.gamma_multiply(0.14);
+        if let Some(p) = &path
+            && let Some(v) = self.language.views.get_mut(p)
+        {
+            v.prepare(
+                ui,
+                self.documents[doc_idx].text(),
+                &mut self.highlighter,
+                &font,
+                hint_color,
+            );
         }
-        let scroll = ui
-            .scope_builder(egui::UiBuilder::new().max_rect(text_rect), |ui| {
-                area.show(ui, |ui| {
-                    ui.horizontal_top(|ui| {
-                        ui.spacing_mut().item_spacing.x = 0.0;
-                        let blame_x = blame.as_ref().map(|_| {
-                            let (r, _) = ui.allocate_exact_size(
-                                egui::vec2(scm::BLAME_WIDTH, 1.0),
-                                egui::Sense::hover(),
-                            );
-                            r.x_range()
-                        });
-                        let underlay = ui.painter().add(Shape::Noop);
-                        // Wrapping lays the text out to the visible width; otherwise
-                        // long lines extend and the area scrolls sideways.
-                        let desired_width = if word_wrap {
-                            ui.available_width()
-                        } else {
-                            f32::INFINITY
-                        };
-                        let mut layouter =
-                            |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
-                                let text = text.as_str();
-                                let mut job = highlighter.highlight(text, &extension, font.clone());
-                                if let Some(v) = views.as_deref_mut() {
-                                    let overlay =
-                                        v.overlay(ui, text, highlighter, &font, hint_color);
-                                    decorate::apply(&mut job, overlay);
-                                }
-                                job.wrap.max_width = wrap_width;
-                                ui.painter().layout_job(job)
-                            };
-                        let output = egui::TextEdit::multiline(&mut doc.buffer)
-                            .id(id)
-                            .code_editor()
-                            .lock_focus(true)
-                            .desired_width(desired_width)
-                            .desired_rows(40)
-                            .frame(frame)
-                            .layouter(&mut layouter)
-                            .show(ui);
+        let views = path.as_ref().and_then(|p| self.language.views.get(p));
 
-                        let galley = &output.galley;
-                        let offset = output.galley_pos.to_vec2();
-                        let mut shapes = vec![Shape::rect_filled(
-                            output.response.response.rect,
-                            0.0,
-                            background,
-                        )];
+        let doc = &mut self.documents[doc_idx];
+        let language_key = doc.language_key();
+        let extension = doc.extension().to_owned();
+        let unit = doc.indent_unit();
+        let gutter_width = gutter::width(doc.line_count(), digit_width, line_numbers);
+        let g = &mut self.groups[gi];
+        let Some(view) = g.tabs.get_mut(g.active) else {
+            return;
+        };
+        let config = EditorConfig {
+            font: font.clone(),
+            word_wrap,
+            gutter_width,
+            blame_width: if blame.is_some() {
+                scm::BLAME_WIDTH
+            } else {
+                0.0
+            },
+            extension: &extension,
+            quotes: ops::auto_close_quotes(&language_key),
+            language: &language_key,
+            indent_unit: &unit,
+            folding: match &fold_ranges {
+                Some(r) => FoldSource::Ranges(r),
+                None => FoldSource::Indent,
+            },
+            selection_color,
+            muted_color: colors.text_muted.0,
+            decorations: views.and_then(|v| v.decorations()),
+        };
+        let mut peek_anchor = None;
+        let highlighter = &self.highlighter;
+        let mut text_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(text_rect)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        let output = EditorWidget {
+            doc,
+            view,
+            highlighter,
+            config,
+        }
+        .show(&mut text_ui, |ui, layout, doc| {
+            let mut shapes = Vec::new();
+            // Find matches, only those on screen.
+            let visible = layout.visible_chars.clone();
+            let first = matches.partition_point(|m| m.chars.end < visible.start);
+            for (i, m) in matches.iter().enumerate().skip(first) {
+                if m.chars.start > visible.end {
+                    break;
+                }
+                let fill = if Some(i) == current_match {
+                    hl.find_current
+                } else {
+                    hl.find
+                };
+                for r in layout.range_rects(m.chars.clone()) {
+                    shapes.push(Shape::rect_filled(r, 2.0, fill));
+                }
+            }
+            ui.painter()
+                .with_clip_rect(layout.text_clip)
+                .set(layout.underlay, Shape::Vec(shapes));
+            if let Some(v) = views {
+                views::paint_hints(ui, layout, v.placed_hints(), hint_fill);
+            }
+            language::paint_problems(ui, layout, &problems, &colors);
 
-                        // Find matches, only those on screen.
-                        let visible = visible_chars(galley, ui.clip_rect().translate(-offset));
-                        let first = matches.partition_point(|m| m.chars.end < visible.start);
-                        for (i, m) in matches.iter().enumerate().skip(first) {
-                            if m.chars.start > visible.end {
-                                break;
-                            }
-                            let fill = if Some(i) == current_match {
-                                hl.find_current
-                            } else {
-                                hl.find
-                            };
-                            for r in range_rects(galley, m.chars.clone()) {
-                                shapes.push(Shape::rect_filled(r.translate(offset), 2.0, fill));
-                            }
-                        }
-
-                        // Matching bracket pair around the caret.
-                        if let Some(range) = output.cursor_range
-                            && range.is_empty()
-                            && output.response.response.has_focus()
-                            && let Some((a, b)) =
-                                ops::matching_bracket(doc.text(), range.primary.index.into())
-                        {
-                            for c in [a, b] {
-                                let r = range_rects(galley, c..c + 1)[0].translate(offset);
-                                shapes.push(Shape::rect_filled(r, 2.0, hl.bracket_fill));
-                                shapes.push(Shape::rect_stroke(
-                                    r,
-                                    2.0,
-                                    hl.bracket_stroke,
-                                    egui::StrokeKind::Inside,
-                                ));
-                            }
-                        }
-                        ui.painter().set(underlay, Shape::Vec(shapes));
-                        if let Some(v) = views.as_deref() {
-                            views::paint_hints(ui, &output, v.placed_hints(), &visible, hint_fill);
-                        }
-                        language::paint_problems(ui, &output, &problems, &visible, &colors);
-                        let response = &output.response.response;
-
-                        // What the language features need: the symbol under the
-                        // pointer, the caret, and what was typed.
-                        let pointer = ui
-                            .input(|i| i.pointer.hover_pos())
-                            .filter(|_| response.contains_pointer())
-                            .and_then(|p| language::char_at(&output, p));
-                        if let Some((at, _)) = pointer
-                            && can_define
-                            && ui.input(|i| i.modifiers.command)
-                            && doc
-                                .text()
-                                .chars()
-                                .nth(at)
-                                .is_some_and(crate::lsp::text::is_word_char)
-                            && let Some(word) = crate::lsp::text::word_at(doc.text(), at)
-                        {
-                            language::underline(ui, &output, word, colors.link.0);
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                            if ui.input(|i| i.pointer.primary_clicked()) {
-                                lsp_frame.definition_at = Some(at);
-                            }
-                        }
-                        lsp_frame.pointer = pointer;
-                        if let Some(range) = output.cursor_range {
-                            let c: usize = range.primary.index.into();
-                            let r = galley.pos_from_cursor(CCursor::new(c)).translate(offset);
-                            lsp_frame.caret_rect = Some(r);
-                            if response.has_focus() {
-                                lsp_frame.caret = Some((c, r));
-                            }
-                        }
-                        if response.changed() {
-                            lsp_frame.typed = ui.input(|i| {
-                                i.events.iter().rev().find_map(|e| match e {
-                                    egui::Event::Text(t) => t.chars().last(),
-                                    _ => None,
-                                })
-                            });
-                        }
-
-                        gutter::paint(
-                            ui,
-                            &output,
-                            current_line,
-                            &font,
-                            line_numbers,
-                            changes.as_ref().map(|c| (c, &mark_colors)),
-                        );
-                        if !found_conflicts.is_empty()
-                            && let Some((c, how)) =
-                                scm::paint_conflicts(ui, &output, &found_conflicts, &colors)
-                        {
-                            action = Some(EditorAction::Resolve(c, how));
-                        }
-                        if let (Some(x), Some(b)) = (blame_x, &blame)
-                            && let Some(hash) = scm::paint_blame(ui, x, &output, b, &colors)
-                        {
-                            action = Some(EditorAction::OpenCommit(hash));
-                        }
-                        // Clicking a change marker opens the peek.
-                        if let Some(c) = &changes {
-                            let hover = ui
-                                .input(|i| i.pointer.hover_pos())
-                                .and_then(|p| gutter::marker_hit(&output, p))
-                                .and_then(|l| c.hunk_at(l));
-                            if hover.is_some() {
-                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                            }
-                            if let Some(i) = hover
-                                && ui.input(|i| i.pointer.primary_clicked())
-                            {
-                                action = Some(if peek_idx == Some(i) {
-                                    EditorAction::ClosePeek
-                                } else {
-                                    EditorAction::GoToChange(i)
-                                });
-                            }
-                            if let Some(h) = peek_idx.and_then(|i| c.hunks.get(i)) {
-                                let last = h.start + h.len.max(1) - 1;
-                                peek_anchor = gutter::line_rect(&output, last);
-                            }
-                        }
-                        if let Some(c) = scroll_to {
-                            let r = galley.pos_from_cursor(CCursor::new(c)).translate(offset);
-                            ui.scroll_to_rect(
-                                r.expand(digit_width * 4.0),
-                                Some(egui::Align::Center),
-                            );
-                        } else if let Some(c) = reveal {
-                            let r = galley.pos_from_cursor(CCursor::new(c)).translate(offset);
-                            ui.scroll_to_rect(r.expand(digit_width * 2.0), None);
-                        }
-                        output
-                    })
-                    .inner
-                })
-            })
-            .inner;
-        let mut output = scroll.inner;
-        if let Some(rect) = minimap_rect {
-            let view = crate::editor::minimap::Viewport {
-                offset: scroll.state.clamped_offset().y,
-                height: scroll.inner_rect.height(),
-                content_height: scroll.content_size.y,
-            };
-            if let Some(y) = self
-                .minimap
-                .show(ui, rect, &output.galley, digit_width, &view)
+            // What the language features need: the symbol under the
+            // pointer and what was clicked.
+            let pointer = ui
+                .input(|i| i.pointer.hover_pos())
+                .filter(|_| ui.rect_contains_pointer(layout.text_clip))
+                .and_then(|p| layout.char_at(p));
+            if let Some((at, _)) = pointer
+                && can_define
+                && ui.input(|i| i.modifiers.command)
+                && doc
+                    .buffer
+                    .char_at(at)
+                    .is_some_and(crate::lsp::text::is_word_char)
+                && let Some(word) = crate::lsp::text::word_at(doc.text(), at)
             {
-                self.minimap_scroll = Some(y);
-                ui.ctx().request_repaint();
+                language::underline(ui, layout, word, colors.link.0);
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                if ui.input(|i| i.pointer.primary_clicked()) {
+                    lsp_frame.definition_at = Some(at);
+                }
+            }
+            lsp_frame.pointer = pointer;
+
+            gutter::paint(
+                ui,
+                layout,
+                current_line,
+                &font,
+                line_numbers,
+                changes.as_ref().map(|c| (c, &mark_colors)),
+            );
+            if !found_conflicts.is_empty()
+                && let Some((c, how)) = scm::paint_conflicts(ui, layout, &found_conflicts, &colors)
+            {
+                action = Some(EditorAction::Resolve(c, how));
+            }
+            if let (Some(x), Some(b)) = (layout.blame, &blame)
+                && let Some(hash) = scm::paint_blame(ui, x, layout, b, &colors)
+            {
+                action = Some(EditorAction::OpenCommit(hash));
+            }
+            // Clicking a change marker opens the peek.
+            if let Some(c) = &changes {
+                let hover = ui
+                    .input(|i| i.pointer.hover_pos())
+                    .and_then(|p| gutter::marker_hit(layout, p))
+                    .and_then(|l| c.hunk_at(l));
+                if hover.is_some() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if let Some(i) = hover
+                    && ui.input(|i| i.pointer.primary_clicked())
+                {
+                    action = Some(if peek_idx == Some(i) {
+                        EditorAction::ClosePeek
+                    } else {
+                        EditorAction::GoToChange(i)
+                    });
+                }
+                if let Some(h) = peek_idx.and_then(|i| c.hunks.get(i)) {
+                    let last = h.start + h.len.max(1) - 1;
+                    peek_anchor = gutter::line_rect(layout, last);
+                }
+            }
+            layout.text_clip.left()
+        });
+        let text_left = output.inner;
+        ui.allocate_rect(editor_rect, egui::Sense::hover());
+
+        // The minimap, built from the rows of this view.
+        if let Some(rect) = minimap_rect {
+            let doc = &self.documents[doc_idx];
+            let g = &mut self.groups[gi];
+            if let Some(view) = g.tabs.get_mut(g.active) {
+                let wrap = view.wrap_cols();
+                let map = view.display_map(&doc.buffer, wrap).clone();
+                let scroll = output.scroll;
+                let viewport = crate::editor::minimap::Viewport {
+                    offset: scroll.offset,
+                    height: scroll.height,
+                    content_height: scroll.content_height,
+                    row_height: scroll.row_height,
+                    rows: map.total_rows(),
+                };
+                let fg = self.highlighter.foreground();
+                let target = crate::editor::minimap::show(ui, rect, &viewport, |row| {
+                    let (line, r) = map.line_at_row(row);
+                    let text = doc.buffer.line_text(line);
+                    let parts = crate::editor::view::line_rows(&text, wrap);
+                    let Some(part) = parts.get(r) else {
+                        return Vec::new();
+                    };
+                    crate::editor::minimap::line_runs(
+                        &text,
+                        part.clone(),
+                        doc.highlight.spans(line),
+                        fg,
+                    )
+                });
+                if let Some(y) = target {
+                    view.scroll_to = Some(y);
+                    ui.ctx().request_repaint();
+                }
             }
         }
 
-        // Undo history lives in the document's `Buffer` (Ctrl+Z is handled as
-        // a command before the widget sees it), so drop egui's own snapshots,
-        // which copy the whole text.
-        output.state.clear_undoer();
-
-        if let Some(range) = output.cursor_range {
-            self.cursor = doc.line_col(range.primary.index.into());
+        // Matching bracket pair around the caret, drawn over the text's
+        // underlay now that the caret is known.
+        let doc = &self.documents[doc_idx];
+        let Some(view) = self.groups[gi].active_view() else {
+            return;
+        };
+        let primary = view.sel.primary();
+        if output.response.has_focus()
+            && primary.is_empty()
+            && !view.sel.is_multi()
+            && let Some((a, b)) =
+                ops::matching_bracket_in(doc.text(), doc.buffer.rope(), primary.head)
+        {
+            let painter = ui.painter().with_clip_rect(output.layout.text_clip);
+            for c in [a, b] {
+                for r in output.layout.range_rects(c..c + 1) {
+                    painter.rect_filled(r, 2.0, hl.bracket_fill);
+                    painter.rect_stroke(r, 2.0, hl.bracket_stroke, egui::StrokeKind::Inside);
+                }
+            }
         }
+        if focused {
+            self.cursor = doc.line_col(primary.head);
+            lsp_frame.caret = output.caret;
+            lsp_frame.caret_rect = output.layout.caret_rect(primary.head);
+            if output.changed {
+                lsp_frame.typed = output.typed;
+            }
+        }
+        let doc = &mut self.documents[doc_idx];
 
         // The change peek popup.
         if let (Some(idx), Some(c), Some(anchor)) = (peek_idx, &changes, peek_anchor) {
@@ -2192,8 +2400,7 @@ impl ForgeApp {
             } else {
                 Ok(())
             };
-            let anchor =
-                egui::Rect::from_min_max(egui::pos2(output.galley_pos.x, anchor.top()), anchor.max);
+            let anchor = egui::Rect::from_min_max(egui::pos2(text_left, anchor.top()), anchor.max);
             if let Some(a) = scm::show_peek(
                 ui.ctx(),
                 anchor,
@@ -2208,6 +2415,11 @@ impl ForgeApp {
             }
         }
 
+        if action.is_some() && !focused {
+            self.group = gi;
+            self.sync_active();
+        }
+        let doc = &mut self.documents[doc_idx];
         match action {
             Some(EditorAction::Revert(h)) => {
                 let reverted = crate::git::line_changes::revert(doc.text(), &h);
@@ -2241,8 +2453,10 @@ impl ForgeApp {
             }
             None => {}
         }
-        lsp_frame.problems = problems;
-        self.after_editor(ui.ctx(), lsp_frame);
+        if focused {
+            lsp_frame.problems = problems;
+            self.after_editor(ui.ctx(), lsp_frame);
+        }
     }
 }
 
@@ -2251,62 +2465,6 @@ struct HighlightColors {
     find_current: egui::Color32,
     bracket_fill: egui::Color32,
     bracket_stroke: Stroke,
-}
-
-/// Range of character indices on rows that intersect `clip` (in galley coordinates).
-fn visible_chars(galley: &Galley, clip: Rect) -> Range<usize> {
-    let mut start = None;
-    let mut chars = 0;
-    for row in &galley.rows {
-        let rect = row.rect();
-        let count: usize = row.char_count_including_newline().into();
-        if rect.bottom() >= clip.top() && start.is_none() {
-            start = Some(chars);
-        }
-        if rect.top() > clip.bottom() {
-            break;
-        }
-        chars += count;
-    }
-    start.unwrap_or(chars)..chars
-}
-
-/// Rectangles (in galley coordinates) covering the characters in `range`, one
-/// per row the range spans.
-fn range_rects(galley: &Galley, range: Range<usize>) -> Vec<Rect> {
-    let a = galley.pos_from_cursor(CCursor::new(range.start));
-    let b = galley.pos_from_cursor(CCursor::new(range.end));
-    let min_width = 4.0;
-    if (a.top() - b.top()).abs() < 0.5 {
-        let right = b.left().max(a.left() + min_width);
-        return vec![Rect::from_min_max(a.min, pos2(right, a.bottom()))];
-    }
-    // Spans rows: from the start to the end of its row, full rows in between,
-    // and the start of the last row up to the end.
-    let mut rects = Vec::new();
-    for row in &galley.rows {
-        let r = row.rect();
-        if r.bottom() <= a.top() || r.top() >= b.bottom() {
-            continue;
-        }
-        let left = if r.top() <= a.top() {
-            a.left()
-        } else {
-            r.left()
-        };
-        let right = if r.bottom() >= b.bottom() {
-            b.left()
-        } else {
-            r.right().max(left + min_width)
-        };
-        if right > left {
-            rects.push(Rect::from_min_max(
-                pos2(left, r.top()),
-                pos2(right, r.bottom()),
-            ));
-        }
-    }
-    rects
 }
 
 /// A small on/off button for search options. Returns true when toggled.
@@ -2465,6 +2623,9 @@ fn tab_close_button(
 impl eframe::App for ForgeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.follow_editor_focus(&ctx);
+        self.sync_active();
+        self.apply_editor_focus(&ctx);
         self.sync_keymap();
         self.intercept_close(&ctx);
         // The dialog is modal; keep shortcuts from acting behind it.
@@ -2541,41 +2702,7 @@ impl eframe::App for ForgeApp {
         let bg = self.highlighter.background();
         egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(ui.style()).fill(bg))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    // Right-to-left so the preview toggle keeps its place at
-                    // the end and the tabs scroll in the space left over.
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        self.markdown_preview_button(ui);
-                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            self.tab_bar(ui);
-                        });
-                    });
-                });
-                ui.separator();
-                match self.active_pane {
-                    Some(i) if i < self.panes.len() => {
-                        let action = self.panes[i].show(ui, &mut self.source_control, &colors);
-                        match action {
-                            Some(PaneAction::OpenFile(rel)) => self.open_repo_file(&rel),
-                            Some(PaneAction::OpenCommit(hash)) => {
-                                let pane = CommitPane::new(hash, &self.source_control);
-                                self.open_pane(Pane::Commit(pane));
-                            }
-                            Some(PaneAction::OpenRebase(base)) => self.open_rebase(base),
-                            Some(PaneAction::Close) => self.close_pane(i),
-                            None => {}
-                        }
-                    }
-                    _ => {
-                        self.markdown_preview_panel(ui);
-                        self.disk_banner(ui);
-                        self.find_bar(ui);
-                        self.breadcrumbs(ui);
-                        self.editor(ui);
-                    }
-                }
-            });
+            .show(ui, |ui| self.editor_area(ui, &colors));
 
         if self.server_browser.open {
             let kinds = self.project_file_kinds();

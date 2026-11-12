@@ -7,11 +7,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use egui::text_edit::TextEditOutput;
 use egui::{Align2, Color32, FontId, Rect, RichText, Sense, Stroke, Ui, UiBuilder, pos2, vec2};
 
 use super::conflicts::{Conflict, Resolution};
 use super::gutter;
+use super::widget::Layout;
 use crate::git::SourceControl;
 use crate::git::blame::{Blame, BlameCommit};
 use crate::git::line_changes::{self, ChangeHunk, LineChanges, Mark};
@@ -177,7 +177,7 @@ fn sc_repaint(sc: &SourceControl) {
 pub fn paint_blame(
     ui: &mut Ui,
     x: egui::Rangef,
-    output: &TextEditOutput,
+    layout: &Layout,
     blame: &Blame,
     colors: &UiColors,
 ) -> Option<String> {
@@ -195,7 +195,7 @@ pub fn paint_blame(
         ],
         Stroke::new(1.0, colors.border.0),
     );
-    for (line, starts, rect) in gutter::rows(output) {
+    for (line, starts, rect) in gutter::rows(layout) {
         if !starts {
             continue;
         }
@@ -290,17 +290,17 @@ pub fn paint_blame(
 /// Tints conflict blocks and puts Accept buttons on each `<<<<<<<` line.
 pub fn paint_conflicts(
     ui: &mut Ui,
-    output: &TextEditOutput,
+    layout: &Layout,
     conflicts: &[Conflict],
     colors: &UiColors,
 ) -> Option<(Conflict, Resolution)> {
     let clip = ui.clip_rect();
     let mut chosen = None;
-    let rects: Vec<(usize, Rect)> = gutter::rows(output)
+    let rects: Vec<(usize, Rect)> = gutter::rows(layout)
         .filter(|(_, _, r)| r.bottom() >= clip.top() && r.top() <= clip.bottom())
         .map(|(l, _, r)| (l - 1, r))
         .collect();
-    let frame = output.response.response.rect;
+    let frame = layout.text_clip;
     for c in conflicts {
         let markers = [Some(c.start), c.base, Some(c.mid), Some(c.end)];
         for (line, r) in &rects {
@@ -316,8 +316,8 @@ pub fn paint_conflicts(
             } else {
                 continue;
             };
-            let row = Rect::from_x_y_ranges(output.galley_pos.x..=frame.right(), r.y_range());
-            ui.painter().rect_filled(row, 0, fill);
+            let row = Rect::from_x_y_ranges(frame.x_range(), r.y_range());
+            ui.painter().with_clip_rect(frame).rect_filled(row, 0, fill);
         }
         let Some((_, r)) = rects.iter().find(|(l, _)| *l == c.start) else {
             continue;
@@ -511,32 +511,5 @@ pub fn mark_color(mark: Mark, colors: &UiColors) -> Color32 {
         Mark::Added => colors.added.0,
         Mark::Modified => colors.modified.0,
         Mark::DeletedAbove => colors.deleted.0,
-    }
-}
-
-/// Character index of the start of 1-based `line`, for placing the cursor.
-pub fn line_start_char(text: &str, line: usize) -> usize {
-    let mut chars = 0;
-    for (i, l) in text.split('\n').enumerate() {
-        if i + 1 == line {
-            return chars;
-        }
-        chars += l.chars().count() + 1;
-    }
-    text.chars().count()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn line_start_chars() {
-        let t = "ab\nçd\n\nx";
-        assert_eq!(line_start_char(t, 1), 0);
-        assert_eq!(line_start_char(t, 2), 3);
-        assert_eq!(line_start_char(t, 3), 6);
-        assert_eq!(line_start_char(t, 4), 7);
-        assert_eq!(line_start_char(t, 99), 8);
     }
 }

@@ -144,7 +144,7 @@ impl ForgeApp {
         if self.language.signature.is_none() || self.language.completion_open() {
             return;
         }
-        if self.active_pane.is_some() || !self.editor_has_focus(ctx) {
+        if self.pane_shown() || !self.editor_has_focus(ctx) {
             self.language.signature = None;
             return;
         }

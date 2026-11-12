@@ -36,6 +36,51 @@ impl Overlay {
     }
 }
 
+/// Restyling and hint gaps for a whole document, in char offsets, so the
+/// editor can cut out the part each row on screen needs.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Decorations {
+    /// Char ranges to restyle, sorted and not overlapping.
+    pub styles: Vec<(Range<usize>, StyleOverride)>,
+    /// Extra space in front of the char at a char offset; sorted, unique.
+    pub gaps: Vec<(usize, f32)>,
+}
+
+impl Decorations {
+    /// The overlay for one row: `text` holds the chars `chars` of the
+    /// document. Gaps at the row's end belong to the next row.
+    pub fn row_overlay(&self, chars: Range<usize>, text: &str) -> Overlay {
+        let mut overlay = Overlay::default();
+        if chars.is_empty() {
+            return overlay;
+        }
+        // Byte offset (in `text`) of each char boundary of the row.
+        let bytes: Vec<usize> = text
+            .char_indices()
+            .map(|(b, _)| b)
+            .chain([text.len()])
+            .collect();
+        let byte_of = |c: usize| bytes[(c - chars.start).min(bytes.len() - 1)];
+        let first = self.styles.partition_point(|(r, _)| r.end <= chars.start);
+        for (r, style) in &self.styles[first..] {
+            if r.start >= chars.end {
+                break;
+            }
+            let a = byte_of(r.start.max(chars.start));
+            let b = byte_of(r.end.min(chars.end));
+            overlay.styles.push((a..b, *style));
+        }
+        let first = self.gaps.partition_point(|&(at, _)| at < chars.start);
+        for &(at, width) in &self.gaps[first..] {
+            if at >= chars.end {
+                break;
+            }
+            overlay.gaps.push((byte_of(at), width));
+        }
+        overlay
+    }
+}
+
 /// Splits `job`'s sections where the overlay starts or stops, restyles the
 /// pieces under a style and widens the ones after a gap.
 pub fn apply(job: &mut LayoutJob, overlay: &Overlay) {
@@ -351,6 +396,28 @@ mod tests {
         let before = j.clone();
         apply(&mut j, &Overlay::default());
         assert_eq!(j, before);
+    }
+
+    #[test]
+    fn cuts_document_decorations_per_row() {
+        let style = color(Color32::RED);
+        let d = Decorations {
+            // `é` is two bytes; the second style crosses into the next row.
+            styles: vec![(1..3, style), (5..9, style)],
+            gaps: vec![(2, 10.0), (6, 20.0), (8, 5.0)],
+        };
+        // Row "aébcde" holds chars 0..6.
+        let row = d.row_overlay(0..6, "aébcde");
+        assert_eq!(row.styles, vec![(1..4, style), (6..7, style)]);
+        assert_eq!(
+            row.gaps,
+            vec![(3, 10.0)],
+            "a gap at the row's end goes to the next row"
+        );
+        // The next row, chars 6..9 = "fgh".
+        let row = d.row_overlay(6..9, "fgh");
+        assert_eq!(row.styles, vec![(0..3, style)]);
+        assert_eq!(row.gaps, vec![(0, 20.0), (2, 5.0)]);
     }
 
     #[test]

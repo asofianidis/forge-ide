@@ -12,20 +12,19 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
-use egui::text_edit::TextEditOutput;
-use egui::{Align2, Color32, Key, Modifiers, Pos2, Rect, Shape, Stroke, TextStyle, pos2, vec2};
+use egui::text::{LayoutJob, TextFormat};
+use egui::{Align2, Color32, Key, Modifiers, Rect, Shape, Stroke, TextStyle, pos2, vec2};
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionTextEdit, Documentation, InsertTextFormat,
 };
 
 use super::ForgeApp;
 use super::code_actions::{CodeActionMenu, CodeActionRequest};
-use super::editing::editor_id;
 use super::signature::SignaturePopup;
 use super::symbols::{SymbolItem, WorkspaceSearch};
 use super::views::DocViews;
 use crate::editor::ops::Selection;
+use crate::editor::widget::Layout;
 use crate::fuzzy;
 use crate::lsp::text::{self, CharEdit, Encoding, LineIndex};
 use crate::lsp::{
@@ -301,29 +300,24 @@ impl ForgeApp {
         Some((path, self.selection(ctx).end))
     }
 
-    /// Applies `edits` to a document, keeping its caret and selection on the
-    /// same text.
-    pub(super) fn edit_document(&mut self, ctx: &egui::Context, idx: usize, edits: &[CharEdit]) {
+    /// Applies `edits` to a document. Every view of it follows the edits
+    /// (through the buffer's change log), keeping cursors on the same text.
+    pub(super) fn edit_document(&mut self, _ctx: &egui::Context, idx: usize, edits: &[CharEdit]) {
         let Some(doc) = self.documents.get_mut(idx) else {
             return;
         };
         doc.apply_edits(edits.iter().map(|e| (e.range.clone(), e.text.as_str())));
-        let id = editor_id(doc);
-        if let Some(mut state) = egui::TextEdit::load_state(ctx, id)
-            && let Some(range) = state.cursor.char_range()
-        {
-            let primary = text::map_offset(range.primary.index.into(), edits);
-            let secondary = text::map_offset(range.secondary.index.into(), edits);
-            state.cursor.set_char_range(Some(CCursorRange {
-                primary: CCursor::new(primary),
-                secondary: CCursor::new(secondary),
-                h_pos: None,
-            }));
-            state.store(ctx, id);
-            if idx == self.active {
-                self.cursor = doc.line_col(primary);
-            }
+        if idx == self.active {
+            let head = self.selections().primary().head;
+            self.cursor = self.documents[idx].line_col(head);
         }
+    }
+
+    /// Fold ranges the language server reported for document `idx`, if it
+    /// supports folding (otherwise the editor folds by indentation).
+    pub(super) fn fold_ranges_for(&self, idx: usize) -> Option<Vec<(usize, usize)>> {
+        let doc = self.documents.get(idx)?;
+        self.lsp.folding_ranges(doc.path.as_deref()?)
     }
 
     // ---- editor hooks ----------------------------------------------------
@@ -334,7 +328,7 @@ impl ForgeApp {
         if self.language.completion.is_none() || self.language.code_actions.is_some() {
             return;
         }
-        if self.active_pane.is_some() || !self.editor_has_focus(ctx) {
+        if self.pane_shown() || !self.editor_has_focus(ctx) {
             self.language.completion = None;
             return;
         }
@@ -1088,8 +1082,10 @@ impl ForgeApp {
         if dialog.select_all {
             dialog.select_all = false;
             if let Some(mut state) = egui::TextEdit::load_state(ctx, input_id) {
-                let all =
-                    CCursorRange::two(CCursor::new(0), CCursor::new(dialog.input.chars().count()));
+                let all = egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    egui::text::CCursor::new(dialog.input.chars().count()),
+                );
                 state.cursor.set_char_range(Some(all));
                 state.store(ctx, input_id);
             }
@@ -1401,13 +1397,11 @@ fn problem_row(ui: &mut egui::Ui, p: &Problem, colors: &UiColors) {
 /// info, a short dotted line for hints.
 pub(super) fn paint_problems(
     ui: &egui::Ui,
-    output: &TextEditOutput,
+    layout: &Layout,
     problems: &[Problem],
-    visible: &Range<usize>,
     colors: &UiColors,
 ) {
-    let offset = output.galley_pos.to_vec2();
-    let galley = &output.galley;
+    let visible = &layout.visible_chars;
     let mut shapes = Vec::new();
     // Least severe first, so errors are drawn on top.
     for p in problems.iter().rev() {
@@ -1420,8 +1414,7 @@ pub(super) fn paint_problems(
         } else {
             p.range.clone()
         };
-        for r in super::range_rects(galley, range) {
-            let r = r.translate(offset);
+        for r in layout.range_rects(range) {
             let y = r.bottom() - 1.0;
             if p.severity == Severity::Hint {
                 let end = r.left() + (r.width()).min(12.0);
@@ -1445,40 +1438,14 @@ pub(super) fn paint_problems(
             }
         }
     }
-    ui.painter().extend(shapes);
-}
-
-/// The char under `pos` (screen coordinates) and its screen rect, if the
-/// pointer is over a character rather than empty space.
-pub(super) fn char_at(output: &TextEditOutput, pos: Pos2) -> Option<(usize, Rect)> {
-    let offset = output.galley_pos.to_vec2();
-    let local = pos - offset;
-    let galley = &output.galley;
-    let nearest: usize = galley.cursor_from_pos(local.to_vec2()).index.into();
-    [nearest.saturating_sub(1), nearest]
-        .into_iter()
-        .find_map(|c| {
-            let a = galley.pos_from_cursor(CCursor::new(c));
-            let b = galley.pos_from_cursor(CCursor::new(c + 1));
-            if (a.top() - b.top()).abs() > 0.5 || b.left() <= a.left() {
-                return None;
-            }
-            let r = Rect::from_min_max(a.min, pos2(b.left(), a.bottom()));
-            r.contains(local).then(|| (c, r.translate(offset)))
-        })
+    ui.painter().with_clip_rect(layout.text_clip).extend(shapes);
 }
 
 /// Underlines `range` like a link (for Cmd/Ctrl+hover over a symbol).
-pub(super) fn underline(
-    ui: &egui::Ui,
-    output: &TextEditOutput,
-    range: Range<usize>,
-    color: Color32,
-) {
-    let offset = output.galley_pos.to_vec2();
-    for r in super::range_rects(&output.galley, range) {
-        let r = r.translate(offset);
-        ui.painter().line_segment(
+pub(super) fn underline(ui: &egui::Ui, layout: &Layout, range: Range<usize>, color: Color32) {
+    let painter = ui.painter().with_clip_rect(layout.text_clip);
+    for r in layout.range_rects(range) {
+        painter.line_segment(
             [
                 pos2(r.left(), r.bottom() - 1.0),
                 pos2(r.right(), r.bottom() - 1.0),

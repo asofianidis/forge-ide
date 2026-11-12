@@ -15,12 +15,26 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
   git status follow changes made by other programs as they happen. Unmodified open files reload;
   files with unsaved edits show a banner to reload or keep your version
 - Tabbed editing with unsaved-change indicators
+- A custom editor widget that lays out and paints only the rows on screen (and, for very long
+  lines, only their visible part), reading them from the rope. Syntax highlighting is computed
+  lazily for the lines shown and follows edits incrementally, so opening, scrolling and typing
+  in large files stay fast
 - Rope-backed buffers with grouped undo/redo history. Every edit is undoable, including line
   commands, replace, hunk revert, conflict resolution, language-server edits and reloads from
-  disk; undoing back to the saved state clears the unsaved marker.
-  *Limitation:* egui's `TextEdit` needs the text as one contiguous string, so the buffer keeps a
-  `String` mirror for rendering and layout is still O(file size). Truly large files need a custom
-  editor widget that lays out only the visible lines; the buffer is the model for that.
+  disk; undoing back to the saved state clears the unsaved marker and restores the cursors.
+  (Find, git and language servers still read a `String` mirror of the text.)
+- **Multiple cursors**: Alt+click adds a cursor (Alt+click on one removes it), Alt+Shift+drag
+  selects a column, Cmd/Ctrl+Alt+Up/Down adds a cursor above/below, Cmd/Ctrl+D adds the next
+  occurrence of the selection, Cmd/Ctrl+Shift+L selects every occurrence, Shift+Alt+I puts a
+  cursor at the end of each selected line, Escape goes back to one. Typing, typing aids,
+  clipboard (one line per cursor) and line commands work at every cursor
+- **Code folding** by indentation, or by the language server's folding ranges where it has
+  them: click the chevrons in the gutter or the `⋯` after a folded line, or use Fold / Unfold
+  (Cmd/Ctrl+Alt+[ / ]) and Fold All / Unfold All
+- **Split editors** (Cmd/Ctrl+\\): up to three editor groups side by side, each with its own tabs.
+  The same file can be open in several groups, each view with its own cursors, folds and
+  scroll position. Drag the divider to resize; right-click a tab to split it or move it to the
+  next group; Cmd/Ctrl+1/2/3 focuses a group. Diff, commit and PR tabs open in the first group
 - Session restore: each folder reopens with the tabs, selected tab and cursor positions it had
   last time. Starting Forge without a folder argument opens the last folder you used
   (`forge-ide .` opens the current directory)
@@ -347,6 +361,13 @@ cargo run --release -- path/to/project
 | Indent / outdent       | Ctrl+] / Ctrl+[ (or Tab / Shift+Tab)    |
 | Move line up / down    | Alt+Up / Alt+Down                       |
 | Duplicate line         | Shift+Alt+Down                          |
+| Add cursor above / below | Ctrl+Alt+Up / Ctrl+Alt+Down           |
+| Add next occurrence    | Ctrl+D                                  |
+| Select all occurrences | Ctrl+Shift+L                            |
+| Cursors at line ends   | Shift+Alt+I                             |
+| Fold / unfold          | Ctrl+Alt+[ / Ctrl+Alt+]                 |
+| Split editor           | Ctrl+\\                                 |
+| Focus editor group 1–3 | Ctrl+1 / Ctrl+2 / Ctrl+3                |
 | Go to definition       | F12 (or Ctrl+click)                     |
 | Find all references    | Shift+F12                               |
 | Rename symbol          | F2                                      |
@@ -369,7 +390,8 @@ src/
 ├── main.rs              # entry point, window setup
 ├── app.rs               # application state and UI layout
 ├── app/
-│   ├── editing.rs       # line-editing commands, selection helpers, Go to Line
+│   ├── editing.rs       # line, multi-cursor and fold commands, selection helpers, Go to Line
+│   ├── groups.rs        # editor groups (split editors) and their tabs
 │   ├── explorer.rs      # file tree, its new / rename / delete / reveal actions, watcher events
 │   ├── language.rs      # diagnostics, hover, completion, definition, rename, formatting UI
 │   ├── find_bar.rs      # find / replace bar
@@ -431,13 +453,18 @@ src/
 │   ├── text.rs          # positions/encodings, URIs, snippets, applying edits
 │   └── browser.rs       # "Language Servers" window
 └── editor/
-    ├── buffer.rs        # rope-backed text buffer, undo/redo history
+    ├── buffer.rs        # rope-backed text buffer, undo/redo history, change log
     ├── document.rs      # open file buffer, load/save, dirty tracking
+    ├── widget.rs        # the editor widget: lays out visible rows, input, painting
+    ├── view.rs          # per-view state: cursors, folds, wrapping, line ↔ row mapping
+    ├── selection.rs     # multiple cursors and selections
+    ├── multi.rs         # running edits at every cursor as one transaction
+    ├── folding.rs       # fold ranges by indentation or from the language server
     ├── find.rs          # in-file find / replace
     ├── ops.rs           # comment, indent, move lines, auto-indent/pairs, brackets
     ├── minimap.rs       # zoomed-out file overview beside the editor
-    ├── gutter.rs        # line-number gutter and change markers
-    ├── highlight.rs     # syntect → egui LayoutJob highlighting
+    ├── gutter.rs        # line-number gutter, fold and change markers
+    ├── highlight.rs     # lazy, incremental syntect highlighting per document
     ├── scm.rs           # change peek, blame column, conflict actions
     └── conflicts.rs     # merge conflict parsing and resolution
 ```
@@ -446,6 +473,10 @@ src/
 
 - [x] Line-number gutter
 - [x] Rope-based buffer for large files, undo/redo history
+- [x] Editor widget that lays out only what's visible
+- [x] Multiple cursors and selections
+- [x] Code folding (indentation and language server)
+- [x] Split editors
 - [x] Find / replace, go to line
 - [x] Project search, quick open
 - [x] Command palette

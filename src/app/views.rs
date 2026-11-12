@@ -2,15 +2,13 @@
 //! file: semantic highlighting, inlay hints and the symbols behind the
 //! breadcrumbs. Results are carried across edits until fresh ones arrive.
 
-use std::ops::Range;
 use std::sync::Arc;
 
-use egui::text::CCursor;
-use egui::text_edit::TextEditOutput;
 use egui::{Color32, FontId, Galley, Rect, pos2, vec2};
 
 use crate::editor::Highlighter;
-use crate::editor::decorate::{Overlay, TextChange};
+use crate::editor::decorate::{Decorations, TextChange};
+use crate::editor::widget::Layout;
 use crate::lsp::features::{DocSymbol, Hint, SemanticSpan};
 
 /// Space around a hint's text inside its pill, and between pills and code.
@@ -33,7 +31,7 @@ pub(super) struct DocViews {
 /// The views turned into layout changes for one text, font and theme.
 struct Prepared {
     key: (u64, u64, FontId, bool),
-    overlay: Overlay,
+    decorations: Decorations,
     hints: Vec<PlacedHint>,
 }
 
@@ -110,16 +108,16 @@ impl DocViews {
         self.symbols.is_some() && self.text == text
     }
 
-    /// Restyling and hint gaps for `text`. Called from the editor's layouter
-    /// with whatever text it is laying out.
-    pub(super) fn overlay(
+    /// Works out the restyling and hint gaps for `text` (see
+    /// [`Self::decorations`]); cheap when nothing changed.
+    pub(super) fn prepare(
         &mut self,
         ui: &egui::Ui,
         text: &str,
         highlighter: &mut Highlighter,
         font: &FontId,
         hints: Option<Color32>,
-    ) -> &Overlay {
+    ) {
         self.rebase(text);
         let key = (
             self.revision,
@@ -127,33 +125,36 @@ impl DocViews {
             font.clone(),
             hints.is_some(),
         );
-        if self.prepared.as_ref().is_none_or(|p| p.key != key) {
-            let mut bytes = ByteCursor::new(&self.text);
-            let mut overlay = Overlay::default();
-            let mut covered = 0;
-            for t in &self.tokens {
-                // Tokens shouldn't overlap; if a server sends some anyway,
-                // the first one wins.
-                if t.range.start < covered {
-                    continue;
-                }
-                covered = t.range.end;
-                if let Some(style) = highlighter.semantic_style(&t.kind, t.modifiers) {
-                    let r = bytes.byte_of(t.range.start)..bytes.byte_of(t.range.end);
-                    overlay.styles.push((r, style));
-                }
-            }
-            let placed = match hints {
-                Some(color) => self.place_hints(ui, font, color, &mut overlay),
-                None => Vec::new(),
-            };
-            self.prepared = Some(Prepared {
-                key,
-                overlay,
-                hints: placed,
-            });
+        if self.prepared.as_ref().is_some_and(|p| p.key == key) {
+            return;
         }
-        &self.prepared.as_ref().expect("prepared above").overlay
+        let mut decorations = Decorations::default();
+        let mut covered = 0;
+        for t in &self.tokens {
+            // Tokens shouldn't overlap; if a server sends some anyway, the
+            // first one wins.
+            if t.range.start < covered {
+                continue;
+            }
+            covered = t.range.end;
+            if let Some(style) = highlighter.semantic_style(&t.kind, t.modifiers) {
+                decorations.styles.push((t.range.clone(), style));
+            }
+        }
+        let placed = match hints {
+            Some(color) => self.place_hints(ui, font, color, &mut decorations),
+            None => Vec::new(),
+        };
+        self.prepared = Some(Prepared {
+            key,
+            decorations,
+            hints: placed,
+        });
+    }
+
+    /// Restyling and hint gaps from the last [`Self::prepare`].
+    pub(super) fn decorations(&self) -> Option<&Decorations> {
+        self.prepared.as_ref().map(|p| &p.decorations)
     }
 
     /// Lays out the hints and makes room for the ones inside a line.
@@ -162,7 +163,7 @@ impl DocViews {
         ui: &egui::Ui,
         font: &FontId,
         color: Color32,
-        overlay: &mut Overlay,
+        decorations: &mut Decorations,
     ) -> Vec<PlacedHint> {
         let hint_font = FontId::new((font.size * 0.9).round(), font.family.clone());
         let mut bytes = ByteCursor::new(&self.text);
@@ -206,13 +207,13 @@ impl DocViews {
                 }
             }
             if !eol {
-                overlay.gaps.push((byte, gap));
+                decorations.gaps.push((at, gap));
             }
         }
         placed
     }
 
-    /// Hints as laid out by the last [`DocViews::overlay`] call.
+    /// Hints as laid out by the last [`Self::prepare`] call.
     pub(super) fn placed_hints(&self) -> &[PlacedHint] {
         self.prepared.as_ref().map_or(&[], |p| &p.hints)
     }
@@ -256,28 +257,28 @@ impl<'a> ByteCursor<'a> {
 }
 
 /// Draws inlay hints as small pills in the gaps made for them (or after the
-/// end of their line).
+/// end of their line), for the rows on screen.
 pub(super) fn paint_hints(
     ui: &egui::Ui,
-    output: &TextEditOutput,
+    layout: &Layout,
     hints: &[PlacedHint],
-    visible: &Range<usize>,
     background: Color32,
 ) {
-    let offset = output.galley_pos.to_vec2();
-    let galley = &output.galley;
-    let left = output.galley_pos.x;
-    let painter = ui.painter();
+    let painter = ui.painter().with_clip_rect(layout.text_clip);
+    let visible = &layout.visible_chars;
     let first = hints.partition_point(|h| h.at < visible.start);
     for h in &hints[first..] {
         if h.at > visible.end {
             break;
         }
-        let pos = galley.pos_from_cursor(CCursor::new(h.at)).translate(offset);
+        // The caret position is after the gap in front of the char.
+        let Some(pos) = layout.caret_rect(h.at) else {
+            continue;
+        };
         let start = if h.eol {
             pos.left()
         } else {
-            (pos.left() - h.gap).max(left)
+            (pos.left() - h.gap).max(layout.text_left)
         };
         let size = h.galley.size();
         let rect = Rect::from_min_size(
@@ -295,6 +296,8 @@ pub(super) fn paint_hints(
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Range;
+
     use super::*;
     use crate::lsp::features::HintKind;
     use lsp_types::SymbolKind;

@@ -142,7 +142,7 @@ impl ForgeApp {
                     .interact_pos()
                     .is_some_and(|p| menu.rect.is_some_and(|r| !r.contains(p)))
         });
-        if menu.doc != doc_id || typed || clicked_outside || self.active_pane.is_some() {
+        if menu.doc != doc_id || typed || clicked_outside || self.pane_shown() {
             self.language.code_actions = None;
         }
     }

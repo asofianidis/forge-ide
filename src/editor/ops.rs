@@ -132,6 +132,7 @@ pub fn line_start(text: &str, line: usize) -> usize {
 }
 
 /// Character index of 1-based (`line`, `column`), clamped to that line.
+#[cfg(test)]
 pub fn line_col_to_char(text: &str, line: usize, column: usize) -> usize {
     let start = line_start(text, line);
     let line_len = text.chars().skip(start).take_while(|&c| c != '\n').count();
@@ -231,6 +232,7 @@ fn leading_whitespace(line: &str) -> usize {
 // ---- operations -----------------------------------------------------------
 
 /// Replaces the selection with `insert`, leaving a caret after it.
+#[cfg(test)]
 pub fn insert(text: &str, sel: Selection, insert: &str) -> Edit {
     let range = char_to_byte(text, sel.start)..char_to_byte(text, sel.end);
     let mut out = String::with_capacity(text.len() + insert.len());
@@ -596,33 +598,29 @@ pub fn newline(text: &str, sel: Selection, unit: &str, extension: &str) -> Edit 
 /// How far bracket matching scans before giving up, in bytes.
 const BRACKET_SCAN_LIMIT: usize = 200_000;
 
+/// The bracket next to the caret and its partner, as character indices
+/// (a test helper over [`matching_bracket_in`]).
+#[cfg(test)]
+pub fn matching_bracket(text: &str, caret: usize) -> Option<(usize, usize)> {
+    matching_bracket_in(text, &ropey::Rope::from_str(text), caret)
+}
+
 /// The bracket next to the caret and its partner, as character indices.
 ///
 /// Looks at the character before the caret first, then the one after it.
-/// Brackets inside strings and comments are not treated specially.
-pub fn matching_bracket(text: &str, caret: usize) -> Option<(usize, usize)> {
-    let byte = char_to_byte(text, caret);
+/// Brackets inside strings and comments are not treated specially. The rope
+/// converts offsets, so this costs the bracket scan only.
+pub fn matching_bracket_in(text: &str, rope: &ropey::Rope, caret: usize) -> Option<(usize, usize)> {
+    let byte = rope.char_to_byte(caret.min(rope.len_chars()));
     let bytes = text.as_bytes();
-    let candidates = [byte.checked_sub(1), Some(byte)];
-    for at in candidates.into_iter().flatten() {
+    for at in [byte.checked_sub(1), Some(byte)].into_iter().flatten() {
         let Some(&b) = bytes.get(at) else { continue };
         let partner = match b {
             b'(' | b'[' | b'{' => scan_forward(bytes, at),
             b')' | b']' | b'}' => scan_backward(bytes, at),
             _ => continue,
         };
-        if let Some(p) = partner {
-            let a = byte_to_char(text, at);
-            // Both brackets are ASCII, so the partner's char index follows from
-            // the char count between them.
-            let b = if p > at {
-                a + text[at..p].chars().count()
-            } else {
-                a - text[p..at].chars().count()
-            };
-            return Some((a, b));
-        }
-        return None;
+        return partner.map(|p| (rope.byte_to_char(at), rope.byte_to_char(p)));
     }
     None
 }

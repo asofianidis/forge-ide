@@ -24,7 +24,7 @@ pub(super) fn is_markdown(doc: &Document) -> bool {
 impl ForgeApp {
     /// Whether the active tab is a document (not a pane) in Markdown.
     pub(super) fn active_is_markdown(&self) -> bool {
-        self.active_pane.is_none() && self.documents.get(self.active).is_some_and(is_markdown)
+        !self.pane_shown() && self.documents.get(self.active).is_some_and(is_markdown)
     }
 
     /// Whether the preview is showing next to the active document.
