@@ -2,10 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
-use egui::text::{CCursor, CCursorRange};
-
 use super::ForgeApp;
-use super::editing::editor_id;
+use crate::editor::selection::{Cursor, Selections};
+use crate::editor::view::Reveal;
 use crate::settings::{OpenFile, Session, Settings};
 
 /// Folder shown in menus, with the home directory abbreviated to `~`.
@@ -45,17 +44,31 @@ impl ForgeApp {
         let folder = &self.workspace.as_ref()?.root.path;
         let mut files = Vec::new();
         let mut active = None;
-        for (i, doc) in self.documents.iter().enumerate() {
+        let pane_shown = self.group == 0 && self.active_pane.is_some();
+        // Tabs left to right across the groups, each file once, with the
+        // cursor of its first view.
+        let mut seen = Vec::new();
+        for view in self.groups.iter().flat_map(|g| &g.tabs) {
+            if seen.contains(&view.doc) {
+                continue;
+            }
+            seen.push(view.doc);
+            let Some(doc) = self.documents.iter().find(|d| d.id == view.doc) else {
+                continue;
+            };
             let Some(path) = doc.path.as_ref().filter(|p| p.starts_with(folder)) else {
                 continue;
             };
-            if i == self.active && self.active_pane.is_none() {
+            if self
+                .documents
+                .get(self.active)
+                .is_some_and(|d| d.id == doc.id)
+                && !pane_shown
+            {
                 active = Some(files.len());
             }
             let (line, column) = if with_cursors {
-                egui::TextEdit::load_state(&self.egui_ctx, editor_id(doc))
-                    .and_then(|s| s.cursor.char_range())
-                    .map_or((1, 1), |r| doc.line_col(r.primary.index.into()))
+                doc.line_col(view.current_selection(&doc.buffer).primary().head)
             } else {
                 (1, 1)
             };
@@ -109,32 +122,33 @@ impl ForgeApp {
                 continue;
             }
             self.open_file(&file.path);
-            if let Some(doc) = self.documents.get(self.active)
+            if let Some((doc, view)) = self.focused_doc_view()
                 && doc.path.as_deref() == Some(file.path.as_path())
             {
                 let idx = doc.char_index(file.line, file.column);
-                let id = editor_id(doc);
-                let mut state = egui::TextEdit::load_state(&self.egui_ctx, id).unwrap_or_default();
-                state
-                    .cursor
-                    .set_char_range(Some(CCursorRange::one(CCursor::new(idx))));
-                state.store(&self.egui_ctx, id);
-                restored.push((self.active, idx, doc.line_col(idx)));
+                view.set_selections(
+                    &doc.buffer,
+                    Selections::single(Cursor::caret(idx)),
+                    Reveal::Center,
+                );
+                restored.push((doc.id, doc.line_col(idx)));
             }
         }
         let selected = session
             .active
             .and_then(|i| session.files.get(i))
             .and_then(|f| {
-                restored
-                    .iter()
-                    .find(|(doc, ..)| self.documents[*doc].path.as_ref() == Some(&f.path))
+                restored.iter().find(|(id, _)| {
+                    self.doc_by_id(*id)
+                        .is_some_and(|i| self.documents[i].path.as_ref() == Some(&f.path))
+                })
             })
             .or(restored.last());
-        if let Some(&(doc, idx, line_col)) = selected {
-            self.active = doc;
+        if let Some(&(id, line_col)) = selected
+            && let Some(idx) = self.doc_by_id(id)
+        {
+            self.show_document(idx);
             self.cursor = line_col;
-            self.scroll_to = Some(idx);
         }
         self.saved_session = Some(session);
         if !restored.is_empty() {

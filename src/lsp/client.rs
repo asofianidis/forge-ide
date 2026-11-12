@@ -377,6 +377,8 @@ fn initialize_params(root: &Path) -> Value {
                 "references": {},
                 "rename": {},
                 "formatting": {},
+                // Whole lines only, so ranges end where the editor's folds do.
+                "foldingRange": { "lineFoldingOnly": true },
             },
         },
     })

@@ -29,6 +29,15 @@ pub enum Command {
     DuplicateLine,
     MoveLineUp,
     MoveLineDown,
+    AddCursorAbove,
+    AddCursorBelow,
+    AddNextOccurrence,
+    SelectAllOccurrences,
+    AddCursorsToLineEnds,
+    Fold,
+    Unfold,
+    FoldAll,
+    UnfoldAll,
     TriggerSuggest,
     RenameSymbol,
     FormatDocument,
@@ -52,6 +61,11 @@ pub enum Command {
     RepositoryHistory,
     ToggleWordWrap,
     ToggleLineNumbers,
+    SplitEditor,
+    MoveTabToNextGroup,
+    FocusFirstGroup,
+    FocusSecondGroup,
+    FocusThirdGroup,
     IncreaseFontSize,
     DecreaseFontSize,
     ResetFontSize,
@@ -110,6 +124,15 @@ impl Command {
         Command::DuplicateLine,
         Command::MoveLineUp,
         Command::MoveLineDown,
+        Command::AddCursorAbove,
+        Command::AddCursorBelow,
+        Command::AddNextOccurrence,
+        Command::SelectAllOccurrences,
+        Command::AddCursorsToLineEnds,
+        Command::Fold,
+        Command::Unfold,
+        Command::FoldAll,
+        Command::UnfoldAll,
         Command::TriggerSuggest,
         Command::RenameSymbol,
         Command::FormatDocument,
@@ -133,6 +156,11 @@ impl Command {
         Command::RepositoryHistory,
         Command::ToggleWordWrap,
         Command::ToggleLineNumbers,
+        Command::SplitEditor,
+        Command::MoveTabToNextGroup,
+        Command::FocusFirstGroup,
+        Command::FocusSecondGroup,
+        Command::FocusThirdGroup,
         Command::IncreaseFontSize,
         Command::DecreaseFontSize,
         Command::ResetFontSize,
@@ -172,6 +200,15 @@ impl Command {
             Command::DuplicateLine => "Duplicate Line",
             Command::MoveLineUp => "Move Line Up",
             Command::MoveLineDown => "Move Line Down",
+            Command::AddCursorAbove => "Add Cursor Above",
+            Command::AddCursorBelow => "Add Cursor Below",
+            Command::AddNextOccurrence => "Add Next Occurrence",
+            Command::SelectAllOccurrences => "Select All Occurrences",
+            Command::AddCursorsToLineEnds => "Add Cursors to Line Ends",
+            Command::Fold => "Fold",
+            Command::Unfold => "Unfold",
+            Command::FoldAll => "Fold All",
+            Command::UnfoldAll => "Unfold All",
             Command::TriggerSuggest => "Trigger Suggest",
             Command::RenameSymbol => "Rename Symbol…",
             Command::FormatDocument => "Format Document",
@@ -195,6 +232,11 @@ impl Command {
             Command::RepositoryHistory => "Repository History",
             Command::ToggleWordWrap => "Toggle Word Wrap",
             Command::ToggleLineNumbers => "Toggle Line Numbers",
+            Command::SplitEditor => "Split Editor",
+            Command::MoveTabToNextGroup => "Move Tab to Next Group",
+            Command::FocusFirstGroup => "Focus First Editor Group",
+            Command::FocusSecondGroup => "Focus Second Editor Group",
+            Command::FocusThirdGroup => "Focus Third Editor Group",
             Command::IncreaseFontSize => "Increase Font Size",
             Command::DecreaseFontSize => "Decrease Font Size",
             Command::ResetFontSize => "Reset Font Size",
@@ -219,12 +261,16 @@ impl Command {
             Undo | Redo | Find | Replace | FindInProject | ToggleComment | Indent | Outdent
             | DuplicateLine | MoveLineUp | MoveLineDown | TriggerSuggest | RenameSymbol
             | FormatDocument => "Edit",
+            AddCursorAbove | AddCursorBelow | AddNextOccurrence | SelectAllOccurrences
+            | AddCursorsToLineEnds => "Selection",
+            Fold | Unfold | FoldAll | UnfoldAll => "View",
             QuickOpen | GoToLine | NextTab | PreviousTab | GoToDefinition | FindReferences
             | NextProblem | PreviousProblem | NextChange | PreviousChange => "Go",
             ShowCommandPalette | ShowExplorer | ShowSourceControl | ShowPullRequests
             | ShowProblems | ToggleBlame | FileHistory | RepositoryHistory | ToggleWordWrap
             | ToggleLineNumbers | IncreaseFontSize | DecreaseFontSize | ResetFontSize
-            | SelectTheme | ReloadThemes | OpenThemesFolder => "View",
+            | SplitEditor | MoveTabToNextGroup | FocusFirstGroup | FocusSecondGroup
+            | FocusThirdGroup | SelectTheme | ReloadThemes | OpenThemesFolder => "View",
             LanguageServers | RestartLanguageServers | ToggleFormatOnSave => "Tools",
             ToggleTerminal | RestartTerminal => "Terminal",
             CheckForUpdates => "Help",
@@ -304,6 +350,17 @@ impl Command {
             Command::PreviousChange => &const { one(shortcut(ALT_SHIFT, Key::F5)) },
             Command::OpenSettings => &const { one(shortcut(CMD, Key::Comma)) },
             Command::ToggleWordWrap => &const { one(shortcut(ALT, Key::Z)) },
+            Command::AddCursorAbove => &const { one(shortcut(CMD_ALT, Key::ArrowUp)) },
+            Command::AddCursorBelow => &const { one(shortcut(CMD_ALT, Key::ArrowDown)) },
+            Command::AddNextOccurrence => &const { one(shortcut(CMD, Key::D)) },
+            Command::SelectAllOccurrences => &const { one(shortcut(CMD_SHIFT, Key::L)) },
+            Command::AddCursorsToLineEnds => &const { one(shortcut(ALT_SHIFT, Key::I)) },
+            Command::Fold => &const { one(shortcut(CMD_ALT, Key::OpenBracket)) },
+            Command::Unfold => &const { one(shortcut(CMD_ALT, Key::CloseBracket)) },
+            Command::SplitEditor => &const { one(shortcut(CMD, Key::Backslash)) },
+            Command::FocusFirstGroup => &const { one(shortcut(CMD, Key::Num1)) },
+            Command::FocusSecondGroup => &const { one(shortcut(CMD, Key::Num2)) },
+            Command::FocusThirdGroup => &const { one(shortcut(CMD, Key::Num3)) },
             // Cmd+= and Cmd+Shift+= (Cmd++) both make the text bigger. These
             // replace egui's whole-UI keyboard zoom, which is turned off.
             Command::IncreaseFontSize => {
@@ -330,6 +387,15 @@ impl Command {
                 | Command::DuplicateLine
                 | Command::MoveLineUp
                 | Command::MoveLineDown
+                | Command::AddCursorAbove
+                | Command::AddCursorBelow
+                | Command::AddNextOccurrence
+                | Command::SelectAllOccurrences
+                | Command::AddCursorsToLineEnds
+                | Command::Fold
+                | Command::Unfold
+                | Command::FoldAll
+                | Command::UnfoldAll
                 | Command::TriggerSuggest
                 | Command::RenameSymbol
                 | Command::FormatDocument

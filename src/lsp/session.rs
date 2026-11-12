@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use lsp_types::{
     CompletionItem, CompletionResponse, Diagnostic, DiagnosticSeverity, DocumentChangeOperation,
@@ -42,7 +43,11 @@ pub enum Feature {
     Completion,
     Rename,
     Formatting,
+    Folding,
 }
+
+/// How long typing has to pause before fold ranges are asked for again.
+const FOLDING_DEBOUNCE: Duration = Duration::from_millis(400);
 
 impl Feature {
     fn describe(self) -> &'static str {
@@ -53,6 +58,7 @@ impl Feature {
             Feature::Completion => "completion",
             Feature::Rename => "rename",
             Feature::Formatting => "formatting",
+            Feature::Folding => "folding",
         }
     }
 
@@ -70,6 +76,10 @@ impl Feature {
             Feature::Completion => caps.completion_provider.is_some(),
             Feature::Rename => enabled(&caps.rename_provider),
             Feature::Formatting => enabled(&caps.document_formatting_provider),
+            Feature::Folding => !matches!(
+                caps.folding_range_provider,
+                None | Some(lsp_types::FoldingRangeProviderCapability::Simple(false))
+            ),
         }
     }
 }
@@ -191,6 +201,13 @@ struct OpenDoc {
     version: i32,
     /// The text as last sent to the server.
     text: String,
+    /// When the text was last sent.
+    changed_at: Instant,
+    /// Fold ranges `(start, end)` for the text at `folds_for` (a version).
+    folds: Option<Vec<(usize, usize)>>,
+    folds_for: i32,
+    /// Version a fold request is outstanding for.
+    folds_requested: Option<i32>,
 }
 
 enum Pending {
@@ -199,6 +216,7 @@ enum Pending {
     Completion { path: PathBuf, at: usize },
     Rename,
     Format { path: PathBuf, then_save: bool },
+    Folding { path: PathBuf, version: i32 },
 }
 
 #[derive(Default)]
@@ -303,10 +321,48 @@ impl Lsp {
         for &(path, text) in docs {
             if self.docs.contains_key(path) {
                 self.flush(path, text);
+                self.request_folds(path);
             } else {
                 self.open(path, text, root, &find_server);
             }
         }
+    }
+
+    /// Asks for fold ranges when the text changed and typing has paused.
+    fn request_folds(&mut self, path: &Path) {
+        if !self.supports(path, Feature::Folding) {
+            return;
+        }
+        let Some(doc) = self.docs.get(path) else {
+            return;
+        };
+        if doc.folds_requested.is_some() || (doc.folds.is_some() && doc.folds_for == doc.version) {
+            return;
+        }
+        let waited = doc.changed_at.elapsed();
+        if doc.folds.is_some() && waited < FOLDING_DEBOUNCE {
+            self.ctx.request_repaint_after(FOLDING_DEBOUNCE - waited);
+            return;
+        }
+        let (key, version) = (doc.key.clone(), doc.version);
+        let params = json!({ "textDocument": { "uri": doc.uri } });
+        let pending = Pending::Folding {
+            path: path.to_path_buf(),
+            version,
+        };
+        if let Some(doc) = self.docs.get_mut(path) {
+            doc.folds_requested = Some(version);
+        }
+        self.send_request(key, "textDocument/foldingRange", params, pending, false);
+    }
+
+    /// The fold ranges the server reported for `path` (`(start, end)` lines,
+    /// sorted), or `None` if its server doesn't do folding.
+    pub fn folding_ranges(&self, path: &Path) -> Option<Vec<(usize, usize)>> {
+        if !self.supports(path, Feature::Folding) {
+            return None;
+        }
+        self.docs.get(path)?.folds.clone()
     }
 
     fn open(
@@ -368,6 +424,10 @@ impl Lsp {
                 uri,
                 version: 0,
                 text: text.to_owned(),
+                changed_at: Instant::now(),
+                folds: None,
+                folds_for: -1,
+                folds_requested: None,
             },
         );
     }
@@ -381,6 +441,7 @@ impl Lsp {
             return;
         }
         doc.version += 1;
+        doc.changed_at = Instant::now();
         doc.text.clear();
         doc.text.push_str(text);
         if let Some(client) = self.clients.get_mut(&doc.key) {
@@ -695,6 +756,14 @@ impl Lsp {
         let quiet = matches!(e.code, rpc::REQUEST_CANCELLED | rpc::CONTENT_MODIFIED);
         let what = match pending {
             Pending::Hover { .. } | Pending::Completion { .. } => return,
+            Pending::Folding { path, .. } => {
+                // Don't ask again for this text; folding falls back to indentation.
+                if let Some(doc) = self.docs.get_mut(&path) {
+                    doc.folds_requested = None;
+                    doc.folds_for = doc.version;
+                }
+                return;
+            }
             Pending::Format { path, then_save } => {
                 self.events.push(LspEvent::Format {
                     path,
@@ -720,6 +789,19 @@ impl Lsp {
     fn on_result(&mut self, key: &ServerKey, pending: Pending, value: Value) {
         let encoding = self.encoding(key);
         match pending {
+            Pending::Folding { path, version } => {
+                let Some(doc) = self.docs.get_mut(&path) else {
+                    return;
+                };
+                doc.folds_requested = None;
+                doc.folds_for = version;
+                let ranges: Vec<lsp_types::FoldingRange> = serde_json::from_value(value)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                doc.folds = Some(fold_lines(&ranges));
+                self.ctx.request_repaint();
+            }
             Pending::Hover { path, at } => {
                 let hover: Option<Hover> = serde_json::from_value(value).ok().flatten();
                 let range = hover.as_ref().and_then(|h| h.range).and_then(|r| {
@@ -1072,6 +1154,20 @@ pub fn workspace_edit_files(edit: WorkspaceEdit) -> (Vec<(PathBuf, Vec<TextEdit>
     }
     files.sort_by(|a, b| a.0.cmp(&b.0));
     (files, skipped)
+}
+
+/// Fold ranges as `(start, end)` lines, sorted by start: folding hides
+/// lines `start + 1..=end`. With `lineFoldingOnly`, servers end a block's
+/// range on the line before its closing bracket, so that stays visible.
+fn fold_lines(ranges: &[lsp_types::FoldingRange]) -> Vec<(usize, usize)> {
+    let mut lines: Vec<(usize, usize)> = ranges
+        .iter()
+        .filter(|r| r.end_line > r.start_line)
+        .map(|r| (r.start_line as usize, r.end_line as usize))
+        .collect();
+    lines.sort_unstable();
+    lines.dedup();
+    lines
 }
 
 #[cfg(test)]

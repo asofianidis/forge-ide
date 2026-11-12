@@ -376,7 +376,7 @@ impl ForgeApp {
             }
             doc.poll_disk();
             if !doc.has_unsaved_edits() {
-                self.remove_tab(i);
+                self.close_document(i);
             }
         }
     }

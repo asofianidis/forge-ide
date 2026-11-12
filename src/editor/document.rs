@@ -5,9 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use anyhow::Context as _;
-use egui::TextBuffer as _;
 
-use super::Buffer;
+use super::{Buffer, HighlightCache};
 
 fn next_id() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -45,6 +44,8 @@ pub struct Document {
     /// everything else should go through [`Self::set_text`] or
     /// [`Self::apply_edits`] so each change is one undo step.
     pub buffer: Buffer,
+    /// Syntax highlighting, filled in lazily as lines are shown.
+    pub highlight: HighlightCache,
     /// Hash of the text as of the last load/save, to tell whether the file on
     /// disk still matches it without keeping a second copy of the text.
     saved_hash: u64,
@@ -59,6 +60,7 @@ impl Document {
             id: next_id(),
             path: None,
             buffer: Buffer::default(),
+            highlight: HighlightCache::default(),
             saved_hash: hash(""),
             disk_mtime: None,
             disk: DiskState::InSync,
@@ -73,6 +75,7 @@ impl Document {
             path: Some(path.to_path_buf()),
             saved_hash: hash(&text),
             buffer: Buffer::from(text.as_str()),
+            highlight: HighlightCache::default(),
             disk_mtime: mtime(path),
             disk: DiskState::InSync,
         })
@@ -107,6 +110,11 @@ impl Document {
 
     pub fn text(&self) -> &str {
         self.buffer.as_str()
+    }
+
+    /// Changes with every edit; identifies the text for caches.
+    pub fn version(&self) -> u64 {
+        self.buffer.version()
     }
 
     /// Replaces the text as one undo step (recording only what differs).
@@ -283,7 +291,8 @@ mod tests {
     fn dirty_tracking() {
         let mut doc = Document::untitled();
         assert!(!doc.is_dirty());
-        doc.buffer.insert_text("x", egui::text::CharIndex(0));
+        doc.buffer
+            .edit([(0..0, "x")], crate::editor::EditKind::Typing, None);
         assert!(doc.is_dirty());
         doc.buffer.undo();
         assert!(!doc.is_dirty(), "undoing back to the saved text is clean");
@@ -445,7 +454,11 @@ mod tests {
             assert_eq!(doc.text(), new);
             assert!(doc.is_dirty());
             let caret = doc.buffer.undo().expect("undoable");
-            assert!(caret <= before.chars().count());
+            assert!(
+                caret
+                    .iter()
+                    .all(|&(a, h)| a.max(h) <= before.chars().count())
+            );
             assert_eq!(doc.text(), before);
             assert!(!doc.is_dirty());
             assert!(!doc.buffer.can_undo(), "{new:?} took more than one step");
