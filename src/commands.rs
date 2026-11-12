@@ -12,6 +12,7 @@ pub enum Command {
     OpenFolder,
     OpenRecent,
     Save,
+    SaveAs,
     CloseTab,
     RevealActiveFile,
     OpenSettings,
@@ -31,6 +32,8 @@ pub enum Command {
     FormatDocument,
     QuickOpen,
     GoToLine,
+    NextTab,
+    PreviousTab,
     GoToDefinition,
     FindReferences,
     NextProblem,
@@ -75,6 +78,7 @@ const fn shortcut(modifiers: Modifiers, key: Key) -> KeyboardShortcut {
 const CMD: Modifiers = Modifiers::COMMAND;
 const CMD_SHIFT: Modifiers = Modifiers::COMMAND.plus(Modifiers::SHIFT);
 const CMD_ALT: Modifiers = Modifiers::COMMAND.plus(Modifiers::ALT);
+const CTRL_SHIFT: Modifiers = Modifiers::CTRL.plus(Modifiers::SHIFT);
 const ALT: Modifiers = Modifiers::ALT;
 const ALT_SHIFT: Modifiers = Modifiers::ALT.plus(Modifiers::SHIFT);
 
@@ -85,6 +89,7 @@ impl Command {
         Command::OpenFolder,
         Command::OpenRecent,
         Command::Save,
+        Command::SaveAs,
         Command::CloseTab,
         Command::RevealActiveFile,
         Command::OpenSettings,
@@ -104,6 +109,8 @@ impl Command {
         Command::FormatDocument,
         Command::QuickOpen,
         Command::GoToLine,
+        Command::NextTab,
+        Command::PreviousTab,
         Command::GoToDefinition,
         Command::FindReferences,
         Command::NextProblem,
@@ -140,6 +147,7 @@ impl Command {
             Command::OpenFolder => "Open Folder…",
             Command::OpenRecent => "Open Recent Folder…",
             Command::Save => "Save",
+            Command::SaveAs => "Save As…",
             Command::CloseTab => "Close Tab",
             Command::RevealActiveFile => REVEAL_LABEL,
             Command::OpenSettings => "Settings…",
@@ -159,6 +167,8 @@ impl Command {
             Command::FormatDocument => "Format Document",
             Command::QuickOpen => "Go to File…",
             Command::GoToLine => "Go to Line…",
+            Command::NextTab => "Next Tab",
+            Command::PreviousTab => "Previous Tab",
             Command::GoToDefinition => "Go to Definition",
             Command::FindReferences => "Find All References",
             Command::NextProblem => "Next Problem",
@@ -192,18 +202,16 @@ impl Command {
     pub fn category(self) -> &'static str {
         use Command::*;
         match self {
-            NewFile | OpenFile | OpenFolder | OpenRecent | Save | CloseTab | RevealActiveFile
-            | OpenSettings | OpenSettingsFile | Quit => "File",
+            NewFile | OpenFile | OpenFolder | OpenRecent | Save | SaveAs | CloseTab
+            | RevealActiveFile | OpenSettings | OpenSettingsFile | Quit => "File",
             Find | Replace | FindInProject | ToggleComment | Indent | Outdent | DuplicateLine
             | MoveLineUp | MoveLineDown | TriggerSuggest | RenameSymbol | FormatDocument => "Edit",
-            QuickOpen | GoToLine | GoToDefinition | FindReferences | NextProblem
-            | PreviousProblem => "Go",
+            QuickOpen | GoToLine | NextTab | PreviousTab | GoToDefinition | FindReferences
+            | NextProblem | PreviousProblem | NextChange | PreviousChange => "Go",
             ShowCommandPalette | ShowExplorer | ShowSourceControl | ShowPullRequests
-            | ShowProblems | ToggleBlame | NextChange | PreviousChange | FileHistory
-            | RepositoryHistory | ToggleWordWrap | ToggleLineNumbers | IncreaseFontSize
-            | DecreaseFontSize | ResetFontSize | SelectTheme | ReloadThemes | OpenThemesFolder => {
-                "View"
-            }
+            | ShowProblems | ToggleBlame | FileHistory | RepositoryHistory | ToggleWordWrap
+            | ToggleLineNumbers | IncreaseFontSize | DecreaseFontSize | ResetFontSize
+            | SelectTheme | ReloadThemes | OpenThemesFolder => "View",
             LanguageServers | RestartLanguageServers | ToggleFormatOnSave => "Tools",
             CheckForUpdates => "Help",
         }
@@ -227,6 +235,7 @@ impl Command {
             Command::NewFile => &const { one(shortcut(CMD, Key::N)) },
             Command::OpenFile => &const { one(shortcut(CMD, Key::O)) },
             Command::Save => &const { one(shortcut(CMD, Key::S)) },
+            Command::SaveAs => &const { one(shortcut(CMD_SHIFT, Key::S)) },
             Command::CloseTab => &const { one(shortcut(CMD, Key::W)) },
             Command::Find => &const { one(shortcut(CMD, Key::F)) },
             // macOS reserves Cmd+H for "Hide", so the menu shows Cmd+Option+F
@@ -250,6 +259,9 @@ impl Command {
             Command::OpenRecent => &const { one(shortcut(Modifiers::CTRL, Key::R)) },
             // Ctrl+G on every platform; Cmd+G is "find next" on macOS.
             Command::GoToLine => &const { one(shortcut(Modifiers::CTRL, Key::G)) },
+            // Ctrl+Tab on every platform: Cmd+Tab switches apps on macOS.
+            Command::NextTab => &const { one(shortcut(Modifiers::CTRL, Key::Tab)) },
+            Command::PreviousTab => &const { one(shortcut(CTRL_SHIFT, Key::Tab)) },
             Command::ShowCommandPalette => &const { one(shortcut(CMD_SHIFT, Key::P)) },
             Command::ShowExplorer => &const { one(shortcut(CMD_SHIFT, Key::E)) },
             Command::ShowSourceControl => &const { one(shortcut(CMD_SHIFT, Key::G)) },
@@ -345,6 +357,25 @@ mod tests {
         assert!(pos(Command::PreviousChange) < pos(Command::NextChange));
         assert!(pos(Command::FindReferences) < pos(Command::GoToDefinition));
         assert!(pos(Command::PreviousProblem) < pos(Command::NextProblem));
+        assert!(pos(Command::SaveAs) < pos(Command::Save));
+        assert!(pos(Command::PreviousTab) < pos(Command::NextTab));
+    }
+
+    /// egui's `consume_shortcut` ignores an extra Shift, so the plain
+    /// shortcut would swallow its Shift variant if it were checked first.
+    #[test]
+    fn shift_variants_are_not_swallowed() {
+        let table = Command::shortcut_table();
+        for (i, (cmd, s)) in table.iter().enumerate() {
+            for (other, earlier) in &table[..i] {
+                assert!(
+                    !s.modifiers.matches_logically(earlier.modifiers)
+                        || s.logical_key != earlier.logical_key
+                        || s.modifiers == earlier.modifiers,
+                    "{other:?} is checked before {cmd:?} and would swallow it"
+                );
+            }
+        }
     }
 
     #[test]
