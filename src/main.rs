@@ -5,6 +5,7 @@ mod cli;
 mod commands;
 mod editor;
 mod editorconfig;
+mod extensions;
 mod fuzzy;
 mod git;
 mod github;

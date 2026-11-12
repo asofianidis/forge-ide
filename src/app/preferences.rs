@@ -66,6 +66,7 @@ impl ForgeApp {
         let (keymap, errors) = Keymap::new(&self.settings.keybindings);
         self.keymap = keymap;
         self.keymap_source = self.settings.keybindings.clone();
+        self.extensions.bind_shortcuts(self.keymap.table());
         if let Some(msg) = keymap_errors_status(&errors) {
             self.status = msg;
         }

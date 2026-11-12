@@ -41,6 +41,9 @@ pub struct Settings {
     /// Defaults to PowerShell on Windows and `$SHELL` elsewhere.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_shell: Option<String>,
+    /// Ids of installed extensions that are switched off.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub disabled_extensions: Vec<String>,
     /// Shortcuts by command id (`toggle_terminal = "cmd+j"`), replacing the
     /// defaults. See [`crate::keymap`].
     pub keybindings: BTreeMap<String, Keys>,
@@ -79,6 +82,7 @@ impl Default for Settings {
             line_numbers: true,
             minimap: true,
             terminal_shell: None,
+            disabled_extensions: Vec::new(),
             keybindings: BTreeMap::new(),
             recent_folders: Vec::new(),
             sessions: Vec::new(),
