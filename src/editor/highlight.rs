@@ -1,16 +1,44 @@
 //! Syntax highlighting via `syntect`, converted into egui `LayoutJob`s.
+//!
+//! Highlighting is incremental: the parser state at the start of every line is
+//! kept, so after an edit only the changed lines are re-parsed, plus any lines
+//! below them whose start state changed as a result (e.g. after opening a block
+//! comment). Typing in a large file costs about one line of parsing, not the
+//! whole file.
 
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontId, Stroke};
-use syntect::easy::HighlightLines;
-use syntect::highlighting::{FontStyle, Theme};
-use syntect::parsing::SyntaxSet;
+use syntect::highlighting::{
+    FontStyle, HighlightIterator, HighlightState, Highlighter as ThemeHighlighter, Style, Theme,
+};
+use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
 use syntect::util::LinesWithEndings;
 
-/// Last highlighted input, so unchanged text isn't re-highlighted every frame.
+/// Parser and highlighter state at the start of a line.
+#[derive(Clone, PartialEq, Eq)]
+struct LineState {
+    parse: ParseState,
+    highlight: HighlightState,
+}
+
+/// One highlighted line of the last input.
+struct Line {
+    /// The line's text, including its line ending.
+    text: String,
+    /// State at the start of the line.
+    start: LineState,
+    /// Styled byte lengths covering `text`, or `None` if parsing failed.
+    spans: Option<Vec<(Style, usize)>>,
+}
+
+/// Highlighting of the last input, so it can be reused after an edit.
 struct Cached {
     extension: String,
     text: String,
+    lines: Vec<Line>,
+    /// State after the last line.
+    end: LineState,
+    font: FontId,
     job: LayoutJob,
 }
 
@@ -36,39 +64,132 @@ impl Highlighter {
     }
 
     pub fn highlight(&mut self, text: &str, extension: &str, font: FontId) -> LayoutJob {
-        if let Some(c) = &self.cache
-            && c.extension == extension
+        let reusable = self.cache.take().filter(|c| c.extension == extension);
+        if let Some(c) = &reusable
             && c.text == text
+            && c.font == font
         {
-            return c.job.clone();
+            let job = c.job.clone();
+            self.cache = reusable;
+            return job;
         }
-        let job = self.build_job(text, extension, font);
+
+        let (old_lines, old_end) = match reusable {
+            Some(c) => (c.lines, Some(c.end)),
+            None => (Vec::new(), None),
+        };
+        let (lines, end) = self.highlight_lines(text, extension, old_lines, old_end);
+        let job = self.build_job(&lines, &font);
         self.cache = Some(Cached {
             extension: extension.to_owned(),
             text: text.to_owned(),
+            lines,
+            end,
+            font,
             job: job.clone(),
         });
         job
     }
 
-    fn build_job(&self, text: &str, extension: &str, font: FontId) -> LayoutJob {
+    /// Highlights `text`, reusing lines from the previous input where possible.
+    fn highlight_lines(
+        &self,
+        text: &str,
+        extension: &str,
+        mut old: Vec<Line>,
+        old_end: Option<LineState>,
+    ) -> (Vec<Line>, LineState) {
+        let new: Vec<&str> = LinesWithEndings::from(text).collect();
+
+        // Lines shared with the previous input at the start and end. Unchanged
+        // leading lines keep their highlighting outright; unchanged trailing
+        // lines do once parsing reaches them in the same state as before.
+        let prefix = old
+            .iter()
+            .zip(&new)
+            .take_while(|(o, n)| o.text == **n)
+            .count();
+        let max_suffix = old.len().min(new.len()) - prefix;
+        let suffix = old
+            .iter()
+            .rev()
+            .zip(new.iter().rev())
+            .take(max_suffix)
+            .take_while(|(o, n)| o.text == **n)
+            .count();
+
+        let mut state = match (old.get(prefix), &old_end) {
+            (Some(line), _) => line.start.clone(),
+            (None, Some(end)) if prefix > 0 => end.clone(),
+            _ => self.initial_state(extension),
+        };
+        let mut tail = old.split_off(prefix);
+        let mut lines = old;
+        lines.reserve(new.len() - prefix);
+
+        let theme = ThemeHighlighter::new(&self.theme);
+        let resume_at = new.len() - suffix;
+        for (idx, &line) in new.iter().enumerate().skip(prefix) {
+            if idx >= resume_at {
+                let old_idx = tail.len() - (new.len() - idx);
+                if tail[old_idx].start == state {
+                    // Everything from here down is unchanged.
+                    lines.extend(tail.drain(old_idx..));
+                    let end = old_end.expect("a non-empty old input has an end state");
+                    return (lines, end);
+                }
+            }
+            let start = state.clone();
+            let spans = self.highlight_line(line, &mut state, &theme);
+            lines.push(Line {
+                text: line.to_owned(),
+                start,
+                spans,
+            });
+        }
+        (lines, state)
+    }
+
+    fn initial_state(&self, extension: &str) -> LineState {
         let syntax = self
             .syntaxes
             .find_syntax_by_extension(extension)
             .unwrap_or_else(|| self.syntaxes.find_syntax_plain_text());
-        let mut hl = HighlightLines::new(syntax, &self.theme);
-        let mut job = LayoutJob::default();
+        LineState {
+            parse: ParseState::new(syntax),
+            highlight: HighlightState::new(&ThemeHighlighter::new(&self.theme), ScopeStack::new()),
+        }
+    }
 
-        for line in LinesWithEndings::from(text) {
-            let Ok(ranges) = hl.highlight_line(line, &self.syntaxes) else {
+    /// Highlights one line, advancing `state` to the start of the next.
+    fn highlight_line(
+        &self,
+        line: &str,
+        state: &mut LineState,
+        theme: &ThemeHighlighter<'_>,
+    ) -> Option<Vec<(Style, usize)>> {
+        let ops = state.parse.parse_line(line, &self.syntaxes).ok()?;
+        let spans = HighlightIterator::new(&mut state.highlight, &ops, line, theme)
+            .map(|(style, piece)| (style, piece.len()))
+            .collect();
+        Some(spans)
+    }
+
+    fn build_job(&self, lines: &[Line], font: &FontId) -> LayoutJob {
+        let mut job = LayoutJob::default();
+        for line in lines {
+            let Some(spans) = &line.spans else {
                 job.append(
-                    line,
+                    &line.text,
                     0.0,
                     TextFormat::simple(font.clone(), self.foreground()),
                 );
                 continue;
             };
-            for (style, piece) in ranges {
+            let mut offset = 0;
+            for (style, len) in spans {
+                let piece = &line.text[offset..offset + len];
+                offset += len;
                 let fg = style.foreground;
                 let mut format =
                     TextFormat::simple(font.clone(), Color32::from_rgb(fg.r, fg.g, fg.b));
@@ -96,5 +217,82 @@ impl Highlighter {
             .background
             .map(|c| Color32::from_rgb(c.r, c.g, c.b))
             .unwrap_or(Color32::from_gray(30))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn highlighter() -> Highlighter {
+        let themes = syntect::highlighting::ThemeSet::load_defaults();
+        Highlighter::new(themes.themes["base16-ocean.dark"].clone())
+    }
+
+    fn font() -> FontId {
+        FontId::monospace(14.0)
+    }
+
+    /// Text and color of every section, for comparing jobs.
+    fn sections(job: &LayoutJob) -> Vec<(String, Color32)> {
+        job.sections
+            .iter()
+            .map(|s| {
+                (
+                    job.text[s.byte_range.start.0..s.byte_range.end.0].to_owned(),
+                    s.format.color,
+                )
+            })
+            .collect()
+    }
+
+    /// Highlighting `after` incrementally (from `before`) must match a fresh run.
+    fn assert_incremental_matches(before: &str, after: &str, ext: &str) {
+        let mut incremental = highlighter();
+        incremental.highlight(before, ext, font());
+        let got = incremental.highlight(after, ext, font());
+        let want = highlighter().highlight(after, ext, font());
+        assert_eq!(got.text, after);
+        assert_eq!(sections(&got), sections(&want), "{before:?} -> {after:?}");
+    }
+
+    const RUST: &str = "fn main() {\n    let x = 1;\n    // comment\n    println!(\"{x}\");\n}\n";
+
+    #[test]
+    fn edits_match_full_rehighlight() {
+        let cases = [
+            // Edit in the middle.
+            RUST.replace("let x = 1", "let y = 22"),
+            // Open a block comment: every following line changes.
+            RUST.replace("let x", "/* let x"),
+            // Insert and delete lines.
+            RUST.replace("    // comment\n", "    a();\n    b();\n    c();\n"),
+            RUST.replace("    // comment\n", ""),
+            // Edits at the very start and end.
+            format!("use std::fmt;\n{RUST}"),
+            format!("{RUST}fn more() {{}}"),
+            RUST.trim_end().to_owned(),
+            String::new(),
+        ];
+        for after in &cases {
+            assert_incremental_matches(RUST, after, "rs");
+            assert_incremental_matches(after, RUST, "rs");
+        }
+    }
+
+    #[test]
+    fn closing_a_comment_rehighlights_below() {
+        let open = RUST.replace("let x", "/* let x");
+        let closed = open.replace("// comment", "*/ // comment");
+        assert_incremental_matches(&open, &closed, "rs");
+    }
+
+    #[test]
+    fn changing_language_starts_over() {
+        let mut h = highlighter();
+        h.highlight(RUST, "rs", font());
+        let got = h.highlight(RUST, "txt", font());
+        let want = highlighter().highlight(RUST, "txt", font());
+        assert_eq!(sections(&got), sections(&want));
     }
 }
