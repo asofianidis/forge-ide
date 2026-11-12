@@ -4,6 +4,8 @@ name: Release
 # from Cargo.toml plus this workflow's run number as the patch, e.g.
 # 0.1.42 -> tag v0.1.42. Bump major/minor in Cargo.toml to start a new
 # series. The in-app updater (src/updater.rs) installs these releases.
+# Running it by hand on another branch builds, signs and notarizes
+# everything without publishing; the builds are kept as run artifacts.
 
 on:
   push:
@@ -57,8 +59,10 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
+            mac_arch: arm64
           - os: macos-latest
             target: x86_64-apple-darwin
+            mac_arch: x64
     env:
       FORGE_VERSION: ${{ needs.check.outputs.version }}
     steps:
@@ -74,11 +78,18 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libgtk-3-dev
       - name: Build
         run: cargo build --locked --release --target ${{ matrix.target }}
-      # Sign with the Developer ID certificate (hardened runtime + secure
-      # timestamp) and notarize with Apple so Gatekeeper accepts the binary.
-      # A bare executable can't have a ticket stapled to it; Gatekeeper looks
-      # the ticket up online on first launch instead.
-      - name: Sign and notarize (macOS)
+      # macOS ships two things, both signed with the Developer ID certificate
+      # (hardened runtime + secure timestamp) and notarized by Apple:
+      #  - Forge-IDE-v<version>-macos-<arch>.dmg holding "Forge IDE.app", for
+      #    people to download. The app and the disk image both have their
+      #    notarization ticket stapled, so Gatekeeper accepts them offline.
+      #  - the bare forge-ide binary in the .tar.gz, for the in-app updater on
+      #    installs that aren't an app bundle. A bare executable can't carry a
+      #    stapled ticket; Gatekeeper has to look it up online, which is why
+      #    the DMG is what people should download.
+      # The DMG's name avoids the target triple so the bare-binary updater
+      # never mistakes it for its .tar.gz.
+      - name: Sign, notarize and bundle (macOS)
         if: runner.os == 'macOS'
         env:
           MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
@@ -86,9 +97,12 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          MAC_ARCH: ${{ matrix.mac_arch }}
         run: |
           set -euo pipefail
           bin="target/${{ matrix.target }}/release/forge-ide"
+          work="$RUNNER_TEMP/macos"
+          mkdir -p "$work" "$GITHUB_WORKSPACE/dist"
 
           # Import the certificate into a throwaway keychain.
           keychain="$RUNNER_TEMP/signing.keychain-db"
@@ -117,29 +131,71 @@ jobs:
             exit 1
           fi
 
-          codesign --force --options runtime --timestamp \
-            --identifier dev.forge-ide.forge-ide \
-            --keychain "$keychain" --sign "$identity" "$bin"
-          codesign --verify --strict --verbose=2 "$bin"
+          sign() {
+            codesign --force --options runtime --timestamp \
+              --identifier dev.forge-ide.forge-ide \
+              --keychain "$keychain" --sign "$identity" "$@"
+          }
 
-          # notarytool takes a zip, not a tar.gz; the zip is only for upload.
-          ditto -c -k --keepParent "$bin" "$RUNNER_TEMP/notarize.zip"
-          result=$(xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
-            --apple-id "$APPLE_ID" \
-            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-            --team-id "$APPLE_TEAM_ID" \
-            --wait --timeout 30m --output-format json)
-          echo "$result"
-          id=$(echo "$result" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
-          status=$(echo "$result" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')
-          if [ "$status" != "Accepted" ]; then
-            xcrun notarytool log "$id" \
+          # Submits a file (zip or dmg) and fails unless Apple accepts it.
+          notarize() {
+            local result id status
+            result=$(xcrun notarytool submit "$1" \
               --apple-id "$APPLE_ID" \
               --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-              --team-id "$APPLE_TEAM_ID" || true
-            echo "::error::Notarization failed with status: $status"
-            exit 1
-          fi
+              --team-id "$APPLE_TEAM_ID" \
+              --wait --timeout 30m --output-format json)
+            echo "$result"
+            id=$(echo "$result" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+            status=$(echo "$result" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')
+            if [ "$status" != "Accepted" ]; then
+              xcrun notarytool log "$id" \
+                --apple-id "$APPLE_ID" \
+                --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+                --team-id "$APPLE_TEAM_ID" || true
+              echo "::error::Notarization of $(basename "$1") failed with status: $status"
+              exit 1
+            fi
+          }
+
+          # The bare binary, for the .tar.gz.
+          sign "$bin"
+          codesign --verify --strict --verbose=2 "$bin"
+
+          # The app bundle around a copy of it, signed as a bundle.
+          app="$work/Forge IDE.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp "$bin" "$app/Contents/MacOS/forge-ide"
+          sed "s/@VERSION@/${FORGE_VERSION}/g" packaging/macos/Info.plist \
+            > "$app/Contents/Info.plist"
+          plutil -lint "$app/Contents/Info.plist"
+          printf 'APPL????' > "$app/Contents/PkgInfo"
+          sign "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+
+          # Notarize both in one submission (notarytool takes a zip), then
+          # staple the app's ticket so it works offline once copied out.
+          mkdir "$work/submit"
+          ditto "$app" "$work/submit/Forge IDE.app"
+          cp "$bin" "$work/submit/forge-ide"
+          ditto -c -k --keepParent "$work/submit" "$work/notarize.zip"
+          notarize "$work/notarize.zip"
+          xcrun stapler staple "$app"
+          xcrun stapler validate "$app"
+          spctl --assess --type execute --verbose=4 "$app"
+
+          # The disk image: the app plus an Applications shortcut to drag it to.
+          dmg="$GITHUB_WORKSPACE/dist/Forge-IDE-v${FORGE_VERSION}-macos-${MAC_ARCH}.dmg"
+          mkdir "$work/dmg"
+          ditto "$app" "$work/dmg/Forge IDE.app"
+          ln -s /Applications "$work/dmg/Applications"
+          hdiutil create -volname "Forge IDE" -srcfolder "$work/dmg" \
+            -fs HFS+ -format UDZO -ov "$dmg"
+          codesign --force --timestamp --keychain "$keychain" --sign "$identity" "$dmg"
+          notarize "$dmg"
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+          spctl --assess --type open --context context:primary-signature --verbose=4 "$dmg"
       - name: Clean up signing keychain
         if: always() && runner.os == 'macOS'
         run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
@@ -163,6 +219,7 @@ jobs:
   release:
     name: Publish release
     needs: [check, build]
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ needs.check.outputs.version }}

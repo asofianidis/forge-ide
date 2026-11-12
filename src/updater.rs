@@ -7,6 +7,12 @@
 //!
 //! Checks and downloads run on a background thread; the UI polls
 //! [`Updater::state`] each frame.
+//!
+//! A plain install is updated by swapping in the release's `.tar.gz`
+//! executable. On macOS, a `Forge IDE.app` install is replaced as a whole
+//! from the release's disk image instead (see [`mac_app`]).
+
+mod mac_app;
 
 use std::sync::{Arc, Mutex};
 
@@ -109,16 +115,15 @@ impl Updater {
                     this.set(&ctx, UpdateState::Installing(fraction));
                 }
             };
-            let result = updater_builder()
-                .progress_callback(progress)
-                .build()
-                .and_then(|u| u.update());
+            let result = match mac_app::current_bundle() {
+                #[cfg(target_os = "macos")]
+                Some(bundle) => install_app_bundle(&bundle, progress),
+                _ => install_executable(progress),
+            };
             let state = match result {
-                Ok(status) if status.is_updated() => {
-                    UpdateState::Installed(status.version().to_owned())
-                }
-                Ok(_) => UpdateState::UpToDate,
-                Err(e) => UpdateState::Failed(format!("Update failed: {e}")),
+                Ok(Some(version)) => UpdateState::Installed(version),
+                Ok(None) => UpdateState::UpToDate,
+                Err(e) => UpdateState::Failed(format!("Update failed: {e:#}")),
             };
             this.set(&ctx, state);
         });
@@ -145,18 +150,101 @@ fn updater_builder() -> github::UpdateBuilder {
     builder
 }
 
-/// The newest published version with a build for this platform, if it is
-/// newer than [`VERSION`].
-fn newer_version() -> self_update::Result<Option<String>> {
+/// Replaces the running executable with the newest release's. Returns the
+/// installed version, or `None` if already up to date.
+fn install_executable(
+    progress: impl Fn(u64, Option<u64>) + Send + Sync + 'static,
+) -> anyhow::Result<Option<String>> {
+    let status = updater_builder()
+        .progress_callback(progress)
+        .build()
+        .and_then(|u| u.update())?;
+    Ok(status.is_updated().then(|| status.version().to_owned()))
+}
+
+/// Replaces the `Forge IDE.app` this process runs from with the newest
+/// release's, from its disk image. Returns the installed version, or `None`
+/// if already up to date.
+#[cfg(target_os = "macos")]
+fn install_app_bundle(
+    bundle: &std::path::Path,
+    progress: impl Fn(u64, Option<u64>) + Send + Sync + 'static,
+) -> anyhow::Result<Option<String>> {
+    use anyhow::Context;
+
+    let Some(release) = newest_release()? else {
+        return Ok(None);
+    };
+    let version = release.version().to_owned();
+    let dmg_name = mac_app::dmg_name(&version);
+    let asset = |name: &str| {
+        release
+            .assets()
+            .iter()
+            .find(|a| a.name() == name)
+            .cloned()
+            .with_context(|| format!("release {version} has no {name}"))
+    };
+    let dmg_asset = asset(&dmg_name)?;
+    let sums_asset = asset(CHECKSUMS_ASSET)?;
+
+    let work = std::env::temp_dir().join(format!("forge-ide-update-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work)?;
+    let result = (|| -> anyhow::Result<()> {
+        let mut sums = Vec::new();
+        download(sums_asset.download_url()).download_to(&mut sums)?;
+        let dmg = work.join(&dmg_name);
+        download(dmg_asset.download_url())
+            .progress_callback(progress)
+            .download_to(std::fs::File::create(&dmg)?)?;
+        mac_app::verify_sha256(&dmg, &String::from_utf8_lossy(&sums), &dmg_name)?;
+        mac_app::install_from_dmg(&dmg, bundle, &work)
+    })();
+    let _ = std::fs::remove_dir_all(&work);
+    result.map(|()| Some(version))
+}
+
+/// A download of a GitHub release asset through its API URL.
+#[cfg(target_os = "macos")]
+fn download(url: &str) -> self_update::Download {
+    let mut download = self_update::Download::from_url(url);
+    download.request_header(
+        self_update::http::header::ACCEPT,
+        "application/octet-stream",
+    );
+    download
+}
+
+/// Whether `release` has something this install can update from: the disk
+/// image for an app bundle, else the archive for this platform.
+fn has_install_asset(release: &self_update::update::Release, in_bundle: bool) -> bool {
+    if in_bundle {
+        let dmg = mac_app::dmg_name(release.version());
+        release.assets().iter().any(|a| a.name() == dmg)
+    } else {
+        release.has_target_asset(self_update::get_target())
+    }
+}
+
+/// The newest published release this install can update to, if it is newer
+/// than [`VERSION`].
+fn newest_release() -> self_update::Result<Option<self_update::update::Release>> {
     let updater = updater_builder().build()?;
     let releases = updater.get_newer_releases()?;
-    let target = self_update::get_target();
+    let in_bundle = mac_app::current_bundle().is_some();
     Ok(releases
         .all()
         .iter()
-        .filter(|r| r.has_target_asset(target))
+        .filter(|r| has_install_asset(r, in_bundle))
         .max_by(|a, b| compare_versions(a.version(), b.version()))
-        .map(|r| r.version().to_owned()))
+        .cloned())
+}
+
+/// The newest published version this install can update to, if it is newer
+/// than [`VERSION`].
+fn newer_version() -> self_update::Result<Option<String>> {
+    Ok(newest_release()?.map(|r| r.version().to_owned()))
 }
 
 /// Compares dotted numeric versions (`1.2.10` > `1.2.9`). Non-numeric
