@@ -55,6 +55,7 @@ pub enum Command {
     ToggleWordWrap,
     ToggleLineNumbers,
     ToggleMinimap,
+    ToggleMarkdownPreview,
     IncreaseFontSize,
     DecreaseFontSize,
     ResetFontSize,
@@ -138,6 +139,7 @@ impl Command {
         Command::ToggleWordWrap,
         Command::ToggleLineNumbers,
         Command::ToggleMinimap,
+        Command::ToggleMarkdownPreview,
         Command::IncreaseFontSize,
         Command::DecreaseFontSize,
         Command::ResetFontSize,
@@ -202,6 +204,7 @@ impl Command {
             Command::ToggleWordWrap => "Toggle Word Wrap",
             Command::ToggleLineNumbers => "Toggle Line Numbers",
             Command::ToggleMinimap => "Toggle Minimap",
+            Command::ToggleMarkdownPreview => "Markdown Preview",
             Command::IncreaseFontSize => "Increase Font Size",
             Command::DecreaseFontSize => "Decrease Font Size",
             Command::ResetFontSize => "Reset Font Size",
@@ -228,10 +231,24 @@ impl Command {
             | FormatDocument => "Edit",
             QuickOpen | GoToLine | NextTab | PreviousTab | GoToDefinition | FindReferences
             | NextProblem | PreviousProblem | NextChange | PreviousChange => "Go",
-            ShowCommandPalette | ShowExplorer | ShowSourceControl | ShowPullRequests
-            | ShowProblems | ToggleBlame | FileHistory | RepositoryHistory | ToggleWordWrap
-            | ToggleLineNumbers | ToggleMinimap | IncreaseFontSize | DecreaseFontSize
-            | ResetFontSize | SelectTheme | ReloadThemes | OpenThemesFolder => "View",
+            ShowCommandPalette
+            | ShowExplorer
+            | ShowSourceControl
+            | ShowPullRequests
+            | ShowProblems
+            | ToggleBlame
+            | FileHistory
+            | RepositoryHistory
+            | ToggleWordWrap
+            | ToggleLineNumbers
+            | ToggleMinimap
+            | ToggleMarkdownPreview
+            | IncreaseFontSize
+            | DecreaseFontSize
+            | ResetFontSize
+            | SelectTheme
+            | ReloadThemes
+            | OpenThemesFolder => "View",
             LanguageServers | RestartLanguageServers | ToggleFormatOnSave => "Tools",
             ToggleTerminal | RestartTerminal => "Terminal",
             CheckForUpdates => "Help",
@@ -334,6 +351,8 @@ impl Command {
             Command::PreviousChange => &const { one(shortcut(ALT_SHIFT, Key::F5)) },
             Command::OpenSettings => &const { one(shortcut(CMD, Key::Comma)) },
             Command::ToggleWordWrap => &const { one(shortcut(ALT, Key::Z)) },
+            // As in other editors. Plain Cmd+V stays paste.
+            Command::ToggleMarkdownPreview => &const { one(shortcut(CMD_SHIFT, Key::V)) },
             // Cmd+= and Cmd+Shift+= (Cmd++) both make the text bigger. These
             // replace egui's whole-UI keyboard zoom, which is turned off.
             Command::IncreaseFontSize => {
