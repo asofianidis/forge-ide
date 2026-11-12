@@ -4,6 +4,7 @@ mod editing;
 mod explorer;
 mod find_bar;
 mod language;
+mod markdown_preview;
 mod pickers;
 mod preferences;
 mod search_panel;
@@ -148,6 +149,8 @@ pub struct ForgeApp {
     explorer_dialog: Option<ExplorerDialog>,
     /// Integrated terminal panel below the editor.
     terminal: TerminalPanel,
+    /// Ids of the Markdown documents showing a preview beside the editor.
+    markdown_preview: HashSet<u64>,
 }
 
 impl ForgeApp {
@@ -233,6 +236,7 @@ impl ForgeApp {
             watcher: None,
             explorer_dialog: None,
             terminal: TerminalPanel::default(),
+            markdown_preview: HashSet::new(),
         };
         if let Some(folder) = folder {
             app.folder_opened(&folder);
@@ -712,7 +716,8 @@ impl ForgeApp {
 
     fn remove_tab(&mut self, idx: usize) {
         if idx < self.documents.len() {
-            self.documents.remove(idx);
+            let doc = self.documents.remove(idx);
+            self.markdown_preview.remove(&doc.id);
         }
         if self.documents.is_empty() {
             self.documents.push(Document::untitled());
@@ -1002,6 +1007,7 @@ impl ForgeApp {
             Command::RepositoryHistory => self.open_history(None),
             Command::ToggleWordWrap => self.toggle_word_wrap(),
             Command::ToggleLineNumbers => self.toggle_line_numbers(),
+            Command::ToggleMarkdownPreview => self.toggle_markdown_preview(),
             Command::IncreaseFontSize => self.change_font_size(ctx, Some(1.0)),
             Command::DecreaseFontSize => self.change_font_size(ctx, Some(-1.0)),
             Command::ResetFontSize => self.change_font_size(ctx, None),
@@ -1174,6 +1180,10 @@ impl ForgeApp {
                 self.menu_checkbox(ui, ToggleWordWrap, &mut wrap, "Word Wrap");
                 let mut numbers = self.settings.line_numbers;
                 self.menu_checkbox(ui, ToggleLineNumbers, &mut numbers, "Line Numbers");
+                if self.active_is_markdown() {
+                    let mut preview = self.markdown_preview_open();
+                    self.menu_checkbox(ui, ToggleMarkdownPreview, &mut preview, "Markdown Preview");
+                }
                 for cmd in [IncreaseFontSize, DecreaseFontSize, ResetFontSize] {
                     self.menu_item(ui, cmd);
                 }
@@ -2275,7 +2285,16 @@ impl eframe::App for ForgeApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(ui.style()).fill(bg))
             .show(ui, |ui| {
-                self.tab_bar(ui);
+                ui.horizontal(|ui| {
+                    // Right-to-left so the preview toggle keeps its place at
+                    // the end and the tabs scroll in the space left over.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        self.markdown_preview_button(ui);
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            self.tab_bar(ui);
+                        });
+                    });
+                });
                 ui.separator();
                 match self.active_pane {
                     Some(i) if i < self.panes.len() => {
@@ -2292,6 +2311,7 @@ impl eframe::App for ForgeApp {
                         }
                     }
                     _ => {
+                        self.markdown_preview_panel(ui);
                         self.disk_banner(ui);
                         self.find_bar(ui);
                         self.editor(ui);
