@@ -249,20 +249,23 @@ in `settings.toml`.
 
 ## Install
 
-Download the archive for your platform from the
-[latest release](https://github.com/asofianidis/forge-ide/releases/latest), extract it, and
-run `forge-ide` (`forge-ide.exe` on Windows). Builds are published for Windows (x64),
-Linux (x64), and macOS (Apple Silicon and Intel).
+Download the build for your platform from the
+[latest release](https://github.com/asofianidis/forge-ide/releases/latest). Builds are published
+for Windows (x64), Linux (x64), and macOS (Apple Silicon and Intel).
 
-> **macOS:** the binary isn't signed yet. If Gatekeeper blocks it, run
-> `xattr -d com.apple.quarantine forge-ide` once.
+- **macOS:** open `Forge-IDE-v…-macos-arm64.dmg` (Apple Silicon) or `…-macos-x64.dmg` (Intel) and
+  drag **Forge IDE** to Applications. The app is signed with a Developer ID and notarized by Apple.
+  The `…-apple-darwin.tar.gz` archives hold the bare `forge-ide` executable (also signed and
+  notarized) for running from a terminal.
+- **Windows / Linux:** extract the archive and run `forge-ide.exe` / `forge-ide`.
 
 ## Updates
 
 Release builds check for a new version on startup. When one is available, an
 **Update to …** button appears in the status bar. Click it to download and install the new version
-(verified against the release's `SHA256SUMS`), then **Restart to update**. Restarting is disabled
-while you have unsaved changes.
+(verified against the release's `SHA256SUMS`), then **Restart to update**. On macOS, an install
+from the disk image replaces the whole `Forge IDE.app` from the new release's disk image.
+Restarting is disabled while you have unsaved changes.
 
 You can also use **Help → Check for Updates**, or turn off the startup check under
 **Help → Check for Updates on Startup**. Builds you compile yourself only check when you ask.
