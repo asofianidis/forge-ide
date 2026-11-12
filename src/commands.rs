@@ -60,6 +60,8 @@ pub enum Command {
     ShowSourceControl,
     ShowPullRequests,
     ShowExtensions,
+    ShowAi,
+    NewAiThread,
     ShowProblems,
     ToggleBlame,
     NextChange,
@@ -171,6 +173,8 @@ impl Command {
         Command::ShowSourceControl,
         Command::ShowPullRequests,
         Command::ShowExtensions,
+        Command::ShowAi,
+        Command::NewAiThread,
         Command::ShowProblems,
         Command::ToggleBlame,
         Command::NextChange,
@@ -263,6 +267,8 @@ impl Command {
             Command::ShowSourceControl => "Source Control",
             Command::ShowPullRequests => "Pull Requests",
             Command::ShowExtensions => "Extensions",
+            Command::ShowAi => "BYO AI",
+            Command::NewAiThread => "New AI Thread",
             Command::ShowProblems => "Problems…",
             Command::ToggleBlame => "Toggle Blame",
             Command::NextChange => "Next Change",
@@ -334,6 +340,8 @@ impl Command {
             | ShowSourceControl
             | ShowPullRequests
             | ShowExtensions
+            | ShowAi
+            | NewAiThread
             | ShowProblems
             | ToggleBlame
             | FileHistory
@@ -450,6 +458,7 @@ impl Command {
             // Cmd+Shift+P is the command palette, as in other editors.
             Command::ShowPullRequests => &const { one(shortcut(CMD_SHIFT, Key::R)) },
             Command::ShowExtensions => &const { one(shortcut(CMD_SHIFT, Key::X)) },
+            Command::ShowAi => &const { one(shortcut(CMD_SHIFT, Key::A)) },
             Command::ToggleBlame => &const { one(shortcut(CMD_ALT, Key::B)) },
             Command::NextChange => &const { one(shortcut(ALT, Key::F5)) },
             // Ctrl+Space on every platform, as in other editors.

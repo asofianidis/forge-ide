@@ -1,7 +1,8 @@
 //! A small GitHub-flavored Markdown renderer for PR descriptions, comments
-//! and the Markdown preview: headings, paragraphs, lists, task lists, quotes,
-//! code blocks, tables (as monospace), rules, and inline
-//! code/bold/italic/links.
+//! and AI replies and the Markdown preview: headings, paragraphs, lists,
+//! task lists, quotes, code blocks, tables, rules, and inline
+//! code/bold/italic/links. Common inline HTML (`<b>`, `<a>`, `<br>`,
+//! `<table>`, `<details>`, …) is turned into the equivalent Markdown first.
 
 use egui::{Color32, RichText, Stroke, Ui};
 
@@ -13,8 +14,22 @@ enum Block {
     ListItem(usize, String, String),
     Quote(String),
     Code(String),
-    Table(String),
+    Table(Table),
     Rule,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Table {
+    header: Vec<String>,
+    align: Vec<Align>,
+    rows: Vec<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Align {
+    Left,
+    Center,
+    Right,
 }
 
 /// Renders markdown `src` into `ui`. Every link opens in the browser.
@@ -100,7 +115,12 @@ fn render(ui: &mut Ui, src: &str, empty: &str, local_links: bool) -> Option<Stri
                 ui.add_space(4.0);
                 link
             }
-            Block::Code(code) | Block::Table(code) => {
+            Block::Table(table) => {
+                let link = show_table(ui, table, local_links);
+                ui.add_space(6.0);
+                link
+            }
+            Block::Code(code) => {
                 egui::Frame::new()
                     .fill(ui.visuals().extreme_bg_color)
                     .corner_radius(6)
@@ -125,6 +145,68 @@ fn render(ui: &mut Ui, src: &str, empty: &str, local_links: bool) -> Option<Stri
         };
         clicked = clicked.or(link);
     }
+    clicked
+}
+
+/// A table as a grid: bold header, a rule under it, striped rows; long
+/// cells wrap, and a very wide table scrolls sideways.
+fn show_table(ui: &mut Ui, table: &Table, local_links: bool) -> Option<String> {
+    let cols = table
+        .header
+        .len()
+        .max(table.rows.iter().map(Vec::len).max().unwrap_or(0));
+    if cols == 0 {
+        return None;
+    }
+    let mut clicked = None;
+    let border = ui.visuals().widgets.noninteractive.bg_stroke.color;
+    let id = ui.next_auto_id();
+    egui::Frame::new()
+        .stroke(Stroke::new(1.0, border))
+        .corner_radius(6)
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            egui::ScrollArea::horizontal().id_salt(id).show(ui, |ui| {
+                // Share the width out, but let short tables stay narrow.
+                let max_col = (ui.available_width() / cols as f32).clamp(140.0, 420.0);
+                egui::Grid::new(id.with("grid"))
+                    .striped(true)
+                    .spacing([16.0, 6.0])
+                    .max_col_width(max_col)
+                    .show(ui, |ui| {
+                        let mut cell = |ui: &mut Ui, text: &str, col: usize, strong: bool| {
+                            let align = table.align.get(col).copied().unwrap_or(Align::Left);
+                            let layout = match align {
+                                Align::Left => egui::Layout::left_to_right(egui::Align::Center)
+                                    .with_main_wrap(true),
+                                Align::Center => egui::Layout::centered_and_justified(
+                                    egui::Direction::LeftToRight,
+                                ),
+                                Align::Right => egui::Layout::right_to_left(egui::Align::Center),
+                            };
+                            let link = ui
+                                .with_layout(layout, |ui| {
+                                    ui.spacing_mut().item_spacing.x = 0.0;
+                                    inline_contents(ui, text, None, strong, local_links)
+                                })
+                                .inner;
+                            clicked = clicked.take().or(link);
+                        };
+                        for c in 0..cols {
+                            let text = table.header.get(c).map_or("", String::as_str);
+                            cell(ui, text, c, true);
+                        }
+                        ui.end_row();
+                        for row in &table.rows {
+                            for c in 0..cols {
+                                let text = row.get(c).map_or("", String::as_str);
+                                cell(ui, text, c, false);
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+        });
     clicked
 }
 
@@ -307,7 +389,7 @@ fn strip_html_comments(src: &str) -> String {
 }
 
 fn parse(src: &str) -> Vec<Block> {
-    let src = strip_html_comments(&src.replace("\r\n", "\n"));
+    let src = html_to_markdown(&strip_html_comments(&src.replace("\r\n", "\n")));
     let mut blocks = Vec::new();
     let mut para = String::new();
     let mut lines = src.lines().peekable();
@@ -364,14 +446,32 @@ fn parse(src: &str) -> Vec<Block> {
                 lines.next();
             }
             blocks.push(Block::Quote(text));
+        } else if trimmed.contains('|') && lines.peek().is_some_and(|l| is_table_separator(l)) {
+            flush(&mut para, &mut blocks);
+            let header = split_row(trimmed);
+            let align = lines.next().map(table_alignment).unwrap_or_default();
+            let mut rows = Vec::new();
+            while let Some(next) = lines
+                .peek()
+                .filter(|l| l.contains('|') && !l.trim().is_empty())
+            {
+                rows.push(split_row(next));
+                lines.next();
+            }
+            blocks.push(Block::Table(Table {
+                header,
+                align,
+                rows,
+            }));
         } else if trimmed.starts_with('|') {
+            // Pipes without a header separator: keep the rows as written.
             flush(&mut para, &mut blocks);
             let mut rows = vec![trimmed.to_owned()];
             while let Some(next) = lines.peek().filter(|l| l.trim_start().starts_with('|')) {
                 rows.push(next.trim().to_owned());
                 lines.next();
             }
-            blocks.push(Block::Table(rows.join("\n")));
+            blocks.push(Block::Code(rows.join("\n")));
         } else if in_list_item && let Some(Block::ListItem(_, _, text)) = blocks.last_mut() {
             // A hard-wrapped list item continues on the next line.
             text.push(' ');
@@ -385,6 +485,390 @@ fn parse(src: &str) -> Vec<Block> {
     }
     flush(&mut para, &mut blocks);
     blocks
+}
+
+/// `|---|:--:|--:|` (outer pipes optional).
+fn is_table_separator(line: &str) -> bool {
+    let t = line.trim();
+    if !t.contains('-') {
+        return false;
+    }
+    let cells = split_row(t);
+    !cells.is_empty()
+        && cells.iter().all(|c| {
+            let c = c.trim();
+            let inner = c.trim_start_matches(':').trim_end_matches(':');
+            !inner.is_empty() && inner.chars().all(|ch| ch == '-')
+        })
+}
+
+fn table_alignment(line: &str) -> Vec<Align> {
+    split_row(line)
+        .iter()
+        .map(|c| {
+            let c = c.trim();
+            match (c.starts_with(':'), c.ends_with(':')) {
+                (true, true) => Align::Center,
+                (false, true) => Align::Right,
+                _ => Align::Left,
+            }
+        })
+        .collect()
+}
+
+/// The cells of a table row. `\|` and pipes inside backticks don't split.
+fn split_row(line: &str) -> Vec<String> {
+    let t = line.trim();
+    let t = t.strip_prefix('|').unwrap_or(t);
+    let t = t
+        .strip_suffix('|')
+        .filter(|r| !r.ends_with('\\'))
+        .unwrap_or(t);
+    let mut cells = Vec::new();
+    let mut cur = String::new();
+    let mut in_code = false;
+    let mut chars = t.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if chars.peek() == Some(&'|') => {
+                cur.push('|');
+                chars.next();
+            }
+            '`' => {
+                in_code = !in_code;
+                cur.push(c);
+            }
+            '|' if !in_code => cells.push(std::mem::take(&mut cur).trim().to_owned()),
+            _ => cur.push(c),
+        }
+    }
+    cells.push(cur.trim().to_owned());
+    cells
+}
+
+// ---- HTML ---------------------------------------------------------------
+
+/// Turns the HTML that shows up in Markdown (and in AI replies) into
+/// Markdown. Fenced code is left alone, as is anything inside backticks;
+/// tags this doesn't know (e.g. `Vec<String>`) stay as written.
+fn html_to_markdown(src: &str) -> String {
+    if !src.contains('<') && !src.contains('&') {
+        return src.to_owned();
+    }
+    let mut out = String::with_capacity(src.len());
+    let mut in_fence = false;
+    let mut html = HtmlState::default();
+    for line in src.split_inclusive('\n') {
+        let t = line.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            in_fence = !in_fence;
+            out.push_str(line);
+            continue;
+        }
+        if in_fence || html.in_pre {
+            // Inside <pre>, keep text but still close the block.
+            if html.in_pre {
+                convert_line(line, &mut html, &mut out);
+            } else {
+                out.push_str(line);
+            }
+            continue;
+        }
+        convert_line(line, &mut html, &mut out);
+    }
+    out
+}
+
+#[derive(Default)]
+struct HtmlState {
+    in_pre: bool,
+    /// Inside a `<table>`: cells in the current row, rows so far.
+    table: Option<(usize, usize)>,
+    /// Ordered-list counters, innermost last (`None` for `<ul>`).
+    lists: Vec<Option<usize>>,
+    /// Text of the open `<a href>`.
+    link: Option<String>,
+}
+
+fn convert_line(line: &str, st: &mut HtmlState, out: &mut String) {
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    let mut in_code = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '`' && !st.in_pre {
+            in_code = !in_code;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if in_code {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '&'
+            && let Some((text, len)) = entity(&chars[i..])
+        {
+            out.push_str(text);
+            i += len;
+            continue;
+        }
+        if c == '<'
+            && let Some((tag, len)) = parse_tag(&chars[i..])
+            && apply_tag(&tag, st, out)
+        {
+            i += len;
+            continue;
+        }
+        if st.table.is_some() && c == '\n' {
+            // Rows end at </tr>; stray line breaks inside a table don't.
+            i += 1;
+            continue;
+        }
+        if st.table.is_some() && c == '|' {
+            out.push_str("\\|");
+            i += 1;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+}
+
+fn entity(chars: &[char]) -> Option<(&'static str, usize)> {
+    const ENTITIES: [(&str, &str); 9] = [
+        ("&amp;", "&"),
+        ("&lt;", "<"),
+        ("&gt;", ">"),
+        ("&quot;", "\""),
+        ("&#39;", "'"),
+        ("&apos;", "'"),
+        ("&nbsp;", " "),
+        ("&mdash;", "—"),
+        ("&ndash;", "–"),
+    ];
+    let head: String = chars.iter().take(8).collect();
+    ENTITIES
+        .iter()
+        .find(|(e, _)| head.starts_with(e))
+        .map(|(e, t)| (*t, e.chars().count()))
+}
+
+#[derive(Debug, PartialEq)]
+struct Tag {
+    name: String,
+    closing: bool,
+    attrs: String,
+}
+
+/// Tags this converts; anything else is left as text.
+const KNOWN_TAGS: &[&str] = &[
+    "b",
+    "strong",
+    "i",
+    "em",
+    "code",
+    "kbd",
+    "s",
+    "del",
+    "strike",
+    "a",
+    "br",
+    "p",
+    "div",
+    "span",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "ul",
+    "ol",
+    "li",
+    "pre",
+    "details",
+    "summary",
+    "img",
+    "hr",
+    "table",
+    "thead",
+    "tbody",
+    "tfoot",
+    "tr",
+    "td",
+    "th",
+    "blockquote",
+    "sup",
+    "sub",
+    "u",
+    "mark",
+    "small",
+    "center",
+    "dl",
+    "dt",
+    "dd",
+    "section",
+    "article",
+    "header",
+    "footer",
+    "html",
+    "body",
+    "head",
+];
+
+fn parse_tag(chars: &[char]) -> Option<(Tag, usize)> {
+    let end = chars.iter().position(|&c| c == '>')?;
+    let inner: String = chars[1..end].iter().collect();
+    let inner = inner.trim();
+    let (closing, inner) = match inner.strip_prefix('/') {
+        Some(r) => (true, r.trim_start()),
+        None => (false, inner),
+    };
+    let inner = inner.strip_suffix('/').unwrap_or(inner).trim_end();
+    let name_len = inner
+        .find(|c: char| !c.is_ascii_alphanumeric())
+        .unwrap_or(inner.len());
+    let name = inner[..name_len].to_ascii_lowercase();
+    if !KNOWN_TAGS.contains(&name.as_str()) {
+        return None;
+    }
+    Some((
+        Tag {
+            name,
+            closing,
+            attrs: inner[name_len..].to_owned(),
+        },
+        end + 1,
+    ))
+}
+
+fn attr(attrs: &str, key: &str) -> Option<String> {
+    let lower = attrs.to_ascii_lowercase();
+    let at = lower.find(&format!("{key}="))? + key.len() + 1;
+    let rest = &attrs[at..];
+    let (quote, rest) = match rest.chars().next()? {
+        q @ ('"' | '\'') => (Some(q), &rest[1..]),
+        _ => (None, rest),
+    };
+    let end = match quote {
+        Some(q) => rest.find(q)?,
+        None => rest.find(char::is_whitespace).unwrap_or(rest.len()),
+    };
+    Some(rest[..end].to_owned())
+}
+
+/// Writes the Markdown for `tag`. Returns false to leave the tag as text.
+fn apply_tag(tag: &Tag, st: &mut HtmlState, out: &mut String) -> bool {
+    let open = !tag.closing;
+    match tag.name.as_str() {
+        "b" | "strong" => out.push_str("**"),
+        "i" | "em" => out.push('*'),
+        "s" | "del" | "strike" => out.push_str("~~"),
+        "code" | "kbd" if !st.in_pre => out.push('`'),
+        "code" | "kbd" => {}
+        "br" => out.push_str(if st.table.is_some() { " " } else { "  \n" }),
+        "hr" => out.push_str("\n\n---\n\n"),
+        "p" | "div" | "section" | "article" | "header" | "footer" | "center" | "blockquote"
+        | "dl" => {
+            if st.table.is_none() {
+                out.push_str("\n\n");
+            }
+        }
+        "dt" | "dd" => out.push('\n'),
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+            if open {
+                let level = tag.name[1..].parse::<usize>().unwrap_or(2);
+                out.push_str("\n\n");
+                out.push_str(&"#".repeat(level));
+                out.push(' ');
+            } else {
+                out.push_str("\n\n");
+            }
+        }
+        "ul" | "ol" => {
+            if open {
+                st.lists.push((tag.name == "ol").then_some(0));
+            } else {
+                st.lists.pop();
+            }
+            out.push('\n');
+        }
+        "li" => {
+            if open {
+                let depth = st.lists.len().saturating_sub(1);
+                out.push('\n');
+                out.push_str(&"  ".repeat(depth));
+                match st.lists.last_mut() {
+                    Some(Some(n)) => {
+                        *n += 1;
+                        out.push_str(&format!("{n}. "));
+                    }
+                    _ => out.push_str("- "),
+                }
+            }
+        }
+        "pre" => {
+            st.in_pre = open;
+            out.push_str("\n```\n");
+        }
+        "details" => out.push_str("\n\n"),
+        "summary" => out.push_str(if open { "\n**▸ " } else { "**\n\n" }),
+        "a" => {
+            if open {
+                st.link = attr(&tag.attrs, "href");
+                out.push('[');
+            } else {
+                match st.link.take() {
+                    Some(href) => out.push_str(&format!("]({href})")),
+                    None => out.push(']'),
+                }
+            }
+        }
+        "img" => {
+            let src = attr(&tag.attrs, "src").unwrap_or_default();
+            let alt = attr(&tag.attrs, "alt").unwrap_or_else(|| "image".to_owned());
+            out.push_str(&format!("![{alt}]({src})"));
+        }
+        "table" => {
+            if open {
+                st.table = Some((0, 0));
+                out.push_str("\n\n");
+            } else {
+                st.table = None;
+                out.push_str("\n\n");
+            }
+        }
+        "tr" => {
+            if let Some((cells, rows)) = &mut st.table {
+                if open {
+                    *cells = 0;
+                    out.push_str("\n|");
+                } else {
+                    if *rows == 0 {
+                        // Markdown tables need a separator under the header.
+                        out.push_str("\n|");
+                        out.push_str(&"---|".repeat((*cells).max(1)));
+                    }
+                    *rows += 1;
+                }
+            }
+        }
+        "td" | "th" => {
+            if let Some((cells, _)) = &mut st.table {
+                if open {
+                    out.push(' ');
+                } else {
+                    *cells += 1;
+                    out.push_str(" |");
+                }
+            }
+        }
+        // Wrappers with no Markdown equivalent: keep their text.
+        _ => {}
+    }
+    true
 }
 
 fn heading_level(line: &str) -> Option<usize> {
@@ -452,6 +936,51 @@ mod tests {
         assert_eq!(b[6], Block::Quote("quote".into()));
         assert_eq!(b[7], Block::Rule);
         assert!(matches!(b[8], Block::Table(_)));
+    }
+
+    #[test]
+    fn parses_tables_with_alignment_and_inline_pipes() {
+        let src = "| Area | Choice |\n|:---|---:|\n| GUI | `egui` / `a|b` |\n| Search | ripgrep \\| ignore |\n\nAfter";
+        let b = parse(src);
+        let Block::Table(t) = &b[0] else {
+            panic!("{b:?}")
+        };
+        assert_eq!(t.header, ["Area", "Choice"]);
+        assert_eq!(t.align, [Align::Left, Align::Right]);
+        assert_eq!(t.rows[0], ["GUI", "`egui` / `a|b`"]);
+        assert_eq!(t.rows[1], ["Search", "ripgrep | ignore"]);
+        assert_eq!(b[1], Block::Paragraph("After".into()));
+        // No outer pipes.
+        let b = parse("a | b\n--|--\n1 | 2");
+        assert!(matches!(&b[0], Block::Table(t) if t.rows == [["1", "2"]]));
+    }
+
+    #[test]
+    fn converts_html() {
+        let md = html_to_markdown(
+            "<p>Hi <b>there</b> &amp; <a href=\"https://x.dev\">link</a><br>next</p>\n<ul><li>one</li><li><code>two</code></li></ul>",
+        );
+        assert!(md.contains("Hi **there** & [link](https://x.dev)"), "{md}");
+        assert!(md.contains("- one") && md.contains("- `two`"), "{md}");
+
+        let md = html_to_markdown(
+            "<table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>x|y</td></tr></table>",
+        );
+        let b = parse(&md);
+        let t = b.iter().find_map(|b| match b {
+            Block::Table(t) => Some(t),
+            _ => None,
+        });
+        let t = t.unwrap_or_else(|| panic!("{md}"));
+        assert_eq!(t.header, ["A", "B"]);
+        assert_eq!(t.rows[0], ["1", "x|y"]);
+
+        // Code is left alone, and so are generics that look like tags.
+        let src = "Use `<b>` and Vec<String>\n```html\n<b>raw</b>\n```\n";
+        assert_eq!(html_to_markdown(src), src);
+
+        let md = html_to_markdown("<details><summary>More</summary>\nBody</details>");
+        assert!(md.contains("**▸ More**"), "{md}");
     }
 
     #[test]

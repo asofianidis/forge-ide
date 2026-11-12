@@ -224,6 +224,8 @@ impl ForgeApp {
             .unwrap_or(updater::IS_RELEASE_BUILD);
         let mut changed = false;
         let mut edit_file = false;
+        let colors = self.current_theme().ui.clone();
+        let mut ai_settings = self.settings.ai.clone();
         egui::Window::new("Settings")
             .open(&mut open)
             .collapsible(false)
@@ -285,6 +287,8 @@ impl ForgeApp {
                         ui.label("Check for updates on startup");
                         changed |= ui.checkbox(&mut auto_update, "").changed();
                         ui.end_row();
+
+                        self.ai.settings_rows(ui, &mut ai_settings, &colors);
                     });
                 ui.separator();
                 if let Some(path) = Settings::path() {
@@ -300,6 +304,10 @@ impl ForgeApp {
 
         if let Some(idx) = theme {
             self.set_theme(ctx, idx);
+        }
+        // Includes favorites starred in the pickers.
+        if ai_settings != self.settings.ai {
+            self.update_settings(|s| s.ai = ai_settings);
         }
         if changed {
             let s = &self.settings;

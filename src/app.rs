@@ -1,5 +1,6 @@
 //! Top-level application state and UI layout.
 
+mod ai_view;
 mod code_actions;
 mod editing;
 mod explorer;
@@ -23,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use egui::{Key, Modifiers, Rect, RichText, Shape, Stroke, TextStyle};
 
+use crate::ai::Ai;
 use crate::commands::Command;
 use crate::editor::conflicts::{self, Resolution};
 use crate::editor::find::Match;
@@ -192,6 +194,11 @@ pub struct ForgeApp {
     windows: Windows,
     /// Title last given to the OS window.
     window_title: String,
+    /// BYO AI: agent threads and AI-written git text.
+    ai: Ai,
+    /// Git state of the worktree the visible AI thread works in, for its
+    /// commit / push / PR button.
+    ai_worktree_sc: Option<(PathBuf, SourceControl)>,
 }
 
 impl ForgeApp {
@@ -306,6 +313,8 @@ impl ForgeApp {
             markdown_preview: HashSet::new(),
             windows: Windows::register(&cc.egui_ctx),
             window_title: String::new(),
+            ai: Ai::new(cc.egui_ctx.clone(), folder.as_deref()),
+            ai_worktree_sc: None,
         };
         if let Some(folder) = folder {
             app.folder_opened(&folder);
@@ -524,6 +533,7 @@ impl ForgeApp {
         self.status = format!("Opened folder {}", path.display());
         self.source_control.open(Some(&path));
         self.github.open(Some(&path));
+        self.ai.set_folder(Some(&path));
         self.panes.clear();
         self.active_pane = None;
         self.editor_git.clear();
@@ -629,6 +639,7 @@ impl ForgeApp {
             (Pane::Log(a), Pane::Log(b)) => a.key == b.key,
             (Pane::Markdown(a), Pane::Markdown(b)) => a.key == b.key,
             (Pane::Rebase(_), Pane::Rebase(_)) => true,
+            (Pane::Ai(a), Pane::Ai(b)) => a.id == b.id,
             _ => false,
         });
         match existing {
@@ -1205,6 +1216,12 @@ impl ForgeApp {
             Command::ReloadExtensions => self.reload_extensions(ctx, true),
             Command::OpenExtensionsFolder => self.open_extensions_folder(),
             Command::ExtensionGuide => self.show_extension_guide(),
+            Command::ShowAi => self.show_sidebar(SidebarView::Ai),
+            Command::NewAiThread => {
+                self.sidebar_view = SidebarView::Ai;
+                self.sidebar_open = true;
+                self.new_ai_thread();
+            }
             Command::ToggleBlame => self.editor_git.blame_on = !self.editor_git.blame_on,
             Command::NextChange => self.change_nav = Some(1),
             Command::PreviousChange => self.change_nav = Some(-1),
@@ -1410,6 +1427,7 @@ impl ForgeApp {
                 self.menu_item(ui, ShowSourceControl);
                 self.menu_item(ui, ShowPullRequests);
                 self.menu_item(ui, ShowExtensions);
+                self.menu_item(ui, ShowAi);
                 self.menu_item(ui, ShowProblems);
                 ui.separator();
                 let mut blame = self.editor_git.blame_on;
@@ -1589,6 +1607,7 @@ impl ForgeApp {
                     None => {}
                 }
             }
+            SidebarView::Ai => self.ai_sidebar(ui),
         }
     }
 
@@ -2032,6 +2051,10 @@ impl ForgeApp {
                 // Right-to-left so the preview toggle keeps its place at the
                 // end and the tabs scroll in the space left over.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if gi == 0 {
+                        // Commit / push / PR, shown while an AI thread tab is open.
+                        self.ai_git_button(ui);
+                    }
                     self.markdown_preview_button(ui);
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         self.tab_bar(ui, gi);
@@ -2045,6 +2068,11 @@ impl ForgeApp {
         if gi == 0
             && let Some(i) = self.active_pane.filter(|&i| i < self.panes.len())
         {
+            if let Pane::Ai(p) = &self.panes[i] {
+                let id = p.id.clone();
+                self.ai_thread_pane(ui, &id);
+                return;
+            }
             let action = self.panes[i].show(ui, &mut self.source_control, colors);
             match action {
                 Some(PaneAction::OpenFile(rel)) => self.open_repo_file(&rel),
@@ -2732,6 +2760,7 @@ impl eframe::App for ForgeApp {
         self.poll_watcher(&ctx);
         self.poll_disk(&ctx);
         self.source_control.poll();
+        self.poll_ai();
         self.github
             .watch_commit(self.source_control.status.branch.oid.clone());
         self.github
@@ -2755,6 +2784,7 @@ impl eframe::App for ForgeApp {
             .show(ui, |ui| {
                 let changes = self.source_control.status.change_count();
                 let review_requests = self.github.badge_count();
+                let agents = self.ai.running_count();
                 activity::show(
                     ui,
                     &mut self.sidebar_view,
@@ -2762,6 +2792,7 @@ impl eframe::App for ForgeApp {
                     |v| match v {
                         SidebarView::SourceControl => changes,
                         SidebarView::PullRequests => review_requests,
+                        SidebarView::Ai => agents,
                         SidebarView::Explorer | SidebarView::Search | SidebarView::Extensions => 0,
                     },
                     &colors,
@@ -2811,6 +2842,7 @@ impl eframe::App for ForgeApp {
     }
 
     fn on_exit(&mut self) {
+        self.ai.shutdown();
         self.persist_session(true);
         self.windows.unregister();
     }

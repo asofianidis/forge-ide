@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::ai::{Access, ModelChoice};
 use crate::keymap::Keys;
 use crate::theme::config_dir;
 
@@ -55,6 +56,30 @@ pub struct Settings {
     pub recent_folders: Vec<PathBuf>,
     /// Open tabs per folder, most recently used first.
     pub sessions: Vec<Session>,
+    /// The BYO AI view: which agent CLIs and models to use.
+    pub ai: AiSettings,
+}
+
+/// Models for the BYO AI view. Unset choices fall back to the first
+/// installed CLI's defaults.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiSettings {
+    /// What new threads may do without asking.
+    pub access: Access,
+    /// Starred models, as `provider:model`.
+    pub favorites: Vec<String>,
+    /// Model ids typed into the picker, as `provider:model`.
+    pub custom_models: Vec<String>,
+    /// Start new threads in their own git worktree.
+    pub new_thread_worktree: bool,
+    // Tables last: TOML needs plain values before them.
+    /// Model for new agent threads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<ModelChoice>,
+    /// Model that writes commit messages and pull request text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<ModelChoice>,
 }
 
 /// The tabs that were open in a folder, restored when it is opened again.
@@ -88,6 +113,7 @@ impl Default for Settings {
             breadcrumbs: true,
             minimap: true,
             terminal_shell: None,
+            ai: AiSettings::default(),
             disabled_extensions: Vec::new(),
             keybindings: BTreeMap::new(),
             recent_folders: Vec::new(),

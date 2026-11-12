@@ -6,8 +6,8 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
 
 ## Features
 
-- Activity bar with five sidebar views: **Explorer**, **Search**, **Source Control**, **Pull Requests**
-  and **Extensions**
+- Activity bar with six sidebar views: **Explorer**, **Search**, **Source Control**, **Pull Requests**,
+  **Extensions** and **BYO AI**
 - File explorer with lazily-loaded directory tree, colored by git status. Right-click to create
   files and folders (`a/b/c.rs` creates the folders in between), rename, delete (to the trash),
   reveal in Finder / File Explorer, or copy the path
@@ -213,6 +213,40 @@ handles sign-in and finds the GitHub repository from the folder's remotes. Insta
   close or reopen, request reviewers, check out the PR locally
 - Create a pull request from the current branch (pushing it first if needed)
 
+## BYO AI
+
+The **BYO AI** view (Cmd/Ctrl+Shift+A) runs the AI coding agents already installed on your machine,
+using your own sign-in and subscription: [Claude Code](https://docs.anthropic.com/claude-code)
+(`claude`), the [Cursor CLI](https://cursor.com/cli) (`cursor-agent`) and
+[Codex](https://github.com/openai/codex) (`codex`). Forge never sees an API key.
+
+- **Threads**: each conversation works in the open folder and is listed in the sidebar for that
+  folder. The text model names each thread from its first message (rename it by hand any time).
+  The sidebar groups them into **Working**, **Done** and a collapsed **Archived** section;
+  right-click a thread to archive or unarchive it (sending it a message also brings it back).
+  Replies render Markdown, including tables, and common HTML (`<b>`, `<a>`, `<br>`, `<table>`,
+  `<details>`, …). Threads open as tabs and show the agent's replies, tool calls (expand for output) and
+  cost. Later messages resume the same CLI session. Stop a running turn at any time.
+- **Worktrees**: before a thread's first message, the **⎇ Local / ⎇ New worktree** switch under
+  the message box picks where it runs. A worktree thread gets its own branch (from your current
+  one) and folder under `~/.forge/worktrees/<repo>/`, so the agent never touches your working copy.
+  The branch is renamed after the thread's title (e.g. `forge/fix-login-redirect`), and the
+  commit / push / PR button acts on it. Right-click the thread to open the worktree in a new
+  window or delete it with the thread (its branch is kept). Your last choice is the default.
+- **Settings** shows which agent CLIs were found (✓/✗, ⟳ to look again).
+- **Default models** are set in **Settings** (Ctrl+,): the *Default AI model* (and access) new
+  threads start with, and the *Commit & PR text model*.
+- **Model picker** (the pill under each thread's message box) switches the model for that thread
+  only, including before its first message: favorites and one tab per CLI, a searchable model
+  list (⌘1–⌘9 pick the first rows; type any model id to use it), the reasoning level, and the
+  access mode: **Full access**, **Edit files only** or **Read only**.
+- **One-click git** (right end of the tab bar while an AI thread tab is showing): *Commit, push & create PR* (or Commit / Commit & push / Push / Create PR,
+  whichever applies) writes the commit message and pull request text with a separately chosen
+  **text model**, usually a fast, cheap one. Source Control's *Generate* buttons use it too.
+
+Threads are saved in `ai-threads.json` next to `settings.toml`; model choices live under `[ai]`
+in `settings.toml`.
+
 ## Install
 
 Download the archive for your platform from the
@@ -243,7 +277,8 @@ To start a new series, bump the major or minor version in `Cargo.toml`.
 ## Settings
 
 Open **File → Settings…** (Ctrl+,) to change the color theme, editor font size, word wrap,
-line numbers, format on save and update checks. Changes apply and are saved right away.
+line numbers, format on save, update checks and the BYO AI default and text models. Changes apply
+and are saved right away.
 
 Settings live in `settings.toml` in the config folder (`~/.config/forge-ide/` on Linux,
 `~/Library/Application Support/forge-ide/` on macOS, `%APPDATA%\forge-ide\` on Windows).
@@ -361,6 +396,7 @@ cargo run --release -- path/to/project
 | Source control         | Ctrl+Shift+G                            |
 | Pull requests          | Ctrl+Shift+R                            |
 | Extensions             | Ctrl+Shift+X                            |
+| BYO AI                 | Ctrl+Shift+A                            |
 | Toggle blame           | Ctrl+Alt+B                              |
 | Next / previous change | Alt+F5 / Shift+Alt+F5                   |
 | Toggle line comment    | Ctrl+/                                  |
@@ -407,6 +443,13 @@ src/
 │   ├── preferences.rs   # Settings and Keyboard Shortcuts windows, font size / wrap / minimap
 │   ├── pickers.rs       # quick open, command palette, theme picker
 │   └── terminal_panel.rs # terminal panel: show / hide, restart
+├── ai/
+│   ├── provider.rs      # Claude / Cursor / Codex CLIs: detection, models, args, stream parsing
+│   ├── thread.rs        # threads, saving them, running one agent turn
+│   ├── textgen.rs       # commit message / PR text through the text model
+│   ├── flow.rs          # one-click commit, push and pull request
+│   ├── picker.rs        # model picker
+│   └── panel.rs         # BYO AI sidebar and thread tab
 ├── commands.rs          # every action: name, menu, default shortcut (menus + palette use it)
 ├── keymap.rs            # shortcuts in effect: defaults + [keybindings] from settings.toml
 ├── editorconfig.rs      # .editorconfig parsing, glob matching, save rules
