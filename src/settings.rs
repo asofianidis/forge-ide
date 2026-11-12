@@ -19,6 +19,8 @@ pub struct Settings {
     pub theme: Option<String>,
     /// Check for updates on startup. Defaults to on for release builds.
     pub auto_update: Option<bool>,
+    /// Format files with their language server when saving.
+    pub format_on_save: bool,
     /// Recently opened folders, most recent first.
     pub recent_folders: Vec<PathBuf>,
     /// Open tabs per folder, most recently used first.
