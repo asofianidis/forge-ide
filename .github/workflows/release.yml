@@ -74,6 +74,75 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libgtk-3-dev
       - name: Build
         run: cargo build --locked --release --target ${{ matrix.target }}
+      # Sign with the Developer ID certificate (hardened runtime + secure
+      # timestamp) and notarize with Apple so Gatekeeper accepts the binary.
+      # A bare executable can't have a ticket stapled to it; Gatekeeper looks
+      # the ticket up online on first launch instead.
+      - name: Sign and notarize (macOS)
+        if: runner.os == 'macOS'
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/forge-ide"
+
+          # Import the certificate into a throwaway keychain.
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password="$(uuidgen)"
+          echo "$MACOS_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/cert.p12"
+          # The .p12 holds only the leaf certificate; codesign needs the
+          # Developer ID G2 intermediate to treat the identity as valid.
+          curl -fsSL https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer \
+            -o "$RUNNER_TEMP/DeveloperIDG2CA.cer"
+          security import "$RUNNER_TEMP/DeveloperIDG2CA.cer" -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$keychain_password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" \
+            $(security list-keychains -d user | tr -d '"')
+
+          identity=$(security find-identity -v -p codesigning "$keychain" \
+            | grep "Developer ID Application" | head -1 | awk '{print $2}')
+          if [ -z "$identity" ]; then
+            echo "::error::No Developer ID Application identity in MACOS_CERTIFICATE_P12"
+            exit 1
+          fi
+
+          codesign --force --options runtime --timestamp \
+            --identifier dev.forge-ide.forge-ide \
+            --keychain "$keychain" --sign "$identity" "$bin"
+          codesign --verify --strict --verbose=2 "$bin"
+
+          # notarytool takes a zip, not a tar.gz; the zip is only for upload.
+          ditto -c -k --keepParent "$bin" "$RUNNER_TEMP/notarize.zip"
+          result=$(xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait --timeout 30m --output-format json)
+          echo "$result"
+          id=$(echo "$result" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+          status=$(echo "$result" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')
+          if [ "$status" != "Accepted" ]; then
+            xcrun notarytool log "$id" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" || true
+            echo "::error::Notarization failed with status: $status"
+            exit 1
+          fi
+      - name: Clean up signing keychain
+        if: always() && runner.os == 'macOS'
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
       - name: Package
         shell: bash
         run: |
