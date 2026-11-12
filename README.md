@@ -151,7 +151,7 @@ using your own sign-in and subscription: [Claude Code](https://docs.anthropic.co
   only, including before its first message: favorites and one tab per CLI, a searchable model
   list (⌘1–⌘9 pick the first rows; type any model id to use it), the reasoning level, and the
   access mode: **Full access**, **Edit files only** or **Read only**.
-- **One-click git**: *Commit, push & create PR* (or Commit / Commit & push / Push / Create PR,
+- **One-click git** (right end of the tab bar while an AI thread tab is showing): *Commit, push & create PR* (or Commit / Commit & push / Push / Create PR,
   whichever applies) writes the commit message and pull request text with a separately chosen
   **text model**, usually a fast, cheap one. Source Control's *Generate* buttons use it too.
 

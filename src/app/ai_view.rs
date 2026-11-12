@@ -65,10 +65,33 @@ impl ForgeApp {
 
     pub(super) fn ai_sidebar(&mut self, ui: &mut egui::Ui) {
         let colors = self.current_theme().ui.clone();
-        let git = self.git_summary();
         let mut ai_settings = self.settings.ai.clone();
         ui.add_space(4.0);
-        let actions = self.ai.sidebar(ui, &mut ai_settings, &git, &colors);
+        let actions = self.ai.sidebar(ui, &mut ai_settings, &colors);
+        self.handle_ai_actions(actions);
+        if ai_settings != self.settings.ai {
+            self.update_settings(|s| s.ai = ai_settings);
+        }
+    }
+
+    /// The commit / push / PR button at the right end of the tab bar.
+    /// `ui` lays out right to left.
+    pub(super) fn ai_git_button(&mut self, ui: &mut egui::Ui) {
+        // Only alongside an AI thread tab that is being viewed.
+        let ai_tab = matches!(
+            self.active_pane.and_then(|i| self.panes.get(i)),
+            Some(Pane::Ai(_))
+        );
+        if self.workspace.is_none() || !ai_tab {
+            return;
+        }
+        let colors = self.current_theme().ui.clone();
+        let git = self.git_summary();
+        let actions = self.ai.git_button(ui, &self.settings.ai, &git, &colors);
+        self.handle_ai_actions(actions);
+    }
+
+    fn handle_ai_actions(&mut self, actions: Vec<SidebarAction>) {
         for action in actions {
             match action {
                 SidebarAction::OpenThread(id) => self.open_ai_thread(id),
@@ -85,9 +108,6 @@ impl ForgeApp {
                 SidebarAction::OpenPr(n) => self.open_pull_request(n),
                 SidebarAction::OpenSettings => self.settings_open = true,
             }
-        }
-        if ai_settings != self.settings.ai {
-            self.update_settings(|s| s.ai = ai_settings);
         }
     }
 

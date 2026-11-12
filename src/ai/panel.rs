@@ -99,7 +99,6 @@ impl Ai {
         &mut self,
         ui: &mut Ui,
         settings: &mut AiSettings,
-        git: &GitSummary,
         colors: &UiColors,
     ) -> Vec<SidebarAction> {
         let mut actions = Vec::new();
@@ -258,10 +257,6 @@ impl Ai {
 
         ui.add_space(4.0);
         ui.separator();
-        self.git_card(ui, settings, git, colors, &mut actions);
-
-        ui.add_space(4.0);
-        ui.separator();
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
             for p in Provider::ALL {
@@ -284,56 +279,45 @@ impl Ai {
         actions
     }
 
-    fn git_card(
+    /// The one-click git split button for the tab bar, laid out right to
+    /// left (the caller gives a right-to-left `ui`).
+    pub fn git_button(
         &mut self,
         ui: &mut Ui,
-        settings: &mut AiSettings,
+        settings: &AiSettings,
         git: &GitSummary,
         colors: &UiColors,
-        actions: &mut Vec<SidebarAction>,
-    ) {
-        section(ui, "GIT", colors);
+    ) -> Vec<SidebarAction> {
+        let mut actions = Vec::new();
         if !git.is_repo {
-            ui.label(
-                RichText::new("This folder isn't a git repository.")
-                    .small()
-                    .color(colors.text_muted.0),
-            );
-            return;
+            return actions;
         }
-        let summary = match (&git.branch, git.changes) {
-            (Some(b), 0) => format!("{b} · no changes"),
-            (Some(b), n) => format!("{b} · {n} changed file{}", if n == 1 { "" } else { "s" }),
-            (None, n) => format!("detached HEAD · {n} changed"),
+        let text = self.text_choice(settings);
+        let writer = if self.is_installed(text.provider) {
+            format!("Text by {} (change in Settings)", text.label())
+        } else {
+            format!(
+                "Built-in text: the {} CLI isn't installed (change in Settings)",
+                text.provider.name()
+            )
         };
-        ui.label(RichText::new(summary).small().color(colors.text_muted.0));
 
         if let Some(flow) = &self.flow {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(RichText::new(flow.progress()).small())
-                    .on_hover_text(flow.kind.label());
-            });
-        } else {
-            let flows = git.flows();
-            let busy = git.busy;
-            ui.horizontal(|ui| match flows.first() {
-                Some(primary) => {
-                    let accent = egui::Button::new(
-                        RichText::new(primary.label()).color(colors.accent_text.0),
-                    )
-                    .fill(colors.accent.0);
-                    if ui
-                        .add_enabled(!busy, accent)
-                        .on_hover_text(flow_tip(*primary, git))
-                        .on_disabled_hover_text("Waiting for another git operation")
-                        .clicked()
-                    {
-                        actions.push(SidebarAction::StartFlow(*primary));
-                    }
-                    if flows.len() > 1 {
-                        ui.add_enabled_ui(!busy, |ui| {
-                            ui.menu_button("▾", |ui| {
+            ui.label(RichText::new(flow.progress()).small())
+                .on_hover_text(flow.kind.label());
+            ui.spinner();
+            return actions;
+        }
+
+        let flows = git.flows();
+        let busy = git.busy;
+        ui.spacing_mut().item_spacing.x = 1.0;
+        match flows.first() {
+            Some(primary) => {
+                if flows.len() > 1 {
+                    ui.add_enabled_ui(!busy, |ui| {
+                        let r =
+                            ui.menu_button(RichText::new("▾").color(colors.accent_text.0), |ui| {
                                 for f in &flows {
                                     if ui
                                         .button(f.label())
@@ -343,63 +327,65 @@ impl Ai {
                                         actions.push(SidebarAction::StartFlow(*f));
                                     }
                                 }
+                                ui.separator();
+                                if ui.button("Change text model…").clicked() {
+                                    actions.push(SidebarAction::OpenSettings);
+                                }
                             });
-                        });
-                    }
+                        r.response.on_hover_text("More git actions");
+                    });
                 }
-                None => match &git.pr {
-                    Some((n, title)) => {
-                        if ui
-                            .button(format!("View PR #{n}"))
-                            .on_hover_text(title)
-                            .clicked()
-                        {
-                            actions.push(SidebarAction::OpenPr(*n));
-                        }
-                    }
-                    None => {
-                        let why = if git.conflicts > 0 {
-                            "Resolve merge conflicts first"
-                        } else if git.on_default_branch() && git.gh_ready {
-                            "Nothing to commit. Switch to a feature branch to open a PR."
-                        } else {
-                            "Nothing to commit"
-                        };
-                        ui.label(RichText::new(why).small().color(colors.text_muted.0));
-                    }
-                },
-            });
-        }
-        if let Some((ok, msg, url)) = &self.flow_result {
-            let color = if *ok { colors.added.0 } else { colors.error.0 };
-            ui.label(RichText::new(msg).small().color(color));
-            if let Some(url) = url {
-                ui.hyperlink_to(RichText::new(url).small(), url);
+                let button =
+                    egui::Button::new(RichText::new(primary.label()).color(colors.accent_text.0))
+                        .fill(colors.accent.0);
+                if ui
+                    .add_enabled(!busy, button)
+                    .on_hover_text(format!("{}\n{writer}", flow_tip(*primary, git)))
+                    .on_disabled_hover_text("Waiting for another git operation")
+                    .clicked()
+                {
+                    actions.push(SidebarAction::StartFlow(*primary));
+                }
+            }
+            None => {
+                if let Some((n, title)) = &git.pr
+                    && ui
+                        .button(format!("View PR #{n}"))
+                        .on_hover_text(title)
+                        .clicked()
+                {
+                    actions.push(SidebarAction::OpenPr(*n));
+                }
             }
         }
+        ui.spacing_mut().item_spacing.x = 8.0;
 
-        ui.add_space(2.0);
-        let text = self.text_choice(settings);
-        let note = if self.is_installed(text.provider) {
-            format!("Text by {} · change in Settings", text.label())
-        } else {
-            format!(
-                "Built-in text ({} CLI missing) · change in Settings",
-                text.provider.name()
-            )
-        };
-        if ui
-            .add(
-                egui::Label::new(RichText::new(note).small().color(colors.text_muted.0))
-                    .sense(Sense::click()),
-            )
-            .on_hover_text(
-                "Open Settings to pick the model that writes commit messages and PR text",
-            )
-            .clicked()
+        // The last run's outcome, for a little while.
+        if let Some((ok, msg, url, at)) = &self.flow_result
+            && at.elapsed() < std::time::Duration::from_secs(30)
         {
-            actions.push(SidebarAction::OpenSettings);
+            if *ok {
+                match url {
+                    Some(url) => {
+                        ui.hyperlink_to(
+                            RichText::new("✓ PR opened ↗").small().color(colors.added.0),
+                            url,
+                        )
+                        .on_hover_text(msg);
+                    }
+                    None => {
+                        ui.label(RichText::new("✓ Done").small().color(colors.added.0))
+                            .on_hover_text(msg);
+                    }
+                }
+            } else {
+                ui.label(RichText::new("✗ Failed").small().color(colors.error.0))
+                    .on_hover_text(msg);
+            }
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs(1));
         }
+        actions
     }
 
     /// Rows for the Settings window's grid: the default agent model (and its

@@ -1495,7 +1495,23 @@ impl ForgeApp {
         }
     }
 
+    /// Tabs on the left, the one-click git button on the right.
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
+        let height = ui.spacing().interact_size.y + 6.0;
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), height),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                self.ai_git_button(ui);
+                ui.add_space(6.0);
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    self.tabs(ui)
+                });
+            },
+        );
+    }
+
+    fn tabs(&mut self, ui: &mut egui::Ui) {
         let mut to_close = None;
         let mut pane_clicked = None;
         let mut pane_to_close = None;

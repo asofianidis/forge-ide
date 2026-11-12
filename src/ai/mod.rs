@@ -49,8 +49,8 @@ pub struct Ai {
     /// Thread being renamed and its new name.
     renaming: Option<(String, String)>,
     pub flow: Option<GitFlow>,
-    /// Last finished git flow: (succeeded, message, PR URL).
-    flow_result: Option<(bool, String, Option<String>)>,
+    /// Last finished git flow: (succeeded, message, PR URL, when).
+    flow_result: Option<(bool, String, Option<String>, std::time::Instant)>,
     status: Vec<String>,
     /// Titles being written by the text model: (thread id, result).
     title_tasks: Vec<(String, crate::task::Pending<Result<String, String>>)>,
@@ -365,8 +365,13 @@ impl Ai {
         let result = self.flow.as_mut()?.poll()?;
         self.flow = None;
         self.flow_result = Some(match &result {
-            Ok(done) => (true, done.summary.clone(), done.pr_url.clone()),
-            Err(e) => (false, e.clone(), None),
+            Ok(done) => (
+                true,
+                done.summary.clone(),
+                done.pr_url.clone(),
+                std::time::Instant::now(),
+            ),
+            Err(e) => (false, e.clone(), None, std::time::Instant::now()),
         });
         Some(result)
     }
