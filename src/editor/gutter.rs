@@ -18,13 +18,17 @@ const PADDING: f32 = 8.0;
 /// `TextEdit` margins are `i8`, so the gutter can never be wider than this.
 const MAX_WIDTH: f32 = i8::MAX as f32;
 
-/// Width of a gutter that fits `line_count` line numbers.
-pub fn width(line_count: usize, digit_width: f32) -> f32 {
+/// Width of a gutter that fits `line_count` line numbers, or just the change
+/// markers when line numbers are hidden.
+pub fn width(line_count: usize, digit_width: f32, numbers: bool) -> f32 {
+    if !numbers {
+        return 2.0 * PADDING;
+    }
     let digits = line_count.max(1).ilog10() as f32 + 1.0;
     (digits.max(2.0) * digit_width + 2.0 * PADDING).min(MAX_WIDTH)
 }
 
-/// Paints line numbers next to each logical line of the laid-out text.
+/// Paints line numbers (if `numbers`) next to each logical line of the laid-out text.
 ///
 /// Wrapped continuation rows get no number. Only rows inside the clip rect are painted.
 /// When `changes` is given, lines that differ from the committed version get
@@ -34,6 +38,7 @@ pub fn paint(
     output: &TextEditOutput,
     current_line: usize,
     font: &FontId,
+    numbers: bool,
     changes: Option<(&LineChanges, &MarkColors)>,
 ) {
     let painter = ui.painter();
@@ -68,7 +73,7 @@ pub fn paint(
                 colors,
             );
         }
-        if starts_line && visible {
+        if numbers && starts_line && visible {
             let color: Color32 = if line == current_line { strong } else { dim };
             painter.text(
                 pos2(right, rect.top()),
@@ -157,13 +162,19 @@ mod tests {
 
     #[test]
     fn width_grows_with_digit_count() {
-        assert_eq!(width(1, 10.0), width(99, 10.0));
-        assert!(width(100, 10.0) > width(99, 10.0));
-        assert!(width(10_000, 10.0) > width(1_000, 10.0));
+        assert_eq!(width(1, 10.0, true), width(99, 10.0, true));
+        assert!(width(100, 10.0, true) > width(99, 10.0, true));
+        assert!(width(10_000, 10.0, true) > width(1_000, 10.0, true));
     }
 
     #[test]
     fn width_is_capped_to_margin_range() {
-        assert_eq!(width(usize::MAX, 50.0), MAX_WIDTH);
+        assert_eq!(width(usize::MAX, 50.0, true), MAX_WIDTH);
+    }
+
+    #[test]
+    fn hidden_numbers_leave_room_for_change_markers() {
+        assert_eq!(width(1, 10.0, false), width(100_000, 10.0, false));
+        assert!(width(1, 10.0, false) < width(1, 10.0, true));
     }
 }

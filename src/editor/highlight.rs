@@ -288,6 +288,16 @@ mod tests {
     }
 
     #[test]
+    fn font_change_rebuilds_cached_job() {
+        let mut h = highlighter();
+        let small = h.highlight(RUST, "rs", FontId::monospace(10.0));
+        let large = h.highlight(RUST, "rs", FontId::monospace(20.0));
+        assert!(small.sections.iter().all(|s| s.format.font_id.size == 10.0));
+        assert!(large.sections.iter().all(|s| s.format.font_id.size == 20.0));
+        assert_eq!(sections(&small), sections(&large));
+    }
+
+    #[test]
     fn changing_language_starts_over() {
         let mut h = highlighter();
         h.highlight(RUST, "rs", font());

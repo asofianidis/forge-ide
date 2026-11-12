@@ -39,6 +39,8 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
 - Git source control (see below) with live change markers in the editor gutter
 - GitHub pull requests through the GitHub CLI (see below)
 - Themes: built-in **Blossom** (default) and **Blossom Light**, plus custom TOML themes
+- Settings window (Ctrl+,): color theme, font size, word wrap, line numbers, format on save,
+  update checks. Changes apply and save immediately; the file can also be edited as TOML
 - Automatic updates from GitHub releases
 
 ## Language servers
@@ -151,6 +153,28 @@ checks and tests the code, builds all platforms, and publishes a GitHub release 
 `v<major>.<minor>.<run number>`, using the major/minor from `Cargo.toml`, e.g. `v0.1.42`.
 To start a new series, bump the major or minor version in `Cargo.toml`.
 
+## Settings
+
+Open **File → Settings…** (Ctrl+,) to change the color theme, editor font size, word wrap,
+line numbers, format on save and update checks. Changes apply and are saved right away.
+
+Settings live in `settings.toml` in the config folder (`~/.config/forge-ide/` on Linux,
+`~/Library/Application Support/forge-ide/` on macOS, `%APPDATA%\forge-ide\` on Windows).
+Set `FORGE_SETTINGS` to use a different file. **Edit as TOML** in the Settings window (or
+**File → Open Settings File**) opens it in a tab, and saving that tab applies it. Missing
+keys use their defaults, and the font size is kept between 8 and 32.
+
+```toml
+theme = "Blossom"       # any built-in or custom theme name
+font_size = 14.0
+word_wrap = false
+line_numbers = true
+format_on_save = false
+auto_update = true      # check for updates on startup (default: on for release builds)
+```
+
+The same file also remembers recent folders and each folder's open tabs.
+
 ## Themes
 
 Switch themes from **View → Theme**. Your choice is remembered between sessions.
@@ -219,6 +243,9 @@ cargo run --release -- path/to/project
 | Format document        | Ctrl+Shift+I                            |
 | Problems               | Ctrl+Shift+M                            |
 | Next / prev. problem   | F8 / Shift+F8                           |
+| Settings               | Ctrl+,                                  |
+| Toggle word wrap       | Alt+Z                                   |
+| Font size bigger / smaller / reset | Ctrl+= / Ctrl+- / Ctrl+0    |
 
 (Cmd instead of Ctrl on macOS, except for Go to line.) macOS uses Cmd+H to hide the app, so
 Replace is also on Cmd+Option+F there. Every action is also in the command palette.
@@ -235,6 +262,7 @@ src/
 │   ├── language.rs      # diagnostics, hover, completion, definition, rename, formatting UI
 │   ├── find_bar.rs      # find / replace bar
 │   ├── search_panel.rs  # "Search" sidebar
+│   ├── preferences.rs   # Settings window, font size / word wrap / line numbers
 │   └── pickers.rs       # quick open, command palette, theme picker
 ├── commands.rs          # every action: name, menu, shortcut (menus + palette use it)
 ├── palette.rs           # list picker used by quick open and the command palette
@@ -302,7 +330,7 @@ src/
 - [ ] LSP client (diagnostics, completion, go to definition)
 - [x] Themes
 - [x] Git source control and GitHub pull requests
-- [ ] Settings UI
+- [x] Settings UI
 
 ## License
 
