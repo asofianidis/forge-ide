@@ -1283,12 +1283,7 @@ impl ForgeApp {
                 ui.horizontal(|ui| {
                     for (idx, doc) in self.documents.iter().enumerate() {
                         let selected = idx == self.active && self.active_pane.is_none();
-                        let label = if doc.is_dirty() {
-                            format!("● {}", doc.title())
-                        } else {
-                            doc.title()
-                        };
-                        let text = egui::RichText::new(label).color(if selected {
+                        let text = egui::RichText::new(doc.title()).color(if selected {
                             colors.text.0
                         } else {
                             colors.text_muted.0
@@ -1316,11 +1311,12 @@ impl ForgeApp {
                             self.active = idx;
                             self.active_pane = None;
                         }
-                        if ui
-                            .add(egui::Button::new("×").small().frame(false))
-                            .on_hover_text("Close")
-                            .clicked()
-                        {
+                        if response.middle_clicked() {
+                            to_close = Some(idx);
+                        }
+                        let close =
+                            tab_close_button(ui, &colors, response.rect, selected, doc.is_dirty());
+                        if close.clicked() {
                             to_close = Some(idx);
                         }
                         ui.add_space(4.0);
@@ -1367,11 +1363,11 @@ impl ForgeApp {
                         if response.clicked() {
                             pane_clicked = Some(idx);
                         }
-                        if ui
-                            .add(egui::Button::new("×").small().frame(false))
-                            .on_hover_text("Close")
-                            .clicked()
-                        {
+                        if response.middle_clicked() {
+                            pane_to_close = Some(idx);
+                        }
+                        let close = tab_close_button(ui, &colors, response.rect, selected, false);
+                        if close.clicked() {
                             pane_to_close = Some(idx);
                         }
                         ui.add_space(4.0);
@@ -1868,6 +1864,62 @@ fn open_path(path: &Path) -> anyhow::Result<()> {
     let program = "xdg-open";
     std::process::Command::new(program).arg(path).spawn()?;
     Ok(())
+}
+
+/// The close button that trails a tab.
+///
+/// The × is faint on idle background tabs and brightens when the tab is
+/// active or hovered; hovering the button itself gives it a rounded
+/// highlight. Unsaved tabs show a dot in this slot that turns into the ×
+/// on hover, so closing never requires hunting for a tiny glyph.
+fn tab_close_button(
+    ui: &mut egui::Ui,
+    colors: &UiColors,
+    tab_rect: Rect,
+    selected: bool,
+    dirty: bool,
+) -> egui::Response {
+    let size = egui::vec2(18.0, tab_rect.height().max(18.0));
+    let (slot, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let tab_hovered = ui.rect_contains_pointer(tab_rect.union(slot));
+    let hovered = response.hovered();
+    if ui.is_rect_visible(slot) {
+        let button = Rect::from_center_size(slot.center(), egui::vec2(18.0, 18.0));
+        let painter = ui.painter();
+        if hovered {
+            let fill = if response.is_pointer_button_down_on() {
+                colors.border.0
+            } else {
+                colors.widget_hover.0
+            };
+            painter.rect_filled(button, 4.0, fill);
+        }
+        if dirty && !hovered {
+            let color = if selected || tab_hovered {
+                colors.text.0
+            } else {
+                colors.text_muted.0
+            };
+            painter.circle_filled(button.center(), 3.5, color);
+        } else {
+            let color = if hovered || selected {
+                colors.text.0
+            } else if tab_hovered {
+                colors.text_muted.0
+            } else {
+                colors.text_muted.0.gamma_multiply(0.45)
+            };
+            icons::paint(painter, button.shrink(3.0), Icon::Close, color);
+        }
+    }
+    let tip = if selected {
+        let shortcut = Command::CloseTab.shortcuts()[0];
+        format!("Close ({})", ui.ctx().format_shortcut(&shortcut))
+    } else {
+        "Close".to_owned()
+    };
+    response.on_hover_text(tip)
 }
 
 impl eframe::App for ForgeApp {
