@@ -6,8 +6,8 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
 
 ## Features
 
-- Activity bar with five sidebar views: **Explorer**, **Search**, **Source Control**, **Pull Requests**
-  and **BYO AI**
+- Activity bar with six sidebar views: **Explorer**, **Search**, **Source Control**, **Pull Requests**,
+  **Extensions** and **BYO AI**
 - File explorer with lazily-loaded directory tree, colored by git status. Right-click to create
   files and folders (`a/b/c.rs` creates the folders in between), rename, delete (to the trash),
   reveal in Finder / File Explorer, or copy the path
@@ -15,18 +15,44 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
   git status follow changes made by other programs as they happen. Unmodified open files reload;
   files with unsaved edits show a banner to reload or keep your version
 - Tabbed editing with unsaved-change indicators
+- A custom editor widget that lays out and paints only the rows on screen (and, for very long
+  lines, only their visible part), reading them from the rope. Syntax highlighting is computed
+  lazily for the lines shown and follows edits incrementally, so opening, scrolling and typing
+  in large files stay fast
 - Rope-backed buffers with grouped undo/redo history. Every edit is undoable, including line
   commands, replace, hunk revert, conflict resolution, language-server edits and reloads from
-  disk; undoing back to the saved state clears the unsaved marker.
-  *Limitation:* egui's `TextEdit` needs the text as one contiguous string, so the buffer keeps a
-  `String` mirror for rendering and layout is still O(file size). Truly large files need a custom
-  editor widget that lays out only the visible lines; the buffer is the model for that.
+  disk; undoing back to the saved state clears the unsaved marker and restores the cursors.
+  (Find, git and language servers still read a `String` mirror of the text.)
+- **Multiple cursors**: Alt+click adds a cursor (Alt+click on one removes it), Alt+Shift+drag
+  selects a column, Cmd/Ctrl+Alt+Up/Down adds a cursor above/below, Cmd/Ctrl+D adds the next
+  occurrence of the selection, Cmd/Ctrl+Shift+L selects every occurrence, Shift+Alt+I puts a
+  cursor at the end of each selected line, Escape goes back to one. Typing, typing aids,
+  clipboard (one line per cursor) and line commands work at every cursor
+- **Code folding** by indentation, or by the language server's folding ranges where it has
+  them: click the chevrons in the gutter or the `⋯` after a folded line, or use Fold / Unfold
+  (Cmd/Ctrl+Alt+[ / ]) and Fold All / Unfold All
+- **Split editors** (Cmd/Ctrl+\\): up to three editor groups side by side, each with its own tabs.
+  The same file can be open in several groups, each view with its own cursors, folds and
+  scroll position. Drag the divider to resize; right-click a tab to split it or move it to the
+  next group; Cmd/Ctrl+1/2/3 focuses a group. Diff, commit and PR tabs open in the first group
 - Session restore: each folder reopens with the tabs, selected tab and cursor positions it had
   last time. Starting Forge without a folder argument opens the last folder you used
   (`forge-ide .` opens the current directory)
 - **File → Open Recent** (or Ctrl+R) lists the last 10 folders you opened
+- Multiple windows: **Window → New Window** (Ctrl+Shift+N) opens an empty window, and the
+  **Window** menu lists every open Forge window by folder; click one to switch to it. Each window
+  is its own process, so a busy language server or terminal in one never stalls another. Opening
+  a folder that another window already has switches to that window
 - Syntax highlighting for many languages (via [syntect](https://github.com/trishume/syntect))
+- Markdown preview (Cmd/Ctrl+Shift+V, the eye button at the end of the tab bar, or
+  **View → Markdown Preview**): renders the open `.md` file beside the editor and follows your
+  edits as you type. Web links open in the browser; relative links (`docs/guide.md`,
+  `/src/main.rs`) open the file in the editor
 - Line-number gutter with current-line highlight
+- Minimap (**View → Minimap**): a zoomed-out, syntax-colored view of the file beside the editor
+  with the visible part outlined. Click or drag it to scroll; the mouse wheel over it scrolls too
+- [EditorConfig](https://editorconfig.org) support (see below)
+- Customizable keyboard shortcuts in `settings.toml` (see below)
 - Cursor line/column in the status bar
 - Find and replace in the current file, with match case, whole word and regex options
   (regex replacements can use `$1` / `${name}` capture groups)
@@ -48,9 +74,44 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
 - Integrated terminal (Ctrl+\`): your shell in a pseudo-terminal below the editor, with colors
   and scrollback (see below)
 - Themes: built-in **Blossom** (default) and **Blossom Light**, plus custom TOML themes
-- Settings window (Ctrl+,): color theme, font size, word wrap, line numbers, format on save,
+- Settings window (Ctrl+,): color theme, font size, word wrap, line numbers, minimap, format on save,
   update checks. Changes apply and save immediately; the file can also be edited as TOML
+- Extensions installed from `.zip` files: commands that run any program with the open file or
+  selection (palette, shortcuts, on save) and color themes (see below)
 - Automatic updates from GitHub releases
+
+## EditorConfig
+
+Forge reads `.editorconfig` files from the edited file's folder upward, stopping at one with
+`root = true`. Closer files win, and later sections win within a file. Supported properties:
+
+- `indent_style`, `indent_size`, `tab_width`: what Tab, Enter, indent/outdent and language server
+  formatting use. Anything left unset falls back to the indentation the file already uses
+- `end_of_line` (`lf` or `crlf`), `trim_trailing_whitespace`, `insert_final_newline`: applied
+  when saving, as one undoable edit
+
+Globs support `*`, `**`, `?`, `[abc]`, `[!abc]`, `{a,b}` and `{1..9}`. Changes to `.editorconfig`
+files apply to open tabs right away. Not supported: `end_of_line = cr`, `charset`, and drawing tabs
+`tab_width` wide (the editor always draws a tab four spaces wide).
+
+## Keyboard shortcuts
+
+**File → Keyboard Shortcuts…** lists every command with its id and current shortcuts. To change one,
+add the command id to `[keybindings]` in `settings.toml`:
+
+```toml
+[keybindings]
+toggle_terminal = "cmd+j"                          # replaces the default
+duplicate_line = ["cmd+shift+d", "alt+shift+down"] # several shortcuts
+go_to_line = []                                    # no shortcut
+```
+
+`cmd` means Cmd on macOS and Ctrl elsewhere; `ctrl`, `alt` (or `option`) and `shift` mean the same
+key everywhere. Keys are letters, digits, `f1`–`f35`, names like `up`, `pagedown`, `esc`, `enter`,
+`space`, or punctuation (`cmd+,`, `` ctrl+` ``, `cmd++`). A shortcut you assign is taken away from any
+command that had it by default. Mistakes (an unknown command or key, or one shortcut given to two
+commands) are reported in the status bar and the Keyboard Shortcuts window, and that command keeps
+its defaults. Changes apply when the settings file is saved.
 
 ## Language servers
 
@@ -66,6 +127,23 @@ it is doing (e.g. indexing progress).
 - **Completion** as you type, after trigger characters like `.`, or with Ctrl+Space. Up/Down to
   choose, Enter or Tab to accept, Escape to dismiss. Snippets and auto-imports are applied
 - **Rename symbol** (F2) across files, **Find all references** (Shift+F12)
+- **Quick fixes and code actions** (Cmd/Ctrl+.): fixes for the diagnostic under the caret,
+  refactors and source actions, in a menu at the caret. Hovering a problem also offers
+  **Quick Fix…**. Actions that need the server to compute their edit (rust-analyzer's assists)
+  are resolved when chosen, and actions that run a server command work too
+- **Signature help** while typing a call's arguments: the signature shows above the caret with
+  the current parameter highlighted, and follows the caret until you leave the call. Opens on
+  `(` (or Cmd/Ctrl+Shift+Space); click ‹ › to page through overloads
+- **Go to Symbol in File** (Cmd/Ctrl+Shift+O) and **Go to Symbol in Workspace** (Cmd/Ctrl+T),
+  in the fuzzy picker. The workspace search asks every running server as you type
+- **Breadcrumbs** above the editor: the file's path and the symbols around the caret. Click a
+  symbol to jump to one beside it. **View → Breadcrumbs** turns them off
+- **Inlay hints**: types and parameter names shown inline in small labels. They make room in
+  the line rather than covering code, and don't change the text or cursor positions.
+  **View → Inlay Hints** turns them off
+- **Semantic highlighting**: the server's classification of each identifier (parameter, field,
+  method, macro, enum member, …) is layered over syntax highlighting, colored from the theme.
+  Hints and colors stay in place while you type and refresh when you pause
 - **Format document** (Cmd/Ctrl+Shift+I), and **Tools → Format on Save**
 - **Tools → Restart Language Servers** if a server gets stuck or crashes
 
@@ -265,6 +343,26 @@ the mouse wheel. Ctrl+C reaches the shell. When the shell exits the panel shows 
 press Enter, click the restart button or run **Terminal: Restart Shell** to start a new one.
 Ctrl+\` while the terminal has focus hides it (the shell keeps running).
 
+## Extensions
+
+The **Extensions** view (Cmd/Ctrl+Shift+X) lists installed extensions. Install one with **+**
+(or **Tools → Extensions → Install Extension from ZIP…**, or by dropping a `.zip` onto the
+window); Forge shows what it adds and which programs it runs before installing. Each extension
+can be disabled, uninstalled or shown in detail, and its commands run from the view, the command
+palette, **Tools → Extensions**, or their own shortcuts.
+
+An extension is a folder with an `extension.toml` manifest. It can add:
+
+- **Commands** that run a program (any language) with the file, selection or document and put
+  the output in the status bar, an output tab, the selection, or the whole document. Commands can
+  ask for input, apply only to some file types, and run automatically on save.
+- **Color themes**.
+
+Extensions live in `extensions/` in the config folder (or `$FORGE_EXTENSIONS_DIR`). See
+[`docs/extensions.md`](docs/extensions.md) to write one (also under **Tools → Extensions →
+Extension Authoring Guide**), and [`examples/extensions/text-tools`](examples/extensions/text-tools)
+for a complete example.
+
 ## Getting started
 
 Requires a recent stable Rust toolchain (edition 2024).
@@ -283,6 +381,8 @@ cargo run --release -- path/to/project
 | Save                   | Ctrl+S                                  |
 | Save as                | Ctrl+Shift+S                            |
 | Close tab              | Ctrl+W                                  |
+| New window             | Ctrl+Shift+N                            |
+| Close window           | Ctrl+Shift+W                            |
 | Undo                   | Ctrl+Z                                  |
 | Redo                   | Ctrl+Y / Ctrl+Shift+Z (Cmd+Shift+Z on macOS) |
 | Next / previous tab    | Ctrl+Tab / Ctrl+Shift+Tab (Ctrl on macOS too) |
@@ -295,6 +395,7 @@ cargo run --release -- path/to/project
 | Show explorer          | Ctrl+Shift+E                            |
 | Source control         | Ctrl+Shift+G                            |
 | Pull requests          | Ctrl+Shift+R                            |
+| Extensions             | Ctrl+Shift+X                            |
 | BYO AI                 | Ctrl+Shift+A                            |
 | Toggle blame           | Ctrl+Alt+B                              |
 | Next / previous change | Alt+F5 / Shift+Alt+F5                   |
@@ -302,6 +403,13 @@ cargo run --release -- path/to/project
 | Indent / outdent       | Ctrl+] / Ctrl+[ (or Tab / Shift+Tab)    |
 | Move line up / down    | Alt+Up / Alt+Down                       |
 | Duplicate line         | Shift+Alt+Down                          |
+| Add cursor above / below | Ctrl+Alt+Up / Ctrl+Alt+Down           |
+| Add next occurrence    | Ctrl+D                                  |
+| Select all occurrences | Ctrl+Shift+L                            |
+| Cursors at line ends   | Shift+Alt+I                             |
+| Fold / unfold          | Ctrl+Alt+[ / Ctrl+Alt+]                 |
+| Split editor           | Ctrl+\\                                 |
+| Focus editor group 1–3 | Ctrl+1 / Ctrl+2 / Ctrl+3                |
 | Go to definition       | F12 (or Ctrl+click)                     |
 | Find all references    | Shift+F12                               |
 | Rename symbol          | F2                                      |
@@ -324,12 +432,15 @@ src/
 ├── main.rs              # entry point, window setup
 ├── app.rs               # application state and UI layout
 ├── app/
-│   ├── editing.rs       # line-editing commands, selection helpers, Go to Line
+│   ├── editing.rs       # line, multi-cursor and fold commands, selection helpers, Go to Line
+│   ├── groups.rs        # editor groups (split editors) and their tabs
 │   ├── explorer.rs      # file tree, its new / rename / delete / reveal actions, watcher events
 │   ├── language.rs      # diagnostics, hover, completion, definition, rename, formatting UI
 │   ├── find_bar.rs      # find / replace bar
+│   ├── markdown_preview.rs # Markdown preview beside the editor, link resolution
 │   ├── search_panel.rs  # "Search" sidebar
-│   ├── preferences.rs   # Settings window, font size / word wrap / line numbers
+│   ├── extension_ui.rs  # Extensions view, running extension commands, install dialog
+│   ├── preferences.rs   # Settings and Keyboard Shortcuts windows, font size / wrap / minimap
 │   ├── pickers.rs       # quick open, command palette, theme picker
 │   └── terminal_panel.rs # terminal panel: show / hide, restart
 ├── ai/
@@ -339,7 +450,9 @@ src/
 │   ├── flow.rs          # one-click commit, push and pull request
 │   ├── picker.rs        # model picker
 │   └── panel.rs         # BYO AI sidebar and thread tab
-├── commands.rs          # every action: name, menu, shortcut (menus + palette use it)
+├── commands.rs          # every action: name, menu, default shortcut (menus + palette use it)
+├── keymap.rs            # shortcuts in effect: defaults + [keybindings] from settings.toml
+├── editorconfig.rs      # .editorconfig parsing, glob matching, save rules
 ├── palette.rs           # list picker used by quick open and the command palette
 ├── fuzzy.rs             # fuzzy matcher for file and command names
 ├── search.rs            # project file listing and text search (ignore + grep-searcher)
@@ -353,6 +466,12 @@ src/
 ├── updater.rs           # self-update from GitHub releases
 ├── watcher.rs           # file watching (notify), batching events for the UI
 ├── workspace.rs         # file tree / project explorer, file operations, file-type scan
+├── extensions/
+│   ├── mod.rs           # loading installed extensions, command lookup, shortcuts
+│   ├── manifest.rs      # extension.toml format, variables, keybinding parsing
+│   ├── install.rs       # installing from .zip, uninstalling
+│   ├── run.rs           # running a command as a process with a time limit
+│   └── panel.rs         # Extensions sidebar
 ├── git/
 │   ├── mod.rs           # repository state and operations
 │   ├── status.rs        # `git status --porcelain=v2` parser
@@ -370,7 +489,7 @@ src/
 │   ├── activity.rs      # activity bar
 │   ├── diff_view.rs     # diff rendering (unified / split, line selection)
 │   ├── diff_style.rs    # diff syntax highlighting and word-level changes
-│   ├── markdown.rs      # Markdown for PR bodies and comments
+│   ├── markdown.rs      # Markdown for PR bodies, comments and the preview
 │   ├── icons.rs         # vector icons
 │   └── fmt.rs           # relative times
 ├── lsp/
@@ -383,12 +502,18 @@ src/
 │   ├── text.rs          # positions/encodings, URIs, snippets, applying edits
 │   └── browser.rs       # "Language Servers" window
 └── editor/
-    ├── buffer.rs        # rope-backed text buffer, undo/redo history
+    ├── buffer.rs        # rope-backed text buffer, undo/redo history, change log
     ├── document.rs      # open file buffer, load/save, dirty tracking
+    ├── widget.rs        # the editor widget: lays out visible rows, input, painting
+    ├── view.rs          # per-view state: cursors, folds, wrapping, line ↔ row mapping
+    ├── selection.rs     # multiple cursors and selections
+    ├── multi.rs         # running edits at every cursor as one transaction
+    ├── folding.rs       # fold ranges by indentation or from the language server
     ├── find.rs          # in-file find / replace
     ├── ops.rs           # comment, indent, move lines, auto-indent/pairs, brackets
-    ├── gutter.rs        # line-number gutter and change markers
-    ├── highlight.rs     # syntect → egui LayoutJob highlighting
+    ├── minimap.rs       # zoomed-out file overview beside the editor
+    ├── gutter.rs        # line-number gutter, fold and change markers
+    ├── highlight.rs     # lazy, incremental syntect highlighting per document
     ├── scm.rs           # change peek, blame column, conflict actions
     └── conflicts.rs     # merge conflict parsing and resolution
 ```
@@ -397,6 +522,10 @@ src/
 
 - [x] Line-number gutter
 - [x] Rope-based buffer for large files, undo/redo history
+- [x] Editor widget that lays out only what's visible
+- [x] Multiple cursors and selections
+- [x] Code folding (indentation and language server)
+- [x] Split editors
 - [x] Find / replace, go to line
 - [x] Project search, quick open
 - [x] Command palette
@@ -407,6 +536,10 @@ src/
 - [x] Themes
 - [x] Git source control and GitHub pull requests
 - [x] Settings UI
+- [x] Extensions (commands and themes, installed from .zip)
+- [x] `.editorconfig` support
+- [x] Customizable keybindings
+- [x] Minimap
 
 ## License
 

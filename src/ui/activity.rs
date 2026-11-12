@@ -1,6 +1,6 @@
 //! The activity bar: a narrow strip on the far left that switches the
 //! sidebar between the explorer, project search, source control, pull
-//! requests and the BYO AI agents.
+//! requests, extensions and the BYO AI agents.
 
 use egui::{Sense, Stroke, Ui, vec2};
 
@@ -14,15 +14,17 @@ pub enum SidebarView {
     Search,
     SourceControl,
     PullRequests,
+    Extensions,
     Ai,
 }
 
 impl SidebarView {
-    pub const ALL: [SidebarView; 5] = [
+    pub const ALL: [SidebarView; 6] = [
         Self::Explorer,
         Self::Search,
         Self::SourceControl,
         Self::PullRequests,
+        Self::Extensions,
         Self::Ai,
     ];
 
@@ -32,6 +34,7 @@ impl SidebarView {
             Self::Search => "Search",
             Self::SourceControl => "Source Control",
             Self::PullRequests => "Pull Requests",
+            Self::Extensions => "Extensions",
             Self::Ai => "BYO AI",
         }
     }
@@ -42,6 +45,7 @@ impl SidebarView {
             Self::Search => Icon::Search,
             Self::SourceControl => Icon::Branch,
             Self::PullRequests => Icon::PullRequest,
+            Self::Extensions => Icon::Extensions,
             Self::Ai => Icon::Sparkle,
         }
     }

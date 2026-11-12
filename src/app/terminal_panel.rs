@@ -82,7 +82,7 @@ impl ForgeApp {
                 ui.weak("— process exited");
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let hide_tip = match Command::ToggleTerminal.shortcuts().first() {
+                let hide_tip = match self.keymap.shortcut(Command::ToggleTerminal) {
                     Some(s) => format!("Hide ({})", ui.ctx().format_shortcut(s)),
                     None => "Hide".to_owned(),
                 };

@@ -29,6 +29,9 @@ pub enum Icon {
     Search,
     Sparkle,
     Stop,
+    Extensions,
+    Play,
+    Preview,
 }
 
 /// Paints `icon` inside `rect` using `color`.
@@ -210,11 +213,39 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             circle(p(0.42, 0.42), 0.24);
             line(p(0.59, 0.59), p(0.84, 0.84));
         }
+        Icon::Preview => {
+            // Eye.
+            poly(arc(p(0.5, 1.02), 0.62, -2.47, -0.67));
+            poly(arc(p(0.5, -0.02), 0.62, 0.67, 2.47));
+            circle(p(0.5, 0.5), 0.12);
+        }
         Icon::History => {
             let c = p(0.5, 0.52);
             poly(arc(c, 0.32, -2.6, 3.0));
             poly(vec![p(0.5, 0.32), p(0.5, 0.54), p(0.64, 0.62)]);
             poly(vec![p(0.10, 0.30), p(0.22, 0.38), p(0.30, 0.24)]);
+        }
+        Icon::Extensions => {
+            // Three blocks with a fourth lifted off the corner.
+            let block = |x: f32, y: f32| {
+                painter.rect_stroke(
+                    Rect::from_min_max(p(x, y), p(x + 0.28, y + 0.28)),
+                    1.0,
+                    stroke,
+                    egui::StrokeKind::Middle,
+                );
+            };
+            block(0.16, 0.56);
+            block(0.44, 0.56);
+            block(0.16, 0.28);
+            block(0.56, 0.16);
+        }
+        Icon::Play => {
+            painter.add(PathShape::convex_polygon(
+                vec![p(0.30, 0.20), p(0.80, 0.50), p(0.30, 0.80)],
+                Color32::TRANSPARENT,
+                PathStroke::new(w, color),
+            ));
         }
         Icon::External => {
             poly(vec![
@@ -266,6 +297,21 @@ pub fn button(ui: &mut Ui, icon: Icon, tooltip: &str) -> Response {
 }
 
 pub fn button_sized(ui: &mut Ui, icon: Icon, tooltip: &str, size: f32) -> Response {
+    button_impl(ui, icon, tooltip, size, None)
+}
+
+/// Like [`button`], drawn in `tint` (e.g. the accent color while a toggle is on).
+pub fn button_tinted(ui: &mut Ui, icon: Icon, tooltip: &str, tint: Option<Color32>) -> Response {
+    button_impl(ui, icon, tooltip, 22.0, tint)
+}
+
+fn button_impl(
+    ui: &mut Ui,
+    icon: Icon,
+    tooltip: &str,
+    size: f32,
+    tint: Option<Color32>,
+) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
     let enabled = ui.is_enabled();
     if ui.is_rect_visible(rect) {
@@ -275,7 +321,7 @@ pub fn button_sized(ui: &mut Ui, icon: Icon, tooltip: &str, size: f32) -> Respon
                 .rect_filled(rect, visuals.corner_radius, visuals.bg_fill);
         }
         let color = if enabled {
-            visuals.fg_stroke.color
+            tint.unwrap_or(visuals.fg_stroke.color)
         } else {
             ui.visuals().weak_text_color()
         };

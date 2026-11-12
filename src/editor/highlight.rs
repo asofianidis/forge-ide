@@ -1,18 +1,33 @@
-//! Syntax highlighting via `syntect`, converted into egui `LayoutJob`s.
+//! Syntax highlighting via `syntect`, computed lazily per line.
 //!
-//! Highlighting is incremental: the parser state at the start of every line is
-//! kept, so after an edit only the changed lines are re-parsed, plus any lines
-//! below them whose start state changed as a result (e.g. after opening a block
-//! comment). Typing in a large file costs about one line of parsing, not the
-//! whole file.
+//! Each document keeps a [`HighlightCache`]: the parser state at the start of
+//! every line highlighted so far and the styled spans of that line. The editor
+//! asks only for the lines it shows, so opening a large file highlights its
+//! first screen, not the whole file. Highlighting runs top-down (each line's
+//! state depends on the one before), within a time budget per frame.
+//!
+//! The cache follows the buffer's change log: after an edit only the changed
+//! lines are re-parsed, plus any lines below them whose start state changed as
+//! a result (e.g. after opening a block comment). As soon as re-parsing
+//! reaches a line in the same state as before, the cached lines below are
+//! reused as they are.
+
+use std::time::{Duration, Instant};
+
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontId, Stroke};
 use syntect::highlighting::{
     FontStyle, HighlightIterator, HighlightState, Highlighter as ThemeHighlighter, Style, Theme,
 };
-use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
-use syntect::util::LinesWithEndings;
+use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxSet};
+
+use super::Buffer;
+
+use super::decorate::{StyleOverride, semantic_scopes};
+use crate::lsp::features::token_mods;
 
 /// Parser and highlighter state at the start of a line.
 #[derive(Clone, PartialEq, Eq)]
@@ -21,31 +36,108 @@ struct LineState {
     highlight: HighlightState,
 }
 
-/// One highlighted line of the last input.
+/// One highlighted line.
 struct Line {
-    /// The line's text, including its line ending.
-    text: String,
     /// State at the start of the line.
     start: LineState,
-    /// Styled byte lengths covering `text`, or `None` if parsing failed.
+    /// Styled byte lengths covering the line (with its line break), or
+    /// `None` if parsing failed.
     spans: Option<Vec<(Style, usize)>>,
 }
 
-/// Highlighting of the last input, so it can be reused after an edit.
-struct Cached {
-    extension: String,
-    text: String,
-    lines: Vec<Line>,
-    /// State after the last line.
-    end: LineState,
-    font: FontId,
-    job: LayoutJob,
+/// Highlighting of one document, kept in step with its buffer.
+#[derive(Default)]
+pub struct HighlightCache {
+    /// Language and theme generation the cache was built for.
+    key: Option<(String, u64)>,
+    /// Buffer version the line entries match.
+    version: u64,
+    /// One entry per buffer line; `None` where never highlighted or edited.
+    lines: Vec<Option<Line>>,
+    /// Entries `[0, valid)` are correct.
+    valid: usize,
+    /// State at the start of line `valid`.
+    next: Option<LineState>,
+    /// Entries `[valid, window_end)` are an unbroken run highlighted before
+    /// an edit above them: if parsing reaches the start of the run in the
+    /// same state as before, the whole run is still correct. `window_state`
+    /// is the state at `window_end`.
+    window_end: usize,
+    window_state: Option<LineState>,
+}
+
+impl HighlightCache {
+    fn reset(&mut self, key: (String, u64), version: u64, initial: LineState) {
+        *self = Self {
+            key: Some(key),
+            version,
+            lines: Vec::new(),
+            valid: 0,
+            next: Some(initial),
+            window_end: 0,
+            window_state: None,
+        };
+    }
+
+    /// Lines highlighted so far (for tests and diagnostics).
+    #[cfg(test)]
+    fn highlighted(&self) -> usize {
+        self.valid
+    }
+
+    /// Updates the line entries for an edit: old lines `line..=line + removed`
+    /// became new lines `line..=line + inserted`.
+    fn apply_line_change(&mut self, line: usize, removed: usize, inserted: usize) {
+        if line < self.valid {
+            // Lines below the edit that were correct form the new window.
+            if self.valid > line + removed + 1 {
+                self.window_end = self.valid - removed + inserted;
+                self.window_state = self.next.take();
+            } else {
+                self.window_end = 0;
+                self.window_state = None;
+            }
+            self.next = self.lines[line].as_ref().map(|l| l.start.clone());
+            self.valid = line;
+        } else if line < self.window_end {
+            // An edit inside the window cuts it short at the edited line.
+            match self.lines.get(line).and_then(Option::as_ref) {
+                Some(l) => {
+                    self.window_state = Some(l.start.clone());
+                    self.window_end = line;
+                }
+                None => {
+                    self.window_end = 0;
+                    self.window_state = None;
+                }
+            }
+        }
+        let n = self.lines.len();
+        let a = line.min(n);
+        let b = (line + removed + 1).min(n);
+        if a < n {
+            self.lines
+                .splice(a..b, std::iter::repeat_with(|| None).take(inserted + 1));
+        }
+    }
+
+    /// Styled spans of `line` (byte lengths covering the line and its line
+    /// break), if it has been highlighted.
+    pub fn spans(&self, line: usize) -> Option<&[(Style, usize)]> {
+        if line >= self.valid {
+            return None;
+        }
+        self.lines.get(line)?.as_ref()?.spans.as_deref()
+    }
 }
 
 pub struct Highlighter {
     syntaxes: SyntaxSet,
     theme: Theme,
-    cache: Option<Cached>,
+    /// Bumped on every theme change, invalidating all caches.
+    theme_generation: u64,
+    /// Theme style of each semantic token type and modifiers seen so far.
+    semantic: HashMap<(Arc<str>, u8), Option<StyleOverride>>,
 }
 
 impl Highlighter {
@@ -53,101 +145,143 @@ impl Highlighter {
         Self {
             syntaxes: SyntaxSet::load_defaults_newlines(),
             theme,
-            cache: None,
+            theme_generation: 0,
+            semantic: HashMap::new(),
         }
     }
 
     /// Switches the color theme, invalidating cached highlighting.
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
-        self.cache = None;
+        self.theme_generation += 1;
+        self.semantic.clear();
     }
 
-    pub fn highlight(&mut self, text: &str, extension: &str, font: FontId) -> LayoutJob {
-        let reusable = self.cache.take().filter(|c| c.extension == extension);
-        if let Some(c) = &reusable
-            && c.text == text
-            && c.font == font
-        {
-            let job = c.job.clone();
-            self.cache = reusable;
-            return job;
+    /// Changes whenever the theme does.
+    pub fn generation(&self) -> u64 {
+        self.theme_generation
+    }
+
+    /// How the theme styles a semantic token, or `None` to leave the syntax
+    /// highlighting as it is (no matching theme rule, or a token kind syntax
+    /// highlighting handles itself).
+    pub fn semantic_style(&mut self, kind: &Arc<str>, modifiers: u8) -> Option<StyleOverride> {
+        let key = (Arc::clone(kind), modifiers);
+        if let Some(style) = self.semantic.get(&key) {
+            return *style;
         }
-
-        let (old_lines, old_end) = match reusable {
-            Some(c) => (c.lines, Some(c.end)),
-            None => (Vec::new(), None),
-        };
-        let (lines, end) = self.highlight_lines(text, extension, old_lines, old_end);
-        let job = self.build_job(&lines, &font);
-        self.cache = Some(Cached {
-            extension: extension.to_owned(),
-            text: text.to_owned(),
-            lines,
-            end,
-            font,
-            job: job.clone(),
-        });
-        job
+        let style = self.lookup_semantic(kind, modifiers);
+        self.semantic.insert(key, style);
+        style
     }
 
-    /// Highlights `text`, reusing lines from the previous input where possible.
-    fn highlight_lines(
-        &self,
-        text: &str,
-        extension: &str,
-        mut old: Vec<Line>,
-        old_end: Option<LineState>,
-    ) -> (Vec<Line>, LineState) {
-        let new: Vec<&str> = LinesWithEndings::from(text).collect();
-
-        // Lines shared with the previous input at the start and end. Unchanged
-        // leading lines keep their highlighting outright; unchanged trailing
-        // lines do once parsing reaches them in the same state as before.
-        let prefix = old
-            .iter()
-            .zip(&new)
-            .take_while(|(o, n)| o.text == **n)
-            .count();
-        let max_suffix = old.len().min(new.len()) - prefix;
-        let suffix = old
-            .iter()
-            .rev()
-            .zip(new.iter().rev())
-            .take(max_suffix)
-            .take_while(|(o, n)| o.text == **n)
-            .count();
-
-        let mut state = match (old.get(prefix), &old_end) {
-            (Some(line), _) => line.start.clone(),
-            (None, Some(end)) if prefix > 0 => end.clone(),
-            _ => self.initial_state(extension),
-        };
-        let mut tail = old.split_off(prefix);
-        let mut lines = old;
-        lines.reserve(new.len() - prefix);
-
+    fn lookup_semantic(&self, kind: &str, modifiers: u8) -> Option<StyleOverride> {
+        let scopes = semantic_scopes(
+            kind,
+            modifiers & token_mods::READONLY != 0,
+            modifiers & token_mods::DEFAULT_LIBRARY != 0,
+        );
         let theme = ThemeHighlighter::new(&self.theme);
-        let resume_at = new.len() - suffix;
-        for (idx, &line) in new.iter().enumerate().skip(prefix) {
-            if idx >= resume_at {
-                let old_idx = tail.len() - (new.len() - idx);
-                if tail[old_idx].start == state {
-                    // Everything from here down is unchanged.
-                    lines.extend(tail.drain(old_idx..));
-                    let end = old_end.expect("a non-empty old input has an end state");
-                    return (lines, end);
-                }
-            }
-            let start = state.clone();
-            let spans = self.highlight_line(line, &mut state, &theme);
-            lines.push(Line {
-                text: line.to_owned(),
-                start,
-                spans,
-            });
+        let found = scopes.iter().find_map(|s| {
+            let style = theme.style_mod_for_stack(&[Scope::new(s).ok()?]);
+            let fg = style.foreground?;
+            Some((Color32::from_rgb(fg.r, fg.g, fg.b), style.font_style))
+        });
+        let deprecated = modifiers & token_mods::DEPRECATED != 0;
+        if found.is_none() && !deprecated {
+            return None;
         }
-        (lines, state)
+        Some(StyleOverride {
+            color: found.map(|(c, _)| c),
+            italics: found
+                .and_then(|(_, f)| f)
+                .map(|f| f.contains(FontStyle::ITALIC)),
+            strikethrough: deprecated,
+        })
+    }
+
+    /// Brings `cache` up to date with `buffer` and highlights lines up to
+    /// (not including) `until`, spending at most `budget`. Returns whether
+    /// those lines are all highlighted; if not, call again next frame.
+    pub fn highlight(
+        &self,
+        cache: &mut HighlightCache,
+        buffer: &Buffer,
+        extension: &str,
+        until: usize,
+        budget: Duration,
+    ) -> bool {
+        self.sync(cache, buffer, extension);
+        let deadline = Instant::now() + budget;
+        let theme = ThemeHighlighter::new(&self.theme);
+        let rope = buffer.rope();
+        let total = rope.len_lines();
+        let until = until.min(total);
+        let mut line_text = String::new();
+        let mut parsed = 0;
+        while cache.valid < until {
+            let i = cache.valid;
+            if i < cache.window_end
+                && let (Some(Some(entry)), Some(next)) = (cache.lines.get(i), &cache.next)
+                && entry.start == *next
+            {
+                // Back in step with the lines highlighted before the edit.
+                cache.valid = cache.window_end;
+                cache.next = cache.window_state.take();
+                cache.window_end = 0;
+                continue;
+            }
+            let Some(start) = cache.next.take() else {
+                // Shouldn't happen; start over from the top.
+                cache.valid = 0;
+                cache.window_end = 0;
+                cache.window_state = None;
+                cache.next = Some(self.initial_state(extension));
+                continue;
+            };
+            line_text.clear();
+            for chunk in rope.line(i).chunks() {
+                line_text.push_str(chunk);
+            }
+            let mut state = start.clone();
+            let spans = self.highlight_line(&line_text, &mut state, &theme);
+            cache.lines[i] = Some(Line { start, spans });
+            cache.next = Some(state);
+            cache.valid += 1;
+            if cache.valid >= cache.window_end {
+                cache.window_end = 0;
+                cache.window_state = None;
+            }
+            parsed += 1;
+            if parsed % 32 == 0 && Instant::now() > deadline {
+                break;
+            }
+        }
+        cache.valid >= until
+    }
+
+    /// Follows the buffer's edits, or starts over if they can't be followed.
+    fn sync(&self, cache: &mut HighlightCache, buffer: &Buffer, extension: &str) {
+        let key = (extension.to_owned(), self.theme_generation);
+        if cache.key.as_ref() != Some(&key) {
+            cache.reset(key, buffer.version(), self.initial_state(extension));
+        } else if cache.version != buffer.version() {
+            match buffer.changes_since(cache.version) {
+                Some(changes) => {
+                    for c in changes {
+                        cache.apply_line_change(c.line, c.removed_lines, c.inserted_lines);
+                    }
+                    cache.version = buffer.version();
+                }
+                None => cache.reset(key, buffer.version(), self.initial_state(extension)),
+            }
+        }
+        let total = buffer.line_count();
+        if cache.lines.len() != total {
+            cache.lines.resize_with(total, || None);
+            cache.valid = cache.valid.min(total);
+            cache.window_end = cache.window_end.min(total);
+        }
     }
 
     fn initial_state(&self, extension: &str) -> LineState {
@@ -175,35 +309,51 @@ impl Highlighter {
         Some(spans)
     }
 
-    fn build_job(&self, lines: &[Line], font: &FontId) -> LayoutJob {
-        let mut job = LayoutJob::default();
-        for line in lines {
-            let Some(spans) = &line.spans else {
-                job.append(
-                    &line.text,
-                    0.0,
-                    TextFormat::simple(font.clone(), self.foreground()),
-                );
+    /// Appends `text` — the chars `byte_range` of a line whose spans are
+    /// `spans` — to `job`, styled. Without spans (not highlighted yet) the
+    /// text gets the theme's foreground color.
+    pub fn append(
+        &self,
+        job: &mut LayoutJob,
+        text: &str,
+        byte_offset: usize,
+        spans: Option<&[(Style, usize)]>,
+        font: &FontId,
+    ) {
+        let Some(spans) = spans else {
+            job.append(
+                text,
+                0.0,
+                TextFormat::simple(font.clone(), self.foreground()),
+            );
+            return;
+        };
+        let end = byte_offset + text.len();
+        let mut pos = 0;
+        for (style, len) in spans {
+            let (a, b) = (pos, pos + len);
+            pos = b;
+            if b <= byte_offset {
                 continue;
-            };
-            let mut offset = 0;
-            for (style, len) in spans {
-                let piece = &line.text[offset..offset + len];
-                offset += len;
-                let fg = style.foreground;
-                let mut format =
-                    TextFormat::simple(font.clone(), Color32::from_rgb(fg.r, fg.g, fg.b));
-                format.italics = style.font_style.contains(FontStyle::ITALIC);
-                if style.font_style.contains(FontStyle::UNDERLINE) {
-                    format.underline = Stroke::new(1.0, format.color);
-                }
-                job.append(piece, 0.0, format);
             }
+            if a >= end {
+                break;
+            }
+            let piece = &text[a.max(byte_offset) - byte_offset..b.min(end) - byte_offset];
+            job.append(piece, 0.0, format(style, font));
         }
-        job
+        if pos < end {
+            // Spans cover the line as it was parsed; anything else is plain.
+            let from = pos.max(byte_offset) - byte_offset;
+            job.append(
+                &text[from..],
+                0.0,
+                TextFormat::simple(font.clone(), self.foreground()),
+            );
+        }
     }
 
-    fn foreground(&self) -> Color32 {
+    pub fn foreground(&self) -> Color32 {
         self.theme
             .settings
             .foreground
@@ -220,21 +370,53 @@ impl Highlighter {
     }
 }
 
+fn format(style: &Style, font: &FontId) -> TextFormat {
+    let fg = style.foreground;
+    let mut format = TextFormat::simple(font.clone(), Color32::from_rgb(fg.r, fg.g, fg.b));
+    format.italics = style.font_style.contains(FontStyle::ITALIC);
+    if style.font_style.contains(FontStyle::UNDERLINE) {
+        format.underline = Stroke::new(1.0, format.color);
+    }
+    format
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor::EditKind;
 
     fn highlighter() -> Highlighter {
         let themes = syntect::highlighting::ThemeSet::load_defaults();
         Highlighter::new(themes.themes["base16-ocean.dark"].clone())
     }
 
-    fn font() -> FontId {
-        FontId::monospace(14.0)
-    }
+    const ALL: Duration = Duration::from_secs(60);
 
-    /// Text and color of every section, for comparing jobs.
-    fn sections(job: &LayoutJob) -> Vec<(String, Color32)> {
+    /// Text and color of every highlighted piece, line by line.
+    fn styled(
+        h: &Highlighter,
+        cache: &mut HighlightCache,
+        buf: &Buffer,
+        ext: &str,
+    ) -> Vec<(String, Color32)> {
+        assert!(h.highlight(cache, buf, ext, usize::MAX, ALL));
+        let font = FontId::monospace(14.0);
+        let mut job = LayoutJob::default();
+        for line in 0..buf.line_count() {
+            let start = buf.line_start(line);
+            let end = if line + 1 < buf.line_count() {
+                buf.line_start(line + 1)
+            } else {
+                buf.len_chars()
+            };
+            h.append(
+                &mut job,
+                &buf.slice(start..end),
+                0,
+                cache.spans(line),
+                &font,
+            );
+        }
         job.sections
             .iter()
             .map(|s| {
@@ -248,12 +430,15 @@ mod tests {
 
     /// Highlighting `after` incrementally (from `before`) must match a fresh run.
     fn assert_incremental_matches(before: &str, after: &str, ext: &str) {
-        let mut incremental = highlighter();
-        incremental.highlight(before, ext, font());
-        let got = incremental.highlight(after, ext, font());
-        let want = highlighter().highlight(after, ext, font());
-        assert_eq!(got.text, after);
-        assert_eq!(sections(&got), sections(&want), "{before:?} -> {after:?}");
+        let h = highlighter();
+        let mut cache = HighlightCache::default();
+        let mut buf = Buffer::from(before);
+        styled(&h, &mut cache, &buf, ext);
+        buf.set_text(after);
+        let got = styled(&h, &mut cache, &buf, ext);
+        let fresh = Buffer::from(after);
+        let want = styled(&h, &mut HighlightCache::default(), &fresh, ext);
+        assert_eq!(got, want, "{before:?} -> {after:?}");
     }
 
     const RUST: &str = "fn main() {\n    let x = 1;\n    // comment\n    println!(\"{x}\");\n}\n";
@@ -288,21 +473,81 @@ mod tests {
     }
 
     #[test]
-    fn font_change_rebuilds_cached_job() {
-        let mut h = highlighter();
-        let small = h.highlight(RUST, "rs", FontId::monospace(10.0));
-        let large = h.highlight(RUST, "rs", FontId::monospace(20.0));
-        assert!(small.sections.iter().all(|s| s.format.font_id.size == 10.0));
-        assert!(large.sections.iter().all(|s| s.format.font_id.size == 20.0));
-        assert_eq!(sections(&small), sections(&large));
+    fn changing_language_starts_over() {
+        let h = highlighter();
+        let mut cache = HighlightCache::default();
+        let buf = Buffer::from(RUST);
+        styled(&h, &mut cache, &buf, "rs");
+        let got = styled(&h, &mut cache, &buf, "txt");
+        let want = styled(&h, &mut HighlightCache::default(), &buf, "txt");
+        assert_eq!(got, want);
     }
 
     #[test]
-    fn changing_language_starts_over() {
+    fn highlights_only_what_is_asked_for() {
+        let h = highlighter();
+        let text = RUST.repeat(1000);
+        let buf = Buffer::from(text.as_str());
+        let mut cache = HighlightCache::default();
+        assert!(h.highlight(&mut cache, &buf, "rs", 50, ALL));
+        assert_eq!(cache.highlighted(), 50);
+        assert!(cache.spans(49).is_some());
+        assert!(cache.spans(50).is_none());
+    }
+
+    #[test]
+    fn edit_far_above_reuses_lines_below() {
+        let h = highlighter();
+        let text = RUST.repeat(200);
+        let mut buf = Buffer::from(text.as_str());
+        let mut cache = HighlightCache::default();
+        assert!(h.highlight(&mut cache, &buf, "rs", usize::MAX, ALL));
+        let lines = buf.line_count();
+        // Typing on line 2 leaves the parser in the same state after it, so
+        // the rest is reused: re-highlighting it all takes ~1 line of work.
+        let at = buf.line_start(1) + 4;
+        buf.edit([(at..at, "z")], EditKind::Typing, None);
+        h.sync(&mut cache, &buf, "rs");
+        assert_eq!(cache.valid, 1);
+        assert_eq!(cache.window_end, lines);
+        assert!(h.highlight(&mut cache, &buf, "rs", lines, Duration::ZERO));
+    }
+
+    #[test]
+    fn multi_line_edits_follow_the_log() {
+        let h = highlighter();
+        let mut buf = Buffer::from(RUST);
+        let mut cache = HighlightCache::default();
+        styled(&h, &mut cache, &buf, "rs");
+        // Several edits between frames, some adding and removing lines.
+        buf.apply_edits([(0..0, "/*\n")]);
+        buf.apply_edits([(5..5, "x\ny\n")]);
+        let end = buf.len_chars();
+        buf.apply_edits([(end - 2..end, "*/")]);
+        let got = styled(&h, &mut cache, &buf, "rs");
+        let fresh = Buffer::from(buf.as_str());
+        let want = styled(&h, &mut HighlightCache::default(), &fresh, "rs");
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn resolves_semantic_tokens_through_theme_scopes() {
         let mut h = highlighter();
-        h.highlight(RUST, "rs", font());
-        let got = h.highlight(RUST, "txt", font());
-        let want = highlighter().highlight(RUST, "txt", font());
-        assert_eq!(sections(&got), sections(&want));
+        let function: Arc<str> = Arc::from("function");
+        let style = h
+            .semantic_style(&function, 0)
+            .expect("theme colors functions");
+        assert!(style.color.is_some());
+        assert!(!style.strikethrough);
+        // Comments are left to syntax highlighting.
+        assert_eq!(h.semantic_style(&Arc::from("comment"), 0), None);
+        // Unknown kinds only pick up the deprecated strikethrough.
+        let unknown: Arc<str> = Arc::from("somethingNew");
+        assert_eq!(h.semantic_style(&unknown, 0), None);
+        let old = h.semantic_style(&unknown, token_mods::DEPRECATED).unwrap();
+        assert!(old.strikethrough && old.color.is_none());
+        let generation = h.generation();
+        h.set_theme(h.theme.clone());
+        assert_ne!(h.generation(), generation);
     }
 }

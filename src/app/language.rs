@@ -1,6 +1,8 @@
 //! Language server features in the editor: diagnostics (squiggles, status bar
 //! counts, problems list), hover, go to definition, find references,
-//! completion, rename and formatting.
+//! completion, rename and formatting. Code actions, signature help, symbols
+//! and the inline views (inlay hints, semantic highlighting) have modules of
+//! their own; this one routes events to them.
 //!
 //! The protocol side lives in `crate::lsp`; this module turns its events into
 //! edits, popups and cursor moves.
@@ -10,20 +12,23 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
-use egui::text_edit::TextEditOutput;
-use egui::{Align2, Color32, Key, Modifiers, Pos2, Rect, Shape, Stroke, TextStyle, pos2, vec2};
+use egui::text::{LayoutJob, TextFormat};
+use egui::{Align2, Color32, Key, Modifiers, Rect, Shape, Stroke, TextStyle, pos2, vec2};
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionTextEdit, Documentation, InsertTextFormat,
 };
 
 use super::ForgeApp;
-use super::editing::editor_id;
-use crate::editor::ops::{self, Selection};
+use super::code_actions::{CodeActionMenu, CodeActionRequest};
+use super::signature::SignaturePopup;
+use super::symbols::{SymbolItem, WorkspaceSearch};
+use super::views::DocViews;
+use crate::editor::ops::Selection;
+use crate::editor::widget::Layout;
 use crate::fuzzy;
 use crate::lsp::text::{self, CharEdit, Encoding, LineIndex};
 use crate::lsp::{
-    Feature, Location, LocationKind, LspEvent, Problem, ServerActivity, Severity,
+    Feature, Location, LocationKind, LspEvent, Problem, ServerActivity, Severity, View,
     workspace_edit_files,
 };
 use crate::palette::PickerItem;
@@ -46,6 +51,23 @@ pub(super) struct LanguageUi {
     /// Rows of the definitions / references / problems picker.
     pub(super) locations: Vec<LocationItem>,
     pub(super) locations_hint: &'static str,
+    /// Semantic tokens, inlay hints and symbols of each open file.
+    pub(super) views: HashMap<PathBuf, DocViews>,
+    /// Rows of the Go to Symbol in File picker.
+    pub(super) symbol_items: Vec<SymbolItem>,
+    pub(super) workspace_search: WorkspaceSearch,
+    pub(super) code_actions: Option<CodeActionMenu>,
+    pub(super) code_action_request: Option<CodeActionRequest>,
+    pub(super) signature: Option<SignaturePopup>,
+    /// Screen rect of the caret last frame, to place popups opened by
+    /// commands.
+    pub(super) caret: Option<Rect>,
+}
+
+impl LanguageUi {
+    pub(super) fn completion_open(&self) -> bool {
+        self.completion.is_some()
+    }
 }
 
 struct HoverPopup {
@@ -108,8 +130,11 @@ pub(super) struct LocationItem {
 pub(super) struct EditorFrame {
     /// The char under the pointer and its screen rect.
     pub pointer: Option<(usize, Rect)>,
-    /// The caret's char index and screen rect.
+    /// The caret's char index and screen rect, while the editor has focus.
     pub caret: Option<(usize, Rect)>,
+    /// Where the caret is on screen, focused or not (for popups opened by
+    /// commands, e.g. from the menu).
+    pub caret_rect: Option<Rect>,
     /// The last character typed into the buffer this frame.
     pub typed: Option<char>,
     /// Cmd/Ctrl+click on a symbol.
@@ -131,6 +156,26 @@ impl ForgeApp {
         let servers = &self.servers;
         self.lsp
             .sync(&docs, root, |name| servers.installed_server_for(name));
+        let open: std::collections::HashSet<&Path> = docs.iter().map(|(p, _)| *p).collect();
+        self.language
+            .views
+            .retain(|p, _| open.contains(p.as_path()));
+
+        // Keep what the editor shows for the active file up to date.
+        if let Some(path) = self
+            .documents
+            .get(self.active)
+            .and_then(|d| d.path.as_deref())
+        {
+            let mut views = vec![View::SemanticTokens];
+            if self.settings.inlay_hints {
+                views.push(View::InlayHints);
+            }
+            if self.settings.breadcrumbs {
+                views.push(View::Symbols);
+            }
+            self.lsp.refresh_views(path, &views);
+        }
     }
 
     pub(super) fn handle_lsp_events(&mut self, ctx: &egui::Context) {
@@ -169,6 +214,55 @@ impl ForgeApp {
                     encoding,
                     then_save,
                 } => self.on_format(ctx, &path, &edits, encoding, then_save),
+                LspEvent::CodeActions {
+                    path,
+                    at,
+                    actions,
+                    encoding,
+                } => self.on_code_actions(path, at, actions, encoding),
+                LspEvent::CodeActionResolved {
+                    path,
+                    action,
+                    encoding,
+                } => self.on_code_action_resolved(ctx, &path, action, encoding),
+                LspEvent::SignatureHelp {
+                    path,
+                    at,
+                    help,
+                    encoding,
+                } => self.on_signature_help(&path, at, help, encoding),
+                LspEvent::SemanticTokens { path, text, tokens } => {
+                    self.language
+                        .views
+                        .entry(path)
+                        .or_default()
+                        .set_tokens(&text, tokens);
+                }
+                LspEvent::InlayHints { path, text, hints } => {
+                    self.language
+                        .views
+                        .entry(path)
+                        .or_default()
+                        .set_hints(&text, hints);
+                }
+                LspEvent::DocumentSymbols {
+                    path,
+                    text,
+                    symbols,
+                    open_picker,
+                } => {
+                    self.language
+                        .views
+                        .entry(path.clone())
+                        .or_default()
+                        .set_symbols(&text, symbols);
+                    if open_picker {
+                        self.open_symbol_picker(&path);
+                    }
+                }
+                LspEvent::WorkspaceSymbols { query, symbols } => {
+                    self.on_workspace_symbols(query, symbols);
+                }
                 LspEvent::Message(msg) => self.status = msg,
             }
         }
@@ -187,12 +281,13 @@ impl ForgeApp {
     }
 
     pub(super) fn restart_language_servers(&mut self) {
+        self.picker.close();
         self.lsp.restart();
         self.language = LanguageUi::default();
         self.status = "Restarting language servers…".to_owned();
     }
 
-    fn doc_index(&self, path: &Path) -> Option<usize> {
+    pub(super) fn doc_index(&self, path: &Path) -> Option<usize> {
         self.documents
             .iter()
             .position(|d| d.path.as_deref() == Some(path))
@@ -205,29 +300,24 @@ impl ForgeApp {
         Some((path, self.selection(ctx).end))
     }
 
-    /// Applies `edits` to a document, keeping its caret and selection on the
-    /// same text.
-    fn edit_document(&mut self, ctx: &egui::Context, idx: usize, edits: &[CharEdit]) {
+    /// Applies `edits` to a document. Every view of it follows the edits
+    /// (through the buffer's change log), keeping cursors on the same text.
+    pub(super) fn edit_document(&mut self, _ctx: &egui::Context, idx: usize, edits: &[CharEdit]) {
         let Some(doc) = self.documents.get_mut(idx) else {
             return;
         };
         doc.apply_edits(edits.iter().map(|e| (e.range.clone(), e.text.as_str())));
-        let id = editor_id(doc);
-        if let Some(mut state) = egui::TextEdit::load_state(ctx, id)
-            && let Some(range) = state.cursor.char_range()
-        {
-            let primary = text::map_offset(range.primary.index.into(), edits);
-            let secondary = text::map_offset(range.secondary.index.into(), edits);
-            state.cursor.set_char_range(Some(CCursorRange {
-                primary: CCursor::new(primary),
-                secondary: CCursor::new(secondary),
-                h_pos: None,
-            }));
-            state.store(ctx, id);
-            if idx == self.active {
-                self.cursor = doc.line_col(primary);
-            }
+        if idx == self.active {
+            let head = self.selections().primary().head;
+            self.cursor = self.documents[idx].line_col(head);
         }
+    }
+
+    /// Fold ranges the language server reported for document `idx`, if it
+    /// supports folding (otherwise the editor folds by indentation).
+    pub(super) fn fold_ranges_for(&self, idx: usize) -> Option<Vec<(usize, usize)>> {
+        let doc = self.documents.get(idx)?;
+        self.lsp.folding_ranges(doc.path.as_deref()?)
     }
 
     // ---- editor hooks ----------------------------------------------------
@@ -235,10 +325,10 @@ impl ForgeApp {
     /// Keys for the completion list. Runs before shortcuts and the editor so
     /// that Enter, Tab and the arrows go to the list while it is open.
     pub(super) fn completion_keys(&mut self, ctx: &egui::Context) {
-        if self.language.completion.is_none() {
+        if self.language.completion.is_none() || self.language.code_actions.is_some() {
             return;
         }
-        if self.active_pane.is_some() || !self.editor_has_focus(ctx) {
+        if self.pane_shown() || !self.editor_has_focus(ctx) {
             self.language.completion = None;
             return;
         }
@@ -313,12 +403,22 @@ impl ForgeApp {
         } else {
             self.language.completion = None;
         }
+        match &path {
+            Some(p) => self.update_signature(doc_id, p, frame.caret.map(|(c, _)| c), frame.typed),
+            None => self.language.signature = None,
+        }
+        self.update_code_actions(ctx, doc_id, frame.typed.is_some());
+        if frame.caret_rect.is_some() {
+            self.language.caret = frame.caret_rect;
+        }
 
         let colors = self.current_theme().ui.clone();
         self.show_hover(ctx, doc_id, &colors);
         if let Some((_, caret_rect)) = frame.caret {
+            self.show_signature(ctx, caret_rect, &colors);
             self.show_completion(ctx, caret_rect, &colors);
         }
+        self.show_code_actions(ctx, &colors);
     }
 
     // ---- hover -----------------------------------------------------------
@@ -430,6 +530,18 @@ impl ForgeApp {
     }
 
     fn show_hover(&mut self, ctx: &egui::Context, doc_id: u64, colors: &UiColors) {
+        let can_fix = self
+            .language
+            .hover
+            .as_ref()
+            .and_then(|h| h.path.as_deref())
+            .is_some_and(|p| self.lsp.supports(p, Feature::CodeActions));
+        let fix_shortcut = self
+            .keymap
+            .shortcut(crate::commands::Command::QuickFix)
+            .map(|s| format!(" ({})", ctx.format_shortcut(s)))
+            .unwrap_or_default();
+        let mut fix = None;
         let Some(h) = &mut self.language.hover else {
             return;
         };
@@ -454,6 +566,19 @@ impl ForgeApp {
                     for p in &h.problems {
                         problem_row(ui, p, colors);
                     }
+                    if can_fix
+                        && !h.problems.is_empty()
+                        && ui.link(format!("Quick Fix…{fix_shortcut}")).clicked()
+                    {
+                        let start = h
+                            .problems
+                            .iter()
+                            .map(|p| p.range.start)
+                            .min()
+                            .unwrap_or(h.at);
+                        let end = h.problems.iter().map(|p| p.range.end).max().unwrap_or(h.at);
+                        fix = Some((start..end, h.anchor));
+                    }
                     if let Some(md) = &h.markdown {
                         if !h.problems.is_empty() {
                             ui.separator();
@@ -471,6 +596,10 @@ impl ForgeApp {
                 });
             });
         h.rect = Some(response.response.rect);
+        if let Some((range, anchor)) = fix {
+            self.language.hover = None;
+            self.request_code_actions(range, Some(anchor));
+        }
     }
 
     // ---- go to definition / references / problems ------------------------
@@ -562,7 +691,7 @@ impl ForgeApp {
             .collect()
     }
 
-    fn display_path(&self, path: &Path) -> String {
+    pub(super) fn display_path(&self, path: &Path) -> String {
         self.workspace
             .as_ref()
             .and_then(|w| path.strip_prefix(&w.root.path).ok())
@@ -829,6 +958,7 @@ impl ForgeApp {
         self.documents[self.active]
             .apply_edits(edits.iter().map(|e| (e.range.clone(), e.text.as_str())));
         self.set_selection(ctx, selection, true);
+        self.signature_after_completion(ctx);
     }
 
     fn show_completion(&mut self, ctx: &egui::Context, caret: Rect, colors: &UiColors) {
@@ -952,8 +1082,10 @@ impl ForgeApp {
         if dialog.select_all {
             dialog.select_all = false;
             if let Some(mut state) = egui::TextEdit::load_state(ctx, input_id) {
-                let all =
-                    CCursorRange::two(CCursor::new(0), CCursor::new(dialog.input.chars().count()));
+                let all = egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    egui::text::CCursor::new(dialog.input.chars().count()),
+                );
                 state.cursor.set_char_range(Some(all));
                 state.store(ctx, input_id);
             }
@@ -987,7 +1119,7 @@ impl ForgeApp {
 
     /// Applies a rename (or a server-requested edit) to open buffers, and
     /// writes files that aren't open directly.
-    fn apply_workspace_edit(
+    pub(super) fn apply_workspace_edit(
         &mut self,
         ctx: &egui::Context,
         label: &str,
@@ -1046,8 +1178,8 @@ impl ForgeApp {
             return false;
         };
         let text = doc.text().to_owned();
-        let indent = ops::indent_unit(&text);
-        match self.lsp.format(&path, &text, &indent, then_save) {
+        let options = crate::lsp::FormatOptions::for_document(doc);
+        match self.lsp.format(&path, &text, &options, then_save) {
             Ok(()) => {
                 self.language.formatting = Some(FormatRequest {
                     path,
@@ -1181,9 +1313,9 @@ impl ForgeApp {
             0.0,
             TextFormat::simple(font, text_color),
         );
-        let shortcut = crate::commands::Command::ShowProblems
-            .shortcuts()
-            .first()
+        let shortcut = self
+            .keymap
+            .shortcut(crate::commands::Command::ShowProblems)
             .map(|s| format!(" ({})", ui.ctx().format_shortcut(s)))
             .unwrap_or_default();
         if ui
@@ -1265,13 +1397,11 @@ fn problem_row(ui: &mut egui::Ui, p: &Problem, colors: &UiColors) {
 /// info, a short dotted line for hints.
 pub(super) fn paint_problems(
     ui: &egui::Ui,
-    output: &TextEditOutput,
+    layout: &Layout,
     problems: &[Problem],
-    visible: &Range<usize>,
     colors: &UiColors,
 ) {
-    let offset = output.galley_pos.to_vec2();
-    let galley = &output.galley;
+    let visible = &layout.visible_chars;
     let mut shapes = Vec::new();
     // Least severe first, so errors are drawn on top.
     for p in problems.iter().rev() {
@@ -1284,8 +1414,7 @@ pub(super) fn paint_problems(
         } else {
             p.range.clone()
         };
-        for r in super::range_rects(galley, range) {
-            let r = r.translate(offset);
+        for r in layout.range_rects(range) {
             let y = r.bottom() - 1.0;
             if p.severity == Severity::Hint {
                 let end = r.left() + (r.width()).min(12.0);
@@ -1309,40 +1438,14 @@ pub(super) fn paint_problems(
             }
         }
     }
-    ui.painter().extend(shapes);
-}
-
-/// The char under `pos` (screen coordinates) and its screen rect, if the
-/// pointer is over a character rather than empty space.
-pub(super) fn char_at(output: &TextEditOutput, pos: Pos2) -> Option<(usize, Rect)> {
-    let offset = output.galley_pos.to_vec2();
-    let local = pos - offset;
-    let galley = &output.galley;
-    let nearest: usize = galley.cursor_from_pos(local.to_vec2()).index.into();
-    [nearest.saturating_sub(1), nearest]
-        .into_iter()
-        .find_map(|c| {
-            let a = galley.pos_from_cursor(CCursor::new(c));
-            let b = galley.pos_from_cursor(CCursor::new(c + 1));
-            if (a.top() - b.top()).abs() > 0.5 || b.left() <= a.left() {
-                return None;
-            }
-            let r = Rect::from_min_max(a.min, pos2(b.left(), a.bottom()));
-            r.contains(local).then(|| (c, r.translate(offset)))
-        })
+    ui.painter().with_clip_rect(layout.text_clip).extend(shapes);
 }
 
 /// Underlines `range` like a link (for Cmd/Ctrl+hover over a symbol).
-pub(super) fn underline(
-    ui: &egui::Ui,
-    output: &TextEditOutput,
-    range: Range<usize>,
-    color: Color32,
-) {
-    let offset = output.galley_pos.to_vec2();
-    for r in super::range_rects(&output.galley, range) {
-        let r = r.translate(offset);
-        ui.painter().line_segment(
+pub(super) fn underline(ui: &egui::Ui, layout: &Layout, range: Range<usize>, color: Color32) {
+    let painter = ui.painter().with_clip_rect(layout.text_clip);
+    for r in layout.range_rects(range) {
+        painter.line_segment(
             [
                 pos2(r.left(), r.bottom() - 1.0),
                 pos2(r.right(), r.bottom() - 1.0),

@@ -898,7 +898,7 @@ mod tests {
     #[test]
     fn picker_is_stable_without_input() {
         let ctx = egui::Context::default();
-        let colors = crate::theme::load_all(None).0[0].ui.clone();
+        let colors = crate::theme::load_all(None, &[]).0[0].ui.clone();
         let mut choice = ModelChoice::new(Provider::Claude, "claude-opus-5-5");
         let mut access = Access::Full;
         let mut state = PickerState::default();

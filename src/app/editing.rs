@@ -1,22 +1,22 @@
-//! Editing commands on the active buffer, typing aids (auto-indent and
-//! auto-closing pairs), cursor/selection access, and the Go to Line dialog.
+//! Editing commands on the focused editor view: cursor/selection access,
+//! undo, line commands at every cursor, multi-cursor and folding commands,
+//! and the Go to Line dialog. Typing itself (and its aids: auto-indent,
+//! auto-closing pairs) is handled by the editor widget.
 
-use egui::text::{CCursor, CCursorRange};
-use egui::{Align2, Event, Key, Modifiers};
+use egui::{Align2, Key, Modifiers};
 
 use super::ForgeApp;
 use crate::commands::Command;
-use crate::editor::Document;
-use crate::editor::ops::{self, Edit, Selection};
-
-/// Widget id of the editor for `doc`.
-pub(super) fn editor_id(doc: &Document) -> egui::Id {
-    egui::Id::unique(("editor", doc.id))
-}
+use crate::editor::EditKind;
+use crate::editor::folding::FoldSource;
+use crate::editor::multi::{self, CursorEdit};
+use crate::editor::ops::{self, Selection};
+use crate::editor::selection::{Cursor, Selections};
+use crate::editor::view::{self, Reveal};
 
 impl ForgeApp {
     pub(super) fn active_editor_id(&self) -> Option<egui::Id> {
-        self.documents.get(self.active).map(editor_id)
+        self.focused_view().map(|v| v.id)
     }
 
     pub(super) fn editor_has_focus(&self, ctx: &egui::Context) -> bool {
@@ -24,67 +24,66 @@ impl ForgeApp {
             .is_some_and(|id| ctx.memory(|m| m.has_focus(id)))
     }
 
-    /// The active editor's selection (kept by egui even when unfocused).
-    pub(super) fn selection(&self, ctx: &egui::Context) -> Selection {
-        self.active_editor_id()
-            .and_then(|id| egui::TextEdit::load_state(ctx, id))
-            .and_then(|s| s.cursor.char_range())
-            .map(|r| {
-                let [a, b] = r.sorted_cursors();
-                Selection::new(a.index.into(), b.index.into())
-            })
-            .unwrap_or(Selection::caret(0))
+    /// The focused view's cursors, in the current text.
+    pub(super) fn selections(&self) -> Selections {
+        match (self.focused_view(), self.documents.get(self.active)) {
+            (Some(v), Some(doc)) => v.current_selection(&doc.buffer),
+            _ => Selections::default(),
+        }
     }
 
-    /// Selects `sel` in the active editor and scrolls it into view.
+    /// The focused view's primary selection.
+    pub(super) fn selection(&self, _ctx: &egui::Context) -> Selection {
+        self.selections().primary().selection()
+    }
+
+    /// Selects `sel` in the focused view and scrolls it to the middle.
     pub(super) fn set_selection(&mut self, ctx: &egui::Context, sel: Selection, focus: bool) {
-        let Some(doc) = self.documents.get(self.active) else {
+        self.set_selections(
+            ctx,
+            Selections::single(Cursor::new(sel.start, sel.end)),
+            Reveal::Center,
+            focus,
+        );
+    }
+
+    pub(super) fn set_selections(
+        &mut self,
+        ctx: &egui::Context,
+        sel: Selections,
+        reveal: Reveal,
+        focus: bool,
+    ) {
+        let Some((doc, view)) = self.focused_doc_view() else {
             return;
         };
-        let id = editor_id(doc);
-        let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
-        state.cursor.set_char_range(Some(CCursorRange::two(
-            CCursor::new(sel.start),
-            CCursor::new(sel.end),
-        )));
-        state.store(ctx, id);
+        view.set_selections(&doc.buffer, sel, reveal);
+        let id = view.id;
+        let head = view.sel.primary().head;
+        self.cursor = doc.line_col(head);
         if focus {
             ctx.memory_mut(|m| m.request_focus(id));
         }
-        self.cursor = doc.line_col(sel.end);
-        self.scroll_to = Some(sel.start);
-    }
-
-    fn apply_edit(&mut self, ctx: &egui::Context, edit: Edit) {
-        let Some(doc) = self.documents.get_mut(self.active) else {
-            return;
-        };
-        doc.set_text(&edit.text);
-        self.set_selection(ctx, edit.selection, true);
-        // Keep the caret in view without re-centering the editor on every edit.
-        self.scroll_to = None;
-        self.reveal = Some(edit.selection.end);
     }
 
     /// Undoes (or with `redo`, redoes) the last step in the active document
-    /// and puts the caret where the change was.
+    /// and restores the cursors it had.
     pub(super) fn undo(&mut self, ctx: &egui::Context, redo: bool) {
-        if self.active_pane.is_some() {
+        if self.pane_shown() {
             return;
         }
         let Some(doc) = self.documents.get_mut(self.active) else {
             return;
         };
-        let caret = if redo {
+        let restore = if redo {
             doc.buffer.redo()
         } else {
             doc.buffer.undo()
         };
-        match caret {
-            Some(at) => {
-                self.set_selection(ctx, Selection::caret(at), true);
-                self.scroll_to = None;
-                self.reveal = Some(at);
+        match restore {
+            Some(snapshot) => {
+                let sel = Selections::from_snapshot(&snapshot);
+                self.set_selections(ctx, sel, Reveal::Cursor, true);
             }
             None => {
                 self.status = if redo {
@@ -97,122 +96,216 @@ impl ForgeApp {
         }
     }
 
-    /// Typing aids, applied before the editor widget sees the input: Enter
-    /// keeps indentation, brackets and quotes auto-close (or wrap the
-    /// selection), typing a closer steps over it, and Backspace in an empty
-    /// pair deletes both halves. Everything else is left to the widget.
-    pub(super) fn handle_typing(&mut self, ctx: &egui::Context) {
-        if self.active_pane.is_some() || !self.editor_has_focus(ctx) {
-            return;
-        }
-        let events = ctx.input(|i| i.events.clone());
-        let mut removed = 0;
-        for (idx, event) in events.iter().enumerate() {
-            let sel = self.selection(ctx);
-            let Some(doc) = self.documents.get(self.active) else {
-                return;
-            };
-            let ext = doc.language_key();
-            let quotes = ops::auto_close_quotes(&ext);
-            let text = doc.text();
-            let edit = match event {
-                Event::Text(t) => {
-                    let mut chars = t.chars();
-                    match (chars.next(), chars.next()) {
-                        (Some(c), None) => ops::type_char(text, sel, c, quotes),
-                        _ => None,
-                    }
-                }
-                Event::Key {
-                    key: Key::Enter,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } if modifiers.is_none() => {
-                    Some(ops::newline(text, sel, &ops::indent_unit(text), &ext))
-                }
-                Event::Key {
-                    key: Key::Backspace,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } if modifiers.is_none() => ops::backspace_pair(text, sel, quotes),
-                _ => None,
-            };
-            if let Some(edit) = edit {
-                ctx.input_mut(|i| i.events.remove(idx - removed));
-                removed += 1;
-                self.apply_edit(ctx, edit);
-            } else if changes_text_or_cursor(event) {
-                // Later events must run after this one, which the widget
-                // handles, so leave them to it too.
-                break;
-            }
-        }
-    }
-
-    /// Runs one of the line-editing commands on the active buffer.
+    /// Runs one of the line-editing commands at every cursor.
     pub(super) fn edit_command(&mut self, ctx: &egui::Context, cmd: Command) {
-        let sel = self.selection(ctx);
         let Some(doc) = self.documents.get(self.active) else {
             return;
         };
-        let text = doc.text();
-        let edit = match cmd {
-            Command::ToggleComment => match ops::comment_style(&doc.language_key()) {
-                Some(style) => ops::toggle_comment(text, sel, style),
-                None => {
-                    self.status = format!("Don't know how to comment {} files", doc.title());
-                    return;
-                }
-            },
-            Command::Indent => ops::indent(text, sel, &ops::indent_unit(text)),
-            Command::Outdent => ops::outdent(text, sel, &ops::indent_unit(text)),
-            Command::DuplicateLine => ops::duplicate_lines(text, sel),
-            Command::MoveLineUp | Command::MoveLineDown => {
-                match ops::move_lines(text, sel, cmd == Command::MoveLineUp) {
-                    Some(edit) => edit,
-                    None => return,
-                }
-            }
-            _ => return,
-        };
-        self.apply_edit(ctx, edit);
-    }
-
-    /// Tab indents a multi-line selection (and otherwise inserts the file's
-    /// indent unit); Shift+Tab outdents. Only while the editor has focus.
-    pub(super) fn handle_tab(&mut self, ctx: &egui::Context) {
-        if !self.editor_has_focus(ctx) {
+        let style = ops::comment_style(&doc.language_key());
+        if cmd == Command::ToggleComment && style.is_none() {
+            self.status = format!("Don't know how to comment {} files", doc.title());
             return;
         }
-        let (shift_tab, tab) = ctx.input_mut(|i| {
-            let shift_tab = i.consume_key(Modifiers::SHIFT, Key::Tab);
-            (
-                shift_tab,
-                !shift_tab && i.consume_key(Modifiers::NONE, Key::Tab),
-            )
+        let unit = doc.indent_unit();
+        // Lines of context each command needs around a cursor.
+        let (above, below) = match cmd {
+            Command::MoveLineUp => (1, 0),
+            Command::MoveLineDown => (0, 1),
+            _ => (0, 0),
+        };
+        let sel = self.selections();
+        let tx = multi::for_each_cursor(&doc.buffer, &sel, |b, c| {
+            multi::local(b, c, above, below, |text, s| match cmd {
+                Command::ToggleComment => Some(ops::toggle_comment(text, s, style?)),
+                Command::Indent => Some(ops::indent(text, s, &unit)),
+                Command::Outdent => Some(ops::outdent(text, s, &unit)),
+                Command::DuplicateLine => Some(ops::duplicate_lines(text, s)),
+                Command::MoveLineUp => ops::move_lines(text, s, true),
+                Command::MoveLineDown => ops::move_lines(text, s, false),
+                _ => None,
+            })
+            .unwrap_or(CursorEdit::Keep)
         });
-        if shift_tab {
-            self.edit_command(ctx, Command::Outdent);
-        } else if tab {
-            let sel = self.selection(ctx);
-            let Some(doc) = self.documents.get(self.active) else {
-                return;
-            };
-            let multi_line = doc
-                .text()
-                .chars()
-                .skip(sel.start)
-                .take(sel.end - sel.start)
-                .any(|c| c == '\n');
-            if multi_line {
-                self.edit_command(ctx, Command::Indent);
-            } else {
-                let edit = ops::insert(doc.text(), sel, &ops::indent_unit(doc.text()));
-                self.apply_edit(ctx, edit);
-            }
+        self.commit(ctx, tx);
+    }
+
+    /// Applies a multi-cursor transaction to the focused view as one undo step.
+    fn commit(&mut self, ctx: &egui::Context, tx: multi::Transaction) {
+        let Some((doc, view)) = self.focused_doc_view() else {
+            return;
+        };
+        if tx.changes_text() {
+            let before = view.current_selection(&doc.buffer).snapshot();
+            doc.buffer.edit(
+                tx.edits,
+                EditKind::Command,
+                Some((before, tx.after.snapshot())),
+            );
         }
+        self.set_selections(ctx, tx.after, Reveal::Cursor, true);
+    }
+
+    // ---- multiple cursors -----------------------------------------------
+
+    pub(super) fn cursor_command(&mut self, ctx: &egui::Context, cmd: Command) {
+        let wrap = self.settings.word_wrap;
+        let Some((doc, view)) = self.focused_doc_view() else {
+            return;
+        };
+        view.sync(&doc.buffer);
+        let buf = &doc.buffer;
+        let mut sel = view.sel.clone();
+        match cmd {
+            Command::AddCursorAbove | Command::AddCursorBelow => {
+                let delta = if cmd == Command::AddCursorAbove {
+                    -1
+                } else {
+                    1
+                };
+                // From the topmost (or bottom-most) cursor, like other editors.
+                let from = if delta < 0 {
+                    sel.as_slice()[0]
+                } else {
+                    sel.as_slice()[sel.len() - 1]
+                };
+                let cols = if wrap { view.wrap_cols() } else { None };
+                let map = view.display_map(buf, cols).clone();
+                let (to, goal) =
+                    view::move_vertically(buf, &map, cols, from.head, from.goal, delta);
+                if buf.char_to_line(to) != buf.char_to_line(from.head) {
+                    let mut c = Cursor::caret(to);
+                    c.goal = Some(goal);
+                    sel.add(c);
+                }
+            }
+            Command::AddNextOccurrence => {
+                let p = sel.primary();
+                if p.is_empty() && !sel.is_multi() {
+                    // First press selects the word at the caret.
+                    let w = view::word_range(buf, p.head);
+                    if w.is_empty() {
+                        return;
+                    }
+                    sel.set_primary(Cursor::new(w.start, w.end));
+                } else {
+                    let needle = buf.slice(p.range());
+                    if needle.is_empty() {
+                        return;
+                    }
+                    match next_occurrence(doc.text(), buf, &needle, p.end(), &sel) {
+                        Some(r) => sel.add(Cursor::new(r.start, r.end)),
+                        None => {
+                            self.status = "No more occurrences".to_owned();
+                            return;
+                        }
+                    }
+                }
+            }
+            Command::SelectAllOccurrences => {
+                let p = sel.primary();
+                let range = if p.is_empty() {
+                    view::word_range(buf, p.head)
+                } else {
+                    p.range()
+                };
+                let needle = buf.slice(range.clone());
+                if needle.is_empty() {
+                    return;
+                }
+                let text = doc.text();
+                let mut cursors = Vec::new();
+                let mut primary = 0;
+                for (byte, m) in text.match_indices(needle.as_str()) {
+                    let start = buf.rope().byte_to_char(byte);
+                    let end = start + m.chars().count();
+                    if start == range.start {
+                        primary = cursors.len();
+                    }
+                    cursors.push(Cursor::new(start, end));
+                }
+                let n = cursors.len();
+                sel = Selections::new(cursors, primary);
+                self.status = format!("{n} occurrence{}", if n == 1 { "" } else { "s" });
+            }
+            Command::AddCursorsToLineEnds => {
+                let mut cursors = Vec::new();
+                for c in sel.iter() {
+                    let (a, b) = (buf.char_to_line(c.start()), buf.char_to_line(c.end()));
+                    if a == b {
+                        cursors.push(Cursor::caret(c.end()));
+                        continue;
+                    }
+                    for line in a..=b {
+                        let end = buf.line_start(line) + buf.line_len(line);
+                        // A selection ending at a line start doesn't include that line.
+                        if line == b && c.end() == buf.line_start(line) {
+                            continue;
+                        }
+                        cursors.push(Cursor::caret(end));
+                    }
+                }
+                let n = cursors.len();
+                sel = Selections::new(cursors, n.saturating_sub(1));
+            }
+            _ => return,
+        }
+        self.set_selections(ctx, sel, Reveal::Cursor, true);
+    }
+
+    // ---- folding --------------------------------------------------------
+
+    pub(super) fn fold_command(&mut self, cmd: Command) {
+        let ranges = self.fold_ranges_for(self.active);
+        let Some((doc, view)) = self.focused_doc_view() else {
+            return;
+        };
+        view.sync(&doc.buffer);
+        let buf = &doc.buffer;
+        let source = match &ranges {
+            Some(r) => FoldSource::Ranges(r),
+            None => FoldSource::Indent,
+        };
+        let lines: Vec<usize> = view.sel.iter().map(|c| buf.char_to_line(c.head)).collect();
+        match cmd {
+            Command::Fold => {
+                for line in lines {
+                    // The innermost region not folded yet.
+                    let mut at = line;
+                    while let Some((s, e)) = source.enclosing(buf, at) {
+                        if !view.is_folded_at(s) {
+                            view.fold(buf, s, e);
+                            break;
+                        }
+                        if s == 0 {
+                            break;
+                        }
+                        at = s - 1;
+                    }
+                }
+            }
+            Command::Unfold => {
+                for line in lines {
+                    if !view.unfold(line)
+                        && let Some(f) = view
+                            .folds()
+                            .iter()
+                            .rev()
+                            .find(|f| f.start <= line && line <= f.end)
+                            .copied()
+                    {
+                        view.unfold(f.start);
+                    }
+                }
+            }
+            Command::FoldAll => {
+                for (s, e) in source.all(buf) {
+                    view.fold(buf, s, e);
+                }
+            }
+            Command::UnfoldAll => view.unfold_all(),
+            _ => {}
+        }
+        view.reveal = Some(Reveal::Cursor);
     }
 
     // ---- go to line ------------------------------------------------------
@@ -260,24 +353,11 @@ impl ForgeApp {
         if enter {
             self.go_to_line = None;
             if let Some((line, col)) = target {
-                let at = ops::line_col_to_char(doc.text(), line.min(line_count), col);
+                let at = doc.char_index(line.min(line_count), col);
                 self.set_selection(ctx, Selection::caret(at), true);
             }
         }
     }
-}
-
-/// Whether the editor widget would act on `event`.
-fn changes_text_or_cursor(event: &Event) -> bool {
-    matches!(
-        event,
-        Event::Text(_)
-            | Event::Paste(_)
-            | Event::Cut
-            | Event::Ime(_)
-            | Event::Key { pressed: true, .. }
-            | Event::PointerButton { .. }
-    )
 }
 
 /// Parses "12" or "12:5" (1-based). Column defaults to 1.
@@ -289,6 +369,31 @@ fn parse_line_col(input: &str) -> Option<(usize, usize)> {
         _ => 1,
     };
     Some((line, col))
+}
+
+/// The next match of `needle` after char `from` (wrapping around) that isn't
+/// already selected.
+fn next_occurrence(
+    text: &str,
+    buf: &crate::editor::Buffer,
+    needle: &str,
+    from: usize,
+    sel: &Selections,
+) -> Option<std::ops::Range<usize>> {
+    let from_byte = buf.rope().char_to_byte(from.min(buf.len_chars()));
+    let found = text[from_byte..]
+        .match_indices(needle)
+        .map(|(b, _)| from_byte + b)
+        .chain(text[..from_byte].match_indices(needle).map(|(b, _)| b));
+    let len = needle.chars().count();
+    for byte in found {
+        let start = buf.rope().byte_to_char(byte);
+        let range = start..start + len;
+        if !sel.iter().any(|c| c.range() == range) {
+            return Some(range);
+        }
+    }
+    None
 }
 
 #[cfg(test)]

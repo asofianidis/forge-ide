@@ -1,8 +1,8 @@
 //! A small GitHub-flavored Markdown renderer for PR descriptions, comments
-//! and AI replies: headings, paragraphs, lists, task lists, quotes, code
-//! blocks, tables, rules, and inline code/bold/italic/links. Common inline
-//! HTML (`<b>`, `<a>`, `<br>`, `<table>`, `<details>`, …) is turned into the
-//! equivalent Markdown first.
+//! and AI replies and the Markdown preview: headings, paragraphs, lists,
+//! task lists, quotes, code blocks, tables, rules, and inline
+//! code/bold/italic/links. Common inline HTML (`<b>`, `<a>`, `<br>`,
+//! `<table>`, `<details>`, …) is turned into the equivalent Markdown first.
 
 use egui::{Color32, RichText, Stroke, Ui};
 
@@ -32,15 +32,36 @@ enum Align {
     Right,
 }
 
-/// Renders markdown `src` into `ui`.
+/// Renders markdown `src` into `ui`. Every link opens in the browser.
 pub fn show(ui: &mut Ui, src: &str) {
+    render(ui, src, "No description provided.", false);
+}
+
+/// Renders a Markdown file's text for the preview. Web links (`http:`,
+/// `https:`, `mailto:`) open in the browser; any other link is returned when
+/// clicked so the caller can resolve it against the file's folder.
+pub fn show_document(ui: &mut Ui, src: &str) -> Option<String> {
+    render(ui, src, "Empty document.", true)
+}
+
+/// Whether a link target leaves the workspace (opened in the browser rather
+/// than in the editor).
+pub fn is_web_link(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    ["http://", "https://", "mailto:"]
+        .iter()
+        .any(|p| lower.starts_with(p))
+}
+
+fn render(ui: &mut Ui, src: &str, empty: &str, local_links: bool) -> Option<String> {
     let blocks = parse(src);
     if blocks.is_empty() {
-        ui.label(RichText::new("No description provided.").italics().weak());
-        return;
+        ui.label(RichText::new(empty).italics().weak());
+        return None;
     }
-    for block in &blocks {
-        match block {
+    let mut clicked = None;
+    for (idx, block) in blocks.iter().enumerate() {
+        let link = match block {
             Block::Heading(level, text) => {
                 ui.add_space(if *level <= 2 { 6.0 } else { 3.0 });
                 let size = match level {
@@ -49,25 +70,29 @@ pub fn show(ui: &mut Ui, src: &str) {
                     3 => 15.0,
                     _ => 13.5,
                 };
-                inline(ui, text, Some(size), true);
+                let link = inline(ui, text, Some(size), true, local_links);
                 if *level <= 2 {
                     ui.separator();
                 }
+                link
             }
             Block::Paragraph(text) => {
-                inline(ui, text, None, false);
+                let link = inline(ui, text, None, false, local_links);
                 ui.add_space(4.0);
+                link
             }
             Block::ListItem(indent, marker, text) => {
-                ui.horizontal_wrapped(|ui| {
+                // Wrapped lines hang under the item's text, not its marker.
+                ui.horizontal_top(|ui| {
                     ui.add_space(8.0 + *indent as f32 * 16.0);
                     ui.label(RichText::new(marker).weak().monospace());
-                    inline_contents(ui, text, None, false);
-                });
+                    inline(ui, text, None, false, local_links)
+                })
+                .inner
             }
             Block::Quote(text) => {
                 let stroke_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
-                egui::Frame::new()
+                let link = egui::Frame::new()
                     .inner_margin(egui::Margin {
                         left: 10,
                         right: 4,
@@ -84,13 +109,16 @@ pub fn show(ui: &mut Ui, src: &str) {
                             Stroke::new(3.0, stroke_color),
                         );
                         ui.visuals_mut().override_text_color = Some(ui.visuals().weak_text_color());
-                        inline(ui, text, None, false);
-                    });
+                        inline(ui, text, None, false, local_links)
+                    })
+                    .inner;
                 ui.add_space(4.0);
+                link
             }
             Block::Table(table) => {
-                show_table(ui, table);
+                let link = show_table(ui, table, local_links);
                 ui.add_space(6.0);
+                link
             }
             Block::Code(code) => {
                 egui::Frame::new()
@@ -99,31 +127,38 @@ pub fn show(ui: &mut Ui, src: &str) {
                     .inner_margin(8)
                     .show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
+                        // Keyed by content rather than address: the text is
+                        // re-parsed every frame, so its address changes.
                         egui::ScrollArea::horizontal()
-                            .id_salt(code.as_ptr())
+                            .id_salt(("md_code", idx, code))
                             .show(ui, |ui| {
                                 ui.add(egui::Label::new(RichText::new(code).monospace()).extend());
                             });
                     });
                 ui.add_space(4.0);
+                None
             }
             Block::Rule => {
                 ui.separator();
+                None
             }
-        }
+        };
+        clicked = clicked.or(link);
     }
+    clicked
 }
 
 /// A table as a grid: bold header, a rule under it, striped rows; long
 /// cells wrap, and a very wide table scrolls sideways.
-fn show_table(ui: &mut Ui, table: &Table) {
+fn show_table(ui: &mut Ui, table: &Table, local_links: bool) -> Option<String> {
     let cols = table
         .header
         .len()
         .max(table.rows.iter().map(Vec::len).max().unwrap_or(0));
     if cols == 0 {
-        return;
+        return None;
     }
+    let mut clicked = None;
     let border = ui.visuals().widgets.noninteractive.bg_stroke.color;
     let id = ui.next_auto_id();
     egui::Frame::new()
@@ -139,7 +174,7 @@ fn show_table(ui: &mut Ui, table: &Table) {
                     .spacing([16.0, 6.0])
                     .max_col_width(max_col)
                     .show(ui, |ui| {
-                        let cell = |ui: &mut Ui, text: &str, col: usize, strong: bool| {
+                        let mut cell = |ui: &mut Ui, text: &str, col: usize, strong: bool| {
                             let align = table.align.get(col).copied().unwrap_or(Align::Left);
                             let layout = match align {
                                 Align::Left => egui::Layout::left_to_right(egui::Align::Center)
@@ -149,10 +184,13 @@ fn show_table(ui: &mut Ui, table: &Table) {
                                 ),
                                 Align::Right => egui::Layout::right_to_left(egui::Align::Center),
                             };
-                            ui.with_layout(layout, |ui| {
-                                ui.spacing_mut().item_spacing.x = 0.0;
-                                inline_contents(ui, text, None, strong);
-                            });
+                            let link = ui
+                                .with_layout(layout, |ui| {
+                                    ui.spacing_mut().item_spacing.x = 0.0;
+                                    inline_contents(ui, text, None, strong, local_links)
+                                })
+                                .inner;
+                            clicked = clicked.take().or(link);
                         };
                         for c in 0..cols {
                             let text = table.header.get(c).map_or("", String::as_str);
@@ -169,14 +207,29 @@ fn show_table(ui: &mut Ui, table: &Table) {
                     });
             });
         });
+    clicked
 }
 
-fn inline(ui: &mut Ui, text: &str, size: Option<f32>, strong: bool) {
-    ui.horizontal_wrapped(|ui| inline_contents(ui, text, size, strong));
+fn inline(
+    ui: &mut Ui,
+    text: &str,
+    size: Option<f32>,
+    strong: bool,
+    local_links: bool,
+) -> Option<String> {
+    ui.horizontal_wrapped(|ui| inline_contents(ui, text, size, strong, local_links))
+        .inner
 }
 
-fn inline_contents(ui: &mut Ui, text: &str, size: Option<f32>, strong: bool) {
+fn inline_contents(
+    ui: &mut Ui,
+    text: &str,
+    size: Option<f32>,
+    strong: bool,
+    local_links: bool,
+) -> Option<String> {
     ui.spacing_mut().item_spacing.x = 0.0;
+    let mut clicked = None;
     for span in parse_inline(text) {
         let mut rt = RichText::new(&span.text);
         if let Some(s) = size {
@@ -197,6 +250,11 @@ fn inline_contents(ui: &mut Ui, text: &str, size: Option<f32>, strong: bool) {
                 .background_color(ui.visuals().extreme_bg_color);
         }
         match &span.link {
+            Some(url) if local_links && !is_web_link(url) => {
+                if ui.link(rt).on_hover_text(url).clicked() {
+                    clicked = Some(url.clone());
+                }
+            }
             Some(url) => {
                 ui.hyperlink_to(rt, url);
             }
@@ -205,6 +263,7 @@ fn inline_contents(ui: &mut Ui, text: &str, size: Option<f32>, strong: bool) {
             }
         }
     }
+    clicked
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -334,6 +393,9 @@ fn parse(src: &str) -> Vec<Block> {
     let mut blocks = Vec::new();
     let mut para = String::new();
     let mut lines = src.lines().peekable();
+    // The last line was a list item or its continuation, so a plain text
+    // line belongs to that item.
+    let mut in_list_item = false;
 
     let flush = |para: &mut String, blocks: &mut Vec<Block>| {
         let text = para.trim();
@@ -363,6 +425,7 @@ fn parse(src: &str) -> Vec<Block> {
             blocks.push(Block::Code(code.join("\n")));
         } else if trimmed.is_empty() {
             flush(&mut para, &mut blocks);
+            in_list_item = false;
         } else if let Some(level) = heading_level(trimmed) {
             flush(&mut para, &mut blocks);
             let text = trimmed[level..].trim().trim_end_matches('#').trim();
@@ -373,6 +436,7 @@ fn parse(src: &str) -> Vec<Block> {
         } else if let Some((marker, text)) = list_item(trimmed) {
             flush(&mut para, &mut blocks);
             blocks.push(Block::ListItem(indent, marker, text.to_owned()));
+            in_list_item = true;
         } else if let Some(q) = trimmed.strip_prefix('>') {
             flush(&mut para, &mut blocks);
             let mut text = q.trim().to_owned();
@@ -408,6 +472,10 @@ fn parse(src: &str) -> Vec<Block> {
                 lines.next();
             }
             blocks.push(Block::Code(rows.join("\n")));
+        } else if in_list_item && let Some(Block::ListItem(_, _, text)) = blocks.last_mut() {
+            // A hard-wrapped list item continues on the next line.
+            text.push(' ');
+            text.push_str(trimmed.trim_end());
         } else {
             if !para.is_empty() {
                 para.push(' ');
@@ -916,6 +984,17 @@ mod tests {
     }
 
     #[test]
+    fn joins_wrapped_list_items() {
+        let b = parse("- one\n  continued\nlazily\n- two\n\nafter");
+        assert_eq!(
+            b[0],
+            Block::ListItem(0, "• ".into(), "one continued lazily".into())
+        );
+        assert_eq!(b[1], Block::ListItem(0, "• ".into(), "two".into()));
+        assert_eq!(b[2], Block::Paragraph("after".into()));
+    }
+
+    #[test]
     fn parses_inline_spans() {
         let spans = parse_inline("a **b** `c` [d](http://x) snake_case");
         assert_eq!(spans[0].text, "a ");
@@ -923,5 +1002,15 @@ mod tests {
         assert!(spans[3].code && spans[3].text == "c");
         assert_eq!(spans[5].link.as_deref(), Some("http://x"));
         assert_eq!(spans.last().unwrap().text, " snake_case");
+    }
+
+    #[test]
+    fn tells_web_links_from_local_ones() {
+        assert!(is_web_link("https://example.com"));
+        assert!(is_web_link("HTTP://example.com"));
+        assert!(is_web_link("mailto:someone@example.com"));
+        assert!(!is_web_link("docs/guide.md"));
+        assert!(!is_web_link("../LICENSE"));
+        assert!(!is_web_link("#roadmap"));
     }
 }
