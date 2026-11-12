@@ -1988,12 +1988,13 @@ fn tab_close_button(
         let button = Rect::from_center_size(slot.center(), egui::vec2(18.0, 18.0));
         let painter = ui.painter();
         if hovered {
+            // Red circle signals a destructive action; darken it while pressed.
             let fill = if response.is_pointer_button_down_on() {
-                colors.border.0
+                colors.error.0.lerp_to_gamma(egui::Color32::BLACK, 0.2)
             } else {
-                colors.widget_hover.0
+                colors.error.0
             };
-            painter.rect_filled(button, 4.0, fill);
+            painter.circle_filled(button.center(), button.width() / 2.0, fill);
         }
         if dirty && !hovered {
             let color = if selected || tab_hovered {
@@ -2003,7 +2004,9 @@ fn tab_close_button(
             };
             painter.circle_filled(button.center(), 3.5, color);
         } else {
-            let color = if hovered || selected {
+            let color = if hovered {
+                egui::Color32::WHITE
+            } else if selected {
                 colors.text.0
             } else if tab_hovered {
                 colors.text_muted.0
