@@ -10,6 +10,7 @@ pub enum Command {
     NewFile,
     OpenFile,
     OpenFolder,
+    OpenRecent,
     Save,
     CloseTab,
     Quit,
@@ -55,6 +56,7 @@ impl Command {
         Command::NewFile,
         Command::OpenFile,
         Command::OpenFolder,
+        Command::OpenRecent,
         Command::Save,
         Command::CloseTab,
         Command::Quit,
@@ -91,6 +93,7 @@ impl Command {
             Command::NewFile => "New File",
             Command::OpenFile => "Open File…",
             Command::OpenFolder => "Open Folder…",
+            Command::OpenRecent => "Open Recent Folder…",
             Command::Save => "Save",
             Command::CloseTab => "Close Tab",
             Command::Quit => "Quit",
@@ -126,7 +129,7 @@ impl Command {
     pub fn category(self) -> &'static str {
         use Command::*;
         match self {
-            NewFile | OpenFile | OpenFolder | Save | CloseTab | Quit => "File",
+            NewFile | OpenFile | OpenFolder | OpenRecent | Save | CloseTab | Quit => "File",
             Find | Replace | FindInProject | ToggleComment | Indent | Outdent | DuplicateLine
             | MoveLineUp | MoveLineDown => "Edit",
             QuickOpen | GoToLine => "Go",
@@ -175,6 +178,8 @@ impl Command {
             Command::MoveLineUp => &const { one(shortcut(ALT, Key::ArrowUp)) },
             Command::MoveLineDown => &const { one(shortcut(ALT, Key::ArrowDown)) },
             Command::QuickOpen => &const { one(shortcut(CMD, Key::P)) },
+            // Ctrl+R on every platform, as in other editors.
+            Command::OpenRecent => &const { one(shortcut(Modifiers::CTRL, Key::R)) },
             // Ctrl+G on every platform; Cmd+G is "find next" on macOS.
             Command::GoToLine => &const { one(shortcut(Modifiers::CTRL, Key::G)) },
             Command::ShowCommandPalette => &const { one(shortcut(CMD_SHIFT, Key::P)) },

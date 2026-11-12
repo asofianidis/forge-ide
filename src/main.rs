@@ -22,10 +22,8 @@ mod workspace;
 use app::ForgeApp;
 
 fn main() -> eframe::Result {
-    let root = std::env::args()
-        .nth(1)
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::current_dir().ok());
+    // A folder given on the command line; otherwise the last one opened.
+    let root = std::env::args().nth(1).map(std::path::PathBuf::from);
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

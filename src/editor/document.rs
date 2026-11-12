@@ -192,6 +192,19 @@ impl Document {
         }
         (line, col)
     }
+
+    /// Character offset of a 1-based (line, column), clamped to the text.
+    pub fn char_index(&self, line: usize, col: usize) -> usize {
+        let mut idx = 0;
+        for (i, text) in self.text.split('\n').enumerate() {
+            let len = text.chars().count();
+            if i + 1 == line.max(1) {
+                return idx + col.saturating_sub(1).min(len);
+            }
+            idx += len + 1;
+        }
+        self.text.chars().count()
+    }
 }
 
 fn mtime(path: &Path) -> Option<SystemTime> {
@@ -210,6 +223,20 @@ mod tests {
         assert_eq!(doc.line_col(2), (1, 3));
         assert_eq!(doc.line_col(3), (2, 1));
         assert_eq!(doc.line_col(7), (3, 2));
+    }
+
+    #[test]
+    fn char_index_inverts_line_col_and_clamps() {
+        let mut doc = Document::untitled();
+        doc.text = "ab\ncd\nef".into();
+        for idx in 0..=8 {
+            let (line, col) = doc.line_col(idx);
+            assert_eq!(doc.char_index(line, col), idx);
+        }
+        // Past the end of a line, or past the last line (the file got shorter).
+        assert_eq!(doc.char_index(1, 99), 2);
+        assert_eq!(doc.char_index(9, 1), 8);
+        assert_eq!(doc.char_index(0, 0), 0);
     }
 
     #[test]

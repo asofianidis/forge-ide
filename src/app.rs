@@ -4,6 +4,7 @@ mod editing;
 mod find_bar;
 mod pickers;
 mod search_panel;
+mod session;
 
 use std::collections::HashSet;
 use std::ops::Range;
@@ -28,7 +29,7 @@ use crate::lsp::{ServerBrowser, ServerManager};
 use crate::palette::Picker;
 use crate::panes::{ChangesPane, CommitPane, LogPane, Pane, PaneAction};
 use crate::search::FileIndex;
-use crate::settings::Settings;
+use crate::settings::{Session, Settings};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::activity::{self, SidebarView};
 use crate::ui::icons::{self, Icon};
@@ -123,6 +124,9 @@ pub struct ForgeApp {
     jump_to_line: Option<usize>,
     /// Requested jump to the next (+1) or previous (-1) change.
     change_nav: Option<i8>,
+    egui_ctx: egui::Context,
+    /// The current folder's tabs as last saved to the settings file.
+    saved_session: Option<Session>,
 }
 
 impl ForgeApp {
@@ -148,9 +152,12 @@ impl ForgeApp {
         themes[idx].apply(&cc.egui_ctx);
         crate::ui::diff_style::set_theme(themes[idx].syntect_theme());
 
-        let workspace = root.filter(|p| p.is_dir()).map(Workspace::open);
+        let root = session::startup_folder(root, &settings)
+            .filter(|p| p.is_dir())
+            .map(|p| std::path::absolute(&p).unwrap_or(p));
+        let workspace = root.map(Workspace::open);
         let folder = workspace.as_ref().map(|w| w.root.path.clone());
-        Self {
+        let mut app = Self {
             source_control: SourceControl::new(cc.egui_ctx.clone(), folder.as_deref()),
             scm_panel: ScmPanel::default(),
             github: GitHub::new(cc.egui_ctx.clone(), folder.as_deref()),
@@ -191,13 +198,13 @@ impl ForgeApp {
             allow_close: false,
             last_disk_poll: Instant::now(),
             was_focused: true,
+            egui_ctx: cc.egui_ctx.clone(),
+            saved_session: None,
+        };
+        if let Some(folder) = folder {
+            app.folder_opened(&folder);
         }
-    }
-
-    fn save_settings(&mut self) {
-        if let Err(e) = self.settings.save() {
-            self.status = format!("Could not save settings: {e:#}");
-        }
+        app
     }
 
     // ---- updates -------------------------------------------------------
@@ -302,8 +309,8 @@ impl ForgeApp {
         self.highlighter.set_theme(theme.syntect_theme());
         crate::ui::diff_style::set_theme(theme.syntect_theme());
         self.status = format!("Theme: {}", theme.name);
-        self.settings.theme = Some(theme.name.clone());
-        self.save_settings();
+        let name = theme.name.clone();
+        self.update_settings(|s| s.theme = Some(name));
     }
 
     fn reload_themes(&mut self, ctx: &egui::Context) {
@@ -390,6 +397,9 @@ impl ForgeApp {
     }
 
     fn open_folder(&mut self, path: PathBuf) {
+        let path = std::path::absolute(&path).unwrap_or(path);
+        // Remember the tabs (and cursors) of the folder being left.
+        self.persist_session(true);
         self.status = format!("Opened folder {}", path.display());
         self.source_control.open(Some(&path));
         self.github.open(Some(&path));
@@ -397,7 +407,8 @@ impl ForgeApp {
         self.active_pane = None;
         self.editor_git.clear();
         self.search = SearchPanel::default();
-        self.workspace = Some(Workspace::open(path));
+        self.workspace = Some(Workspace::open(path.clone()));
+        self.folder_opened(&path);
     }
 
     /// Starts another Forge process with `path` open.
@@ -797,6 +808,7 @@ impl ForgeApp {
             Command::NewFile => self.new_file(),
             Command::OpenFile => self.open_file_dialog(),
             Command::OpenFolder => self.open_folder_dialog(),
+            Command::OpenRecent => self.open_recent_picker(),
             Command::Save => self.save_active(),
             Command::CloseTab => match self.active_pane {
                 Some(i) => self.close_pane(i),
@@ -889,6 +901,7 @@ impl ForgeApp {
                 for cmd in [NewFile, OpenFile, OpenFolder] {
                     self.menu_item(ui, cmd);
                 }
+                self.open_recent_menu(ui);
                 ui.separator();
                 self.menu_item(ui, Save);
                 self.menu_item(ui, CloseTab);
@@ -969,8 +982,7 @@ impl ForgeApp {
                     .checkbox(&mut auto, "Check for Updates on Startup")
                     .changed()
                 {
-                    self.settings.auto_update = Some(auto);
-                    self.save_settings();
+                    self.update_settings(|s| s.auto_update = Some(auto));
                 }
                 ui.separator();
                 ui.label(format!("Forge IDE {}", updater::VERSION));
@@ -2021,5 +2033,10 @@ impl eframe::App for ForgeApp {
             self.run_command(&ctx, cmd);
         }
         self.close_dialog(&ctx);
+        self.persist_session(false);
+    }
+
+    fn on_exit(&mut self) {
+        self.persist_session(true);
     }
 }
