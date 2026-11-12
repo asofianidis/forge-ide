@@ -82,21 +82,21 @@ struct Row {
 }
 
 fn rows_for(provider: Provider, show_more: bool, custom: &[String]) -> Vec<Row> {
-    let mut rows: Vec<Row> = provider
-        .models()
+    let models = provider.models();
+    let mut rows: Vec<Row> = models
         .iter()
         .filter(|m| show_more || !m.more)
         .map(|m| Row {
             provider,
-            id: m.id.to_owned(),
-            name: m.name.to_owned(),
+            id: m.id.clone(),
+            name: m.name.clone(),
             custom: false,
         })
         .collect();
     for k in custom {
         if let Some((p, m)) = parse_key(k)
             && p == provider
-            && !provider.models().iter().any(|x| x.id == m)
+            && !models.iter().any(|x| x.id == m)
         {
             rows.push(Row {
                 provider,
@@ -127,7 +127,7 @@ pub fn button(
 ) -> bool {
     let name = choice.provider.model_name(&choice.model);
     let name = short_name(&name).to_owned();
-    let effort = choice.provider.effort_label(&choice.effort);
+    let effort = choice.provider.effort_label(&choice.model, &choice.effort);
     let font = egui::TextStyle::Button.resolve(ui.style());
     let name_g = ui
         .painter()
@@ -431,15 +431,15 @@ fn contents(
             }
             state.search.clear();
         }
-        if choice.provider != row.provider {
-            let keep = row
-                .provider
-                .efforts()
-                .iter()
-                .any(|(v, _)| *v == choice.effort);
-            if !keep {
-                choice.effort = row.provider.default_effort().to_owned();
-            }
+        // Keep the effort when the new model takes it; Cursor models have
+        // none (the level is part of the model id).
+        let keep = row
+            .provider
+            .efforts_for(&row.id)
+            .iter()
+            .any(|(v, _)| *v == choice.effort);
+        if !keep {
+            choice.effort = row.provider.default_effort_for(&row.id);
         }
         if choice.provider != row.provider || choice.model != row.id {
             choice.provider = row.provider;
@@ -681,13 +681,14 @@ fn effort_meter(ui: &mut Ui, choice: &mut ModelChoice, colors: &UiColors) -> boo
     ui.horizontal(|ui| {
         ui.label(RichText::new("Effort").small().color(colors.text_muted.0));
         ui.add_space(8.0);
-        let efforts = choice.provider.efforts();
+        let efforts = choice.provider.efforts_for(&choice.model);
         if efforts.is_empty() {
-            ui.label(
-                RichText::new(format!("set by the model in {}", choice.provider.name()))
-                    .small()
-                    .color(colors.text_muted.0),
-            );
+            let text = if choice.provider == Provider::Cursor {
+                "part of the model: pick a -high or -thinking variant above".to_owned()
+            } else {
+                format!("set by {}", choice.provider.name())
+            };
+            ui.label(RichText::new(text).small().color(colors.text_muted.0));
             return;
         }
         let current = efforts.iter().position(|(v, _)| *v == choice.effort);
@@ -709,13 +710,13 @@ fn effort_meter(ui: &mut Ui, choice: &mut ModelChoice, colors: &UiColors) -> boo
                 colors.border.0
             };
             ui.painter().rect_filled(bar, 2.0, fill);
-            if response.on_hover_text(*label).clicked() && current != Some(i) {
-                choice.effort = (*value).to_owned();
+            if response.on_hover_text(label.as_str()).clicked() && current != Some(i) {
+                choice.effort = value.clone();
                 changed = true;
             }
         }
         ui.add_space(6.0);
-        let label = current.map_or("Default", |c| efforts[c].1);
+        let label = current.map_or("Default", |c| efforts[c].1.as_str());
         ui.label(RichText::new(label).small().color(colors.text.0));
     });
     changed

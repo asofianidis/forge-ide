@@ -17,13 +17,13 @@ pub enum Provider {
     Codex,
 }
 
-/// One entry in a provider's model list.
+/// One entry in a provider's built-in model list.
 #[derive(Debug, Clone, Copy)]
 pub struct ModelInfo {
     /// What is passed to the CLI's `--model`; empty means "the CLI's default".
     pub id: &'static str,
     pub name: &'static str,
-    /// Listed only after "Show more".
+    /// Listed only after "+ more".
     pub more: bool,
 }
 
@@ -55,32 +55,276 @@ const CLAUDE_MODELS: &[ModelInfo] = &[
     more("", "Default (Claude config)"),
 ];
 
-const CURSOR_MODELS: &[ModelInfo] = &[model("auto", "Auto"), model("", "Default (Cursor config)")];
+/// Used until `cursor-agent models` answers (or if it can't). Cursor puts
+/// the reasoning level in the model id, so each level is its own entry.
+const CURSOR_MODELS: &[ModelInfo] = &[
+    model("auto", "Auto"),
+    model("composer-2", "Composer 2"),
+    model("composer-1.5", "Composer 1.5"),
+    model("sonnet-4.6", "Claude Sonnet 4.6"),
+    model("sonnet-4.6-thinking", "Claude Sonnet 4.6 Thinking"),
+    model("opus-4.6", "Claude Opus 4.6"),
+    model("opus-4.6-thinking", "Claude Opus 4.6 Thinking"),
+    more("opus-4.5", "Claude Opus 4.5"),
+    more("opus-4.5-thinking", "Claude Opus 4.5 Thinking"),
+];
 
+/// Used until Codex's own model cache is found.
 const CODEX_MODELS: &[ModelInfo] = &[
-    model("", "Default (Codex config)"),
-    more("gpt-5.1-codex", "GPT-5.1 Codex"),
-    more("gpt-5.1-codex-mini", "GPT-5.1 Codex Mini"),
-    more("gpt-5.1-codex-max", "GPT-5.1 Codex Max"),
-    more("gpt-5.1", "GPT-5.1"),
+    model("gpt-6-astra", "GPT-6 Astra"),
+    model("gpt-6.1-sol", "GPT-6.1 Sol"),
+    model("gpt-6-luna", "GPT-6 Luna"),
+    more("gpt-6-sol", "GPT-6 Sol"),
+    more("gpt-5.6-sol", "GPT-5.6 Sol"),
+    more("gpt-5.6-terra", "GPT-5.6 Terra"),
+    more("gpt-5.6-luna", "GPT-5.6 Luna"),
+    more("gpt-5.5", "GPT-5.5"),
+    more("gpt-5.4-mini", "GPT-5.4 Mini"),
+    more("gpt-5.3-codex-spark", "GPT-5.3 Codex Spark"),
+    more("", "Default (Codex config)"),
 ];
 
 /// Reasoning levels: (value passed to the CLI, label).
-const CLAUDE_EFFORTS: &[(&str, &str)] = &[
-    ("low", "Low"),
-    ("medium", "Medium"),
-    ("high", "High"),
-    ("xhigh", "Extra High"),
-    ("max", "Max"),
-];
+const CLAUDE_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+const CODEX_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
 
-const CODEX_EFFORTS: &[(&str, &str)] = &[
-    ("minimal", "Minimal"),
-    ("low", "Low"),
-    ("medium", "Medium"),
-    ("high", "High"),
-    ("xhigh", "Extra High"),
-];
+/// A model as the picker shows it: from the CLI itself when it could be
+/// asked, otherwise from the built-in list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Model {
+    pub id: String,
+    pub name: String,
+    pub more: bool,
+    /// Reasoning levels this model takes, when the CLI said so.
+    pub efforts: Option<Vec<String>>,
+    pub default_effort: Option<String>,
+}
+
+impl From<&ModelInfo> for Model {
+    fn from(m: &ModelInfo) -> Self {
+        Self {
+            id: m.id.to_owned(),
+            name: m.name.to_owned(),
+            more: m.more,
+            efforts: None,
+            default_effort: None,
+        }
+    }
+}
+
+/// Model lists the CLIs reported, by provider.
+static DISCOVERED: std::sync::RwLock<Vec<(Provider, Vec<Model>)>> =
+    std::sync::RwLock::new(Vec::new());
+
+/// Label for a reasoning level.
+pub fn effort_name(effort: &str) -> String {
+    match effort {
+        "minimal" => "Minimal".to_owned(),
+        "low" => "Low".to_owned(),
+        "medium" => "Medium".to_owned(),
+        "high" => "High".to_owned(),
+        "xhigh" => "Extra High".to_owned(),
+        "max" => "Max".to_owned(),
+        "none" => "None".to_owned(),
+        other => {
+            let mut c = other.chars();
+            c.next()
+                .map(|f| f.to_uppercase().collect::<String>() + c.as_str())
+                .unwrap_or_default()
+        }
+    }
+}
+
+/// Asks each installed CLI for its models, in the background.
+pub fn refresh_catalogs(ctx: &egui::Context, installed: Vec<(Provider, PathBuf)>) {
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        for (p, exe) in installed {
+            if let Some(models) = discover(p, &exe).filter(|m| !m.is_empty()) {
+                let mut store = DISCOVERED.write().unwrap();
+                store.retain(|(x, _)| *x != p);
+                store.push((p, models));
+                ctx.request_repaint();
+            }
+        }
+    });
+}
+
+fn discover(p: Provider, exe: &Path) -> Option<Vec<Model>> {
+    match p {
+        // Claude's aliases and ids are stable; the built-in list is right.
+        Provider::Claude => None,
+        Provider::Cursor => ["models", "--list-models"].iter().find_map(|arg| {
+            let out = run_with_timeout(exe, &[arg], std::time::Duration::from_secs(20))?;
+            let models = parse_cursor_models(&out);
+            (!models.is_empty()).then_some(models)
+        }),
+        Provider::Codex => {
+            let home = std::env::var_os("CODEX_HOME")
+                .map(PathBuf::from)
+                .or_else(|| dirs::home_dir().map(|h| h.join(".codex")))?;
+            let text = std::fs::read_to_string(home.join("models_cache.json")).ok()?;
+            let mut models = parse_codex_models(&text);
+            if models.is_empty() {
+                return None;
+            }
+            models.push(Model::from(&more("", "Default (Codex config)")));
+            Some(models)
+        }
+    }
+}
+
+/// Runs `exe args` and returns stdout, or `None` if it fails or hangs.
+fn run_with_timeout(exe: &Path, args: &[&str], limit: std::time::Duration) -> Option<String> {
+    use std::io::Read as _;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(args)
+        .env("PATH", augmented_path(exe))
+        .env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    crate::lsp::detect::hide_console_window(&mut cmd);
+    let mut child = cmd.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stdout.read_to_string(&mut s);
+        s
+    });
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let out = reader.join().ok()?;
+                return status.success().then_some(out);
+            }
+            Ok(None) if start.elapsed() < limit => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+/// Removes terminal color codes.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Reads `cursor-agent models` output: one `id - Display Name` per line,
+/// the current or default model marked in parentheses.
+pub fn parse_cursor_models(text: &str) -> Vec<Model> {
+    let text = strip_ansi(text);
+    let mut out: Vec<Model> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim().trim_start_matches(['*', '-', '•', '>']).trim();
+        let Some((id, name)) = line.split_once(" - ").or_else(|| line.split_once(" – ")) else {
+            continue;
+        };
+        let id = id.trim();
+        let valid = !id.is_empty()
+            && id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '/'));
+        if !valid || out.iter().any(|m| m.id == id) {
+            continue;
+        }
+        let mut name = name.trim().to_owned();
+        for tag in ["(current)", "(default)", "(selected)"] {
+            name = name.replace(tag, "");
+        }
+        let name = name.trim();
+        out.push(Model {
+            id: id.to_owned(),
+            name: if name.is_empty() {
+                id.to_owned()
+            } else {
+                name.to_owned()
+            },
+            more: false,
+            efforts: None,
+            default_effort: None,
+        });
+    }
+    out
+}
+
+/// Reads Codex's `models_cache.json`: the models the account can use, each
+/// with the reasoning levels it supports.
+pub fn parse_codex_models(text: &str) -> Vec<Model> {
+    let Ok(v) = serde_json::from_str::<Value>(text) else {
+        return Vec::new();
+    };
+    let list = v
+        .get("models")
+        .and_then(Value::as_array)
+        .or_else(|| v.as_array());
+    let mut out = Vec::new();
+    for m in list.into_iter().flatten() {
+        let id = ["slug", "id", "model"]
+            .iter()
+            .find_map(|k| m.get(*k).and_then(Value::as_str))
+            .unwrap_or_default();
+        if id.is_empty() {
+            continue;
+        }
+        if let Some(vis) = m.get("visibility").and_then(Value::as_str)
+            && vis != "list"
+        {
+            continue;
+        }
+        let name = ["display_name", "displayName", "name"]
+            .iter()
+            .find_map(|k| m.get(*k).and_then(Value::as_str))
+            .unwrap_or(id);
+        let efforts: Vec<String> = m
+            .get("supported_reasoning_levels")
+            .or_else(|| m.get("supportedReasoningEfforts"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| {
+                e.as_str()
+                    .or_else(|| e.get("effort").and_then(Value::as_str))
+                    .or_else(|| e.get("reasoningEffort").and_then(Value::as_str))
+                    .map(str::to_owned)
+            })
+            .collect();
+        let default_effort = ["default_reasoning_level", "defaultReasoningEffort"]
+            .iter()
+            .find_map(|k| m.get(*k).and_then(Value::as_str))
+            .map(str::to_owned);
+        out.push(Model {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            more: false,
+            efforts: (!efforts.is_empty()).then_some(efforts),
+            default_effort,
+        });
+    }
+    out
+}
 
 /// How much the agent may do without asking (the CLIs run headless, so
 /// nothing can ask).
@@ -150,7 +394,7 @@ impl Provider {
         self.executables().iter().find_map(|n| find_executable(n))
     }
 
-    pub fn models(self) -> &'static [ModelInfo] {
+    fn builtin_models(self) -> &'static [ModelInfo] {
         match self {
             Provider::Claude => CLAUDE_MODELS,
             Provider::Cursor => CURSOR_MODELS,
@@ -158,36 +402,74 @@ impl Provider {
         }
     }
 
-    pub fn efforts(self) -> &'static [(&'static str, &'static str)] {
-        match self {
+    /// The models to offer: what the CLI reported, else the built-in list.
+    pub fn models(self) -> Vec<Model> {
+        if let Some((_, list)) = DISCOVERED.read().unwrap().iter().find(|(p, _)| *p == self) {
+            return list.clone();
+        }
+        self.builtin_models().iter().map(Model::from).collect()
+    }
+
+    /// Reasoning levels `model` takes, as (value, label). Empty for Cursor,
+    /// whose models carry the level in their id.
+    pub fn efforts_for(self, model: &str) -> Vec<(String, String)> {
+        let base: &[&str] = match self {
             Provider::Claude => CLAUDE_EFFORTS,
             Provider::Codex => CODEX_EFFORTS,
-            // Cursor encodes reasoning in the model name.
-            Provider::Cursor => &[],
+            Provider::Cursor => return Vec::new(),
+        };
+        let reported = self
+            .models()
+            .into_iter()
+            .find(|m| m.id == model)
+            .and_then(|m| m.efforts);
+        match reported {
+            Some(list) => list.iter().map(|e| (e.clone(), effort_name(e))).collect(),
+            None => base
+                .iter()
+                .map(|e| ((*e).to_owned(), effort_name(e)))
+                .collect(),
         }
     }
 
-    pub fn default_effort(self) -> &'static str {
-        match self {
-            Provider::Claude | Provider::Codex => "medium",
-            Provider::Cursor => "",
+    /// The level a new choice of `model` starts at.
+    pub fn default_effort_for(self, model: &str) -> String {
+        if self == Provider::Cursor {
+            return String::new();
         }
+        let reported = self
+            .models()
+            .into_iter()
+            .find(|m| m.id == model)
+            .and_then(|m| m.default_effort);
+        let efforts = self.efforts_for(model);
+        reported
+            .filter(|d| efforts.iter().any(|(v, _)| v == d))
+            .or_else(|| {
+                efforts
+                    .iter()
+                    .any(|(v, _)| v == "medium")
+                    .then(|| "medium".to_owned())
+            })
+            .or_else(|| efforts.first().map(|(v, _)| v.clone()))
+            .unwrap_or_default()
     }
 
     /// A display name for `model` (falls back to the id itself).
     pub fn model_name(self, model: &str) -> String {
         self.models()
-            .iter()
+            .into_iter()
             .find(|m| m.id == model)
-            .map(|m| m.name.to_owned())
+            .map(|m| m.name)
             .unwrap_or_else(|| model.to_owned())
     }
 
-    pub fn effort_label(self, effort: &str) -> Option<&'static str> {
-        self.efforts()
-            .iter()
-            .find(|(v, _)| *v == effort)
-            .map(|(_, l)| *l)
+    /// The label for `effort` on `model`, if the model takes it.
+    pub fn effort_label(self, model: &str, effort: &str) -> Option<String> {
+        self.efforts_for(model)
+            .into_iter()
+            .find(|(v, _)| v == effort)
+            .map(|(_, l)| l)
     }
 
     /// Arguments for one agent turn. `session` resumes an earlier
@@ -796,6 +1078,60 @@ mod tests {
                 detail: "src/a.rs".into()
             }]
         );
+    }
+
+    #[test]
+    fn cursor_model_list_parses() {
+        let out = "\x1b[1mAvailable models\x1b[0m\n\nauto - Auto  (current)\ncomposer-2 - Composer 2\ngpt-5.3-codex-high - GPT-5.3 Codex High\nsonnet-4.6-thinking - Claude Sonnet 4.6 Thinking (default)\n\nTip: use --model <id>\n";
+        let m = parse_cursor_models(out);
+        let ids: Vec<&str> = m.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "auto",
+                "composer-2",
+                "gpt-5.3-codex-high",
+                "sonnet-4.6-thinking"
+            ]
+        );
+        assert_eq!(m[0].name, "Auto");
+        assert_eq!(m[3].name, "Claude Sonnet 4.6 Thinking");
+        assert!(m.iter().all(|m| m.efforts.is_none()));
+    }
+
+    #[test]
+    fn codex_model_cache_parses() {
+        let json = r#"{"fetched_at":"x","models":[
+            {"slug":"gpt-6-astra","display_name":"GPT-6 Astra","visibility":"list",
+             "default_reasoning_level":"medium",
+             "supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"},{"effort":"high"},{"effort":"xhigh"}]},
+            {"slug":"internal-thing","display_name":"Hidden","visibility":"hide"},
+            {"slug":"gpt-6-luna","display_name":"GPT-6 Luna","visibility":"list",
+             "supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"}]}]}"#;
+        let m = parse_codex_models(json);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0].name, "GPT-6 Astra");
+        assert_eq!(m[0].default_effort.as_deref(), Some("medium"));
+        assert_eq!(m[1].efforts.as_ref().unwrap(), &["low", "medium"]);
+        assert!(parse_codex_models("not json").is_empty());
+    }
+
+    #[test]
+    fn cursor_has_no_effort_selector_and_codex_does() {
+        assert!(
+            Provider::Cursor
+                .efforts_for("gpt-5.3-codex-high")
+                .is_empty()
+        );
+        assert_eq!(Provider::Cursor.default_effort_for("auto"), "");
+        let codex: Vec<String> = Provider::Codex
+            .efforts_for("gpt-6-astra")
+            .into_iter()
+            .map(|(_, l)| l)
+            .collect();
+        assert_eq!(codex, ["Low", "Medium", "High", "Extra High"]);
+        assert_eq!(Provider::Codex.default_effort_for("gpt-6-astra"), "medium");
+        assert_eq!(effort_name("xhigh"), "Extra High");
     }
 
     #[test]

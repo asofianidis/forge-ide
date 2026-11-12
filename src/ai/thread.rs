@@ -30,7 +30,7 @@ impl ModelChoice {
         Self {
             provider,
             model: model.to_owned(),
-            effort: provider.default_effort().to_owned(),
+            effort: provider.default_effort_for(model),
         }
     }
 
@@ -38,7 +38,7 @@ impl ModelChoice {
     pub fn label(&self) -> String {
         let name = self.provider.model_name(&self.model);
         let name = name.strip_prefix("Claude ").unwrap_or(&name).to_owned();
-        match self.provider.effort_label(&self.effort) {
+        match self.provider.effort_label(&self.model, &self.effort) {
             Some(e) => format!("{name} {e}"),
             None => name,
         }

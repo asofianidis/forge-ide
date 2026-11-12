@@ -58,9 +58,11 @@ pub struct Ai {
 
 impl Ai {
     pub fn new(ctx: egui::Context, folder: Option<&Path>) -> Self {
+        let installed = detect();
+        provider::refresh_catalogs(&ctx, installed_paths(&installed));
         Self {
             ctx,
-            installed: detect(),
+            installed,
             threads: thread::load_all(),
             runs: HashMap::new(),
             folder: folder.map(Path::to_path_buf),
@@ -84,6 +86,7 @@ impl Ai {
     /// Looks for the CLIs again (e.g. after installing one).
     pub fn redetect(&mut self) {
         self.installed = detect();
+        provider::refresh_catalogs(&self.ctx, installed_paths(&self.installed));
     }
 
     pub fn exe(&self, p: Provider) -> Option<&Path> {
@@ -107,7 +110,7 @@ impl Ai {
             match self.first_installed().unwrap_or(Provider::Claude) {
                 Provider::Claude => ModelChoice::new(Provider::Claude, "claude-opus-5-5"),
                 Provider::Cursor => ModelChoice::new(Provider::Cursor, "auto"),
-                Provider::Codex => ModelChoice::new(Provider::Codex, ""),
+                Provider::Codex => ModelChoice::new(Provider::Codex, "gpt-6-astra"),
             }
         })
     }
@@ -121,10 +124,11 @@ impl Ai {
                     model: "claude-haiku-5-5".to_owned(),
                     effort: "low".to_owned(),
                 },
-                Provider::Cursor => ModelChoice::new(Provider::Cursor, "auto"),
+                // Fast, cheap models for short text.
+                Provider::Cursor => ModelChoice::new(Provider::Cursor, "composer-2"),
                 Provider::Codex => ModelChoice {
                     provider: Provider::Codex,
-                    model: String::new(),
+                    model: "gpt-6-luna".to_owned(),
                     effort: "low".to_owned(),
                 },
             }
@@ -375,6 +379,13 @@ impl Ai {
         });
         Some(result)
     }
+}
+
+fn installed_paths(installed: &[(Provider, Option<PathBuf>)]) -> Vec<(Provider, PathBuf)> {
+    installed
+        .iter()
+        .filter_map(|(p, path)| Some((*p, path.clone()?)))
+        .collect()
 }
 
 fn detect() -> Vec<(Provider, Option<PathBuf>)> {
