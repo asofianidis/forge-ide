@@ -1,12 +1,14 @@
 //! Workspace / project explorer: a lazily-loaded file tree rooted at a folder.
 
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
+
+use anyhow::{Context as _, bail};
 
 use crate::lsp::catalog::ServerSpec;
 
 /// Directory names hidden from the explorer.
-const IGNORED_DIRS: &[&str] = &[".git", "target", "node_modules"];
+pub const IGNORED_DIRS: &[&str] = &[".git", "target", "node_modules"];
 
 #[derive(Debug)]
 pub struct FileNode {
@@ -39,10 +41,123 @@ impl FileNode {
             .as_mut_slice()
     }
 
-    /// Drops cached children so they are re-read on next expansion.
-    pub fn refresh(&mut self) {
-        self.children = None;
+    /// The loaded node at `path` (this node or a descendant), if any.
+    pub fn find_mut(&mut self, path: &Path) -> Option<&mut FileNode> {
+        if self.path == path {
+            return Some(self);
+        }
+        if !path.starts_with(&self.path) {
+            return None;
+        }
+        self.children
+            .as_mut()?
+            .iter_mut()
+            .find_map(|c| c.find_mut(path))
     }
+
+    /// Re-reads this directory's listing if it has been loaded. Entries that
+    /// are still there keep their own loaded children.
+    pub fn reload(&mut self) {
+        let Some(old) = self.children.take() else {
+            return;
+        };
+        let mut old: HashMap<PathBuf, FileNode> =
+            old.into_iter().map(|n| (n.path.clone(), n)).collect();
+        let mut fresh = read_dir_sorted(&self.path);
+        for node in &mut fresh {
+            if let Some(prev) = old.remove(&node.path)
+                && prev.is_dir == node.is_dir
+            {
+                *node = prev;
+            }
+        }
+        self.children = Some(fresh);
+    }
+
+    /// Re-reads every loaded directory in this subtree.
+    pub fn reload_all(&mut self) {
+        self.reload();
+        if let Some(children) = &mut self.children {
+            for child in children.iter_mut().filter(|c| c.is_dir) {
+                child.reload_all();
+            }
+        }
+    }
+}
+
+/// Checks a name typed for a new or renamed entry. `allow_nested` permits
+/// `a/b/c.rs`, creating the folders in between.
+fn check_name(name: &str, allow_nested: bool) -> anyhow::Result<&str> {
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("Enter a name");
+    }
+    if !allow_nested && (name.contains('/') || name.contains('\\')) {
+        bail!("A name can't contain / or \\");
+    }
+    let path = Path::new(name);
+    if path.is_absolute() || !path.components().all(|c| matches!(c, Component::Normal(_))) {
+        bail!("\"{name}\" isn't a valid name");
+    }
+    Ok(name)
+}
+
+/// Creates an empty file (or a folder) named `name` inside `dir`, along with
+/// any folders in between. Fails if it already exists.
+pub fn create_entry(dir: &Path, name: &str, folder: bool) -> anyhow::Result<PathBuf> {
+    let path = dir.join(check_name(name, true)?);
+    if path.symlink_metadata().is_ok() {
+        bail!("{} already exists", path.display());
+    }
+    if folder {
+        std::fs::create_dir_all(&path)
+    } else {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map(drop)
+    }
+    .with_context(|| format!("failed to create {}", path.display()))?;
+    Ok(path)
+}
+
+/// Renames `path` within its folder. Changing only the case of a name works
+/// on case-insensitive file systems too.
+pub fn rename_entry(path: &Path, new_name: &str) -> anyhow::Result<PathBuf> {
+    let new_name = check_name(new_name, false)?;
+    let parent = path.parent().context("can't rename the root folder")?;
+    let target = parent.join(new_name);
+    if target == path {
+        return Ok(target);
+    }
+    // On case-insensitive file systems `target` "exists" when only the case
+    // changes; that is still the same entry, so allow it.
+    let same_entry = || {
+        let a = std::fs::canonicalize(path).ok();
+        a.is_some() && a == std::fs::canonicalize(&target).ok()
+    };
+    if target.symlink_metadata().is_ok() && !same_entry() {
+        bail!("{} already exists", target.display());
+    }
+    std::fs::rename(path, &target)
+        .with_context(|| format!("failed to rename {}", path.display()))?;
+    Ok(target)
+}
+
+/// Where a path ends up after `from` is renamed to `to`: unchanged unless it
+/// is `from` itself or inside it.
+pub fn renamed_path(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
+    let rest = path.strip_prefix(from).ok()?;
+    Some(if rest.as_os_str().is_empty() {
+        to.to_path_buf()
+    } else {
+        to.join(rest)
+    })
 }
 
 fn read_dir_sorted(dir: &Path) -> Vec<FileNode> {
@@ -152,6 +267,71 @@ mod tests {
         assert!(kinds.uses(catalog::find("rust-analyzer").unwrap()));
         assert!(kinds.uses(catalog::find("dockerfile-language-server").unwrap()));
         assert!(!kinds.uses(catalog::find("gopls").unwrap()));
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("forge-ws-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn create_rename_and_validate_entries() {
+        let dir = temp_dir("entries");
+        let file = create_entry(&dir, " src/deep/a.rs ", false).unwrap();
+        assert_eq!(file, dir.join("src/deep/a.rs"));
+        assert!(file.is_file());
+        assert!(create_entry(&dir, "src/deep/a.rs", false).is_err());
+        assert!(create_entry(&dir, "../escape", false).is_err());
+        assert!(create_entry(&dir, "", true).is_err());
+        assert!(create_entry(&dir, "docs", true).unwrap().is_dir());
+
+        assert!(rename_entry(&file, "b/c.rs").is_err());
+        assert!(rename_entry(&file, "..").is_err());
+        let renamed = rename_entry(&file, "b.rs").unwrap();
+        assert!(renamed.is_file() && !file.exists());
+        // Only the case changes: fine even where the file system ignores case.
+        let upper = rename_entry(&renamed, "B.rs").unwrap();
+        assert!(upper.is_file());
+        create_entry(&dir, "src/deep/other.rs", false).unwrap();
+        assert!(rename_entry(&upper, "other.rs").is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn renamed_paths_follow_their_folder() {
+        let from = Path::new("/w/src");
+        let to = Path::new("/w/lib");
+        assert_eq!(renamed_path(from, from, to).unwrap(), to);
+        assert_eq!(
+            renamed_path(Path::new("/w/src/a/b.rs"), from, to).unwrap(),
+            Path::new("/w/lib/a/b.rs")
+        );
+        assert_eq!(renamed_path(Path::new("/w/srcx/a.rs"), from, to), None);
+    }
+
+    #[test]
+    fn reload_keeps_loaded_subfolders() {
+        let dir = temp_dir("reload");
+        std::fs::create_dir_all(dir.join("a/inner")).unwrap();
+        let mut root = FileNode::new(dir.clone());
+        root.children();
+        root.find_mut(&dir.join("a")).unwrap().children();
+        assert!(root.find_mut(&dir.join("a/inner")).is_some());
+
+        std::fs::write(dir.join("new.txt"), "").unwrap();
+        std::fs::write(dir.join("a/later.txt"), "").unwrap();
+        root.reload();
+        let names: Vec<_> = root.children().iter().map(|n| n.name.clone()).collect();
+        assert_eq!(names, ["a", "new.txt"]);
+        // `a` kept its listing, so it doesn't show `later.txt` until reloaded.
+        let a = root.find_mut(&dir.join("a")).unwrap();
+        assert_eq!(a.children().len(), 1);
+        root.reload_all();
+        let a = root.find_mut(&dir.join("a")).unwrap();
+        assert_eq!(a.children().len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -360,6 +360,16 @@ impl SourceControl {
         self.refresh_extras();
     }
 
+    /// Reacts to the file watcher: work tree changes re-read status; git
+    /// metadata changes (commits, checkouts, fetches) re-read everything.
+    pub fn files_changed(&mut self, metadata: bool) {
+        if metadata {
+            self.refresh();
+        } else {
+            self.refresh_status();
+        }
+    }
+
     fn refresh_status(&mut self) {
         let Some(git) = self.git.clone() else { return };
         if self.status_task.is_some() {

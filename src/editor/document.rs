@@ -86,7 +86,12 @@ impl Document {
 
     /// Unsaved edits, or a buffer whose file was deleted from under it.
     pub fn is_dirty(&self) -> bool {
-        self.text != self.saved_text || self.disk == DiskState::Deleted
+        self.has_unsaved_edits() || self.disk == DiskState::Deleted
+    }
+
+    /// Whether the buffer differs from what was last loaded or saved.
+    pub fn has_unsaved_edits(&self) -> bool {
+        self.text != self.saved_text
     }
 
     /// Checks whether another program changed or deleted the file.
