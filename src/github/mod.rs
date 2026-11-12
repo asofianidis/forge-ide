@@ -539,6 +539,11 @@ impl GitHub {
         }))
     }
 
+    /// `gh` for the repository, for work run outside this type.
+    pub fn cli(&self) -> Option<Cli> {
+        self.cli.clone()
+    }
+
     /// The open PR whose head is `branch`, if any.
     pub fn pr_for_branch(&self, branch: &str) -> Option<&PrSummary> {
         self.prs

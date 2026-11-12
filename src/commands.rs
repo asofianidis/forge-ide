@@ -44,6 +44,8 @@ pub enum Command {
     ShowExplorer,
     ShowSourceControl,
     ShowPullRequests,
+    ShowAi,
+    NewAiThread,
     ShowProblems,
     ToggleBlame,
     NextChange,
@@ -125,6 +127,8 @@ impl Command {
         Command::ShowExplorer,
         Command::ShowSourceControl,
         Command::ShowPullRequests,
+        Command::ShowAi,
+        Command::NewAiThread,
         Command::ShowProblems,
         Command::ToggleBlame,
         Command::NextChange,
@@ -187,6 +191,8 @@ impl Command {
             Command::ShowExplorer => "Explorer",
             Command::ShowSourceControl => "Source Control",
             Command::ShowPullRequests => "Pull Requests",
+            Command::ShowAi => "BYO AI",
+            Command::NewAiThread => "New AI Thread",
             Command::ShowProblems => "Problems…",
             Command::ToggleBlame => "Toggle Blame",
             Command::NextChange => "Next Change",
@@ -221,10 +227,10 @@ impl Command {
             | FormatDocument => "Edit",
             QuickOpen | GoToLine | NextTab | PreviousTab | GoToDefinition | FindReferences
             | NextProblem | PreviousProblem | NextChange | PreviousChange => "Go",
-            ShowCommandPalette | ShowExplorer | ShowSourceControl | ShowPullRequests
-            | ShowProblems | ToggleBlame | FileHistory | RepositoryHistory | ToggleWordWrap
-            | ToggleLineNumbers | IncreaseFontSize | DecreaseFontSize | ResetFontSize
-            | SelectTheme | ReloadThemes | OpenThemesFolder => "View",
+            ShowCommandPalette | ShowExplorer | ShowSourceControl | ShowPullRequests | ShowAi
+            | NewAiThread | ShowProblems | ToggleBlame | FileHistory | RepositoryHistory
+            | ToggleWordWrap | ToggleLineNumbers | IncreaseFontSize | DecreaseFontSize
+            | ResetFontSize | SelectTheme | ReloadThemes | OpenThemesFolder => "View",
             LanguageServers | RestartLanguageServers | ToggleFormatOnSave => "Tools",
             ToggleTerminal | RestartTerminal => "Terminal",
             CheckForUpdates => "Help",
@@ -290,6 +296,7 @@ impl Command {
             Command::ShowSourceControl => &const { one(shortcut(CMD_SHIFT, Key::G)) },
             // Cmd+Shift+P is the command palette, as in other editors.
             Command::ShowPullRequests => &const { one(shortcut(CMD_SHIFT, Key::R)) },
+            Command::ShowAi => &const { one(shortcut(CMD_SHIFT, Key::A)) },
             Command::ToggleBlame => &const { one(shortcut(CMD_ALT, Key::B)) },
             Command::NextChange => &const { one(shortcut(ALT, Key::F5)) },
             // Ctrl+Space on every platform, as in other editors.

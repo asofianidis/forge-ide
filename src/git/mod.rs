@@ -255,6 +255,9 @@ pub struct SourceControl {
     running: Option<(String, Pending<Result<String, String>>)>,
     events: Vec<Event>,
     was_focused: bool,
+    /// Writes commit messages and PR text with an AI model; the built-in
+    /// rules are used when unset.
+    pub text_gen: Option<crate::ai::TextGenerator>,
 }
 
 impl SourceControl {
@@ -288,6 +291,7 @@ impl SourceControl {
             running: None,
             events: Vec::new(),
             was_focused: true,
+            text_gen: None,
         };
         sc.open(workspace);
         sc
@@ -1127,7 +1131,21 @@ impl SourceControl {
     /// A commit message for what the commit button would commit right now:
     /// the staged changes, or every change when nothing is staged.
     pub fn suggest_commit_message(&self) -> Option<Pending<Result<String, String>>> {
+        let job = self.commit_message_job()?;
+        Some(Pending::spawn(&self.ctx, job))
+    }
+
+    /// `git` for the repository, for work run outside the operation queue.
+    pub fn git_cli(&self) -> Option<Cli> {
+        self.git.clone()
+    }
+
+    /// The work behind [`Self::suggest_commit_message`], to run on any thread.
+    pub fn commit_message_job(
+        &self,
+    ) -> Option<impl FnOnce() -> Result<String, String> + Send + 'static> {
         let git = self.git.clone()?;
+        let ai = self.text_gen.clone();
         let staged_only = self.status.staged().next().is_some();
         let unborn = self.status.branch.is_unborn();
         let untracked: Vec<String> = if staged_only {
@@ -1141,7 +1159,7 @@ impl SourceControl {
                 .collect()
         };
         let subjects: Vec<String> = self.log.iter().map(|c| c.subject.clone()).collect();
-        Some(Pending::spawn(&self.ctx, move || {
+        Some(move || {
             const COMMON: [&str; 5] = [
                 "--no-color",
                 "--no-ext-diff",
@@ -1156,18 +1174,23 @@ impl SourceControl {
                 args.push("HEAD");
             }
             args.extend(COMMON);
-            let mut files = diff::parse(&git.run(&args)?);
+            let mut raw = git.run(&args)?;
+            let mut files = diff::parse(&raw);
             // Untracked files aren't in any diff; read a few for their content.
             for (i, path) in untracked.iter().enumerate() {
                 let parsed = if i < 40 {
                     let mut a = vec!["diff", "--no-index"];
                     a.extend(COMMON);
                     a.extend(["--", "/dev/null", path.as_str()]);
-                    git.output(&a, None)
+                    let out = git
+                        .output(&a, None)
                         .ok()
-                        .map(|o| diff::parse(&o.stdout))
-                        .unwrap_or_default()
+                        .map(|o| o.stdout)
+                        .unwrap_or_default();
+                    raw.push_str(&out);
+                    diff::parse(&out)
                 } else {
+                    raw.push_str(&format!("new file: {path}\n"));
                     Vec::new()
                 };
                 if parsed.is_empty() {
@@ -1187,18 +1210,31 @@ impl SourceControl {
                 return Err("there are no changes to describe".to_owned());
             }
             let subjects: Vec<&str> = subjects.iter().map(String::as_str).collect();
+            if let Some(ai) = ai {
+                return ai.commit_message(git.cwd(), &raw, &subjects);
+            }
             Ok(suggest::commit_message(&files, &subjects))
-        }))
+        })
     }
 
     /// Title and description for a pull request from HEAD into `base`
     /// (a branch name; the remote's copy is preferred when it exists).
     pub fn suggest_pr_text(&self, base: &str) -> Option<Pending<Result<suggest::PrText, String>>> {
+        let job = self.pr_text_job(base)?;
+        Some(Pending::spawn(&self.ctx, job))
+    }
+
+    /// The work behind [`Self::suggest_pr_text`], to run on any thread.
+    pub fn pr_text_job(
+        &self,
+        base: &str,
+    ) -> Option<impl FnOnce() -> Result<suggest::PrText, String> + Send + 'static> {
         let git = self.git.clone()?;
+        let ai = self.text_gen.clone();
         let base = base.trim().to_owned();
         let remote = self.default_remote();
         let branch = self.status.branch.head.clone().unwrap_or_default();
-        Some(Pending::spawn(&self.ctx, move || {
+        Some(move || {
             let verify = |r: &str| {
                 git.output(
                     &[
@@ -1259,13 +1295,27 @@ impl SourceControl {
             ]
             .iter()
             .find_map(|p| std::fs::read_to_string(root.join(p)).ok());
+            if let Some(ai) = ai {
+                let log: String = commits
+                    .iter()
+                    .map(|c| {
+                        if c.body.is_empty() {
+                            format!("- {}\n", c.subject)
+                        } else {
+                            format!("- {}\n  {}\n", c.subject, c.body.replace('\n', "\n  "))
+                        }
+                    })
+                    .collect();
+                let (title, body) = ai.pr_text(root, &branch, &log, &diff, template.as_deref())?;
+                return Ok(suggest::PrText { title, body });
+            }
             Ok(suggest::pr_text(
                 &branch,
                 &commits,
                 &files,
                 template.as_deref(),
             ))
-        }))
+        })
     }
 
     /// Commit history matching `query`, for the history view.

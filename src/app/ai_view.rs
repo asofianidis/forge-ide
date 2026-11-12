@@ -1,0 +1,171 @@
+//! Connects the BYO AI view to the rest of the app: the sidebar, thread
+//! tabs, and the one-click commit / push / pull request flow.
+
+use super::ForgeApp;
+use crate::ai::{FlowKind, FlowPlan, GitSummary, SidebarAction, ThreadAction};
+use crate::git::RepoState;
+use crate::panes::{AiPane, Pane};
+
+impl ForgeApp {
+    /// Per-frame upkeep: agent output, the git flow, and keeping Source
+    /// Control's "Generate" buttons on the selected text model.
+    pub(super) fn poll_ai(&mut self) {
+        if self.ai.poll() {
+            // An agent finished a turn; it may have changed files.
+            self.source_control.refresh();
+        }
+        self.source_control.text_gen = self.ai.text_generator(&self.settings.ai);
+        for msg in self.ai.take_status() {
+            self.status = msg;
+        }
+        if let Some(result) = self.ai.poll_flow() {
+            self.status = match result {
+                Ok(done) => done.summary,
+                Err(e) => format!("Error: {e}"),
+            };
+            self.source_control.refresh();
+            if self.github.is_ready() {
+                self.github.refresh();
+            }
+        }
+        // Thread titles change as conversations start.
+        for pane in &mut self.panes {
+            if let Pane::Ai(p) = pane
+                && let Some(t) = self.ai.thread(&p.id)
+                && t.title != p.title
+            {
+                p.title = t.title.clone();
+            }
+        }
+    }
+
+    fn git_summary(&self) -> GitSummary {
+        let sc = &self.source_control;
+        let b = &sc.status.branch;
+        let pr = b
+            .head
+            .as_deref()
+            .and_then(|h| self.github.pr_for_branch(h))
+            .map(|p| (p.number, p.title.clone()));
+        GitSummary {
+            is_repo: sc.state == RepoState::Ready,
+            branch: b.head.clone(),
+            changes: sc.status.entries.len(),
+            staged: sc.status.staged().count(),
+            conflicts: sc.status.conflicts().count(),
+            ahead: b.ahead as usize,
+            has_upstream: b.upstream.is_some(),
+            has_remote: !sc.remotes.is_empty(),
+            gh_ready: self.github.is_ready(),
+            default_branch: self.github.repo.default_branch_ref.name.clone(),
+            pr,
+            busy: sc.busy().is_some(),
+        }
+    }
+
+    pub(super) fn ai_sidebar(&mut self, ui: &mut egui::Ui) {
+        let colors = self.current_theme().ui.clone();
+        let git = self.git_summary();
+        let mut ai_settings = self.settings.ai.clone();
+        ui.add_space(4.0);
+        let actions = self.ai.sidebar(ui, &mut ai_settings, &git, &colors);
+        for action in actions {
+            match action {
+                SidebarAction::OpenThread(id) => self.open_ai_thread(id),
+                SidebarAction::ThreadDeleted(id) => {
+                    if let Some(i) = self
+                        .panes
+                        .iter()
+                        .position(|p| matches!(p, Pane::Ai(a) if a.id == id))
+                    {
+                        self.close_pane(i);
+                    }
+                }
+                SidebarAction::StartFlow(kind) => self.start_ai_flow(kind),
+                SidebarAction::OpenPr(n) => self.open_pull_request(n),
+                SidebarAction::OpenSettings => self.settings_open = true,
+            }
+        }
+        if ai_settings != self.settings.ai {
+            self.update_settings(|s| s.ai = ai_settings);
+        }
+    }
+
+    pub(super) fn open_ai_thread(&mut self, id: String) {
+        let title = self
+            .ai
+            .thread(&id)
+            .map(|t| t.title.clone())
+            .unwrap_or_default();
+        self.open_pane(Pane::Ai(AiPane { id, title }));
+    }
+
+    pub(super) fn new_ai_thread(&mut self) {
+        match self.ai.new_thread(&self.settings.ai) {
+            Some(id) => self.open_ai_thread(id),
+            None => self.status = "Open a folder to start an AI thread".to_owned(),
+        }
+    }
+
+    /// Draws the thread tab at `idx`.
+    pub(super) fn ai_thread_pane(&mut self, ui: &mut egui::Ui, id: &str) {
+        let colors = self.current_theme().ui.clone();
+        let mut ai_settings = self.settings.ai.clone();
+        let action = self.ai.thread_view(ui, id, &mut ai_settings, &colors);
+        if matches!(action, Some(ThreadAction::SettingsChanged)) || ai_settings != self.settings.ai
+        {
+            self.update_settings(|s| s.ai = ai_settings);
+        }
+    }
+
+    fn start_ai_flow(&mut self, kind: FlowKind) {
+        if self.ai.flow.is_some() {
+            return;
+        }
+        let sc = &self.source_control;
+        let Some(git) = sc.git_cli() else {
+            self.status = "This folder isn't a git repository".to_owned();
+            return;
+        };
+        let b = &sc.status.branch;
+        let branch = b.head.clone().unwrap_or_default();
+        let base = self.github.repo.default_branch_ref.name.clone();
+        let publish_to = if b.upstream.is_none() {
+            match sc.default_remote() {
+                Some(r) => Some(r),
+                None if kind.pushes() => {
+                    self.status = "This repository has no remote to push to".to_owned();
+                    return;
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let commit_message = if kind.commits() {
+            sc.commit_message_job()
+                .map(|j| Box::new(j) as crate::ai::CommitJob)
+        } else {
+            None
+        };
+        let pr_text = if kind.opens_pr() {
+            sc.pr_text_job(&base)
+                .map(|j| Box::new(j) as crate::ai::PrJob)
+        } else {
+            None
+        };
+        let plan = FlowPlan {
+            kind,
+            git,
+            gh: self.github.cli(),
+            commit_message,
+            stage_all: sc.status.staged().next().is_none(),
+            publish_to,
+            branch,
+            base,
+            pr_text,
+        };
+        self.status = format!("{}…", kind.label());
+        self.ai.start_flow(plan);
+    }
+}

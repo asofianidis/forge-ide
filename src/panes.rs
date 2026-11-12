@@ -34,6 +34,15 @@ pub enum Pane {
     History(Box<HistoryPane>),
     Rebase(Box<RebasePane>),
     Log(LogPane),
+    /// A BYO AI thread; drawn by the app, which owns the threads.
+    Ai(AiPane),
+}
+
+/// The tab of an AI thread.
+pub struct AiPane {
+    pub id: String,
+    /// Kept in sync with the thread's title by the app.
+    pub title: String,
 }
 
 impl Pane {
@@ -52,6 +61,7 @@ impl Pane {
             Pane::History(p) => p.title(),
             Pane::Rebase(p) => p.title(),
             Pane::Log(p) => p.title.clone(),
+            Pane::Ai(p) => p.title.clone(),
         }
     }
 
@@ -62,6 +72,7 @@ impl Pane {
             Pane::PullRequest(_) => Icon::PullRequest,
             Pane::History(_) | Pane::Rebase(_) => Icon::History,
             Pane::Log(_) => Icon::OpenFile,
+            Pane::Ai(_) => Icon::Sparkle,
         }
     }
 
@@ -85,6 +96,7 @@ impl Pane {
                 p.show(ui, colors);
                 None
             }
+            Pane::Ai(_) => None,
         }
     }
 }

@@ -1,5 +1,6 @@
 //! Top-level application state and UI layout.
 
+mod ai_view;
 mod editing;
 mod explorer;
 mod find_bar;
@@ -18,6 +19,7 @@ use std::time::{Duration, Instant};
 use egui::text::CCursor;
 use egui::{Galley, Key, Modifiers, Rect, RichText, Shape, Stroke, TextStyle, pos2};
 
+use crate::ai::Ai;
 use crate::commands::Command;
 use crate::editor::conflicts::{self, Resolution};
 use crate::editor::find::Match;
@@ -148,6 +150,8 @@ pub struct ForgeApp {
     explorer_dialog: Option<ExplorerDialog>,
     /// Integrated terminal panel below the editor.
     terminal: TerminalPanel,
+    /// BYO AI: agent threads and AI-written git text.
+    ai: Ai,
 }
 
 impl ForgeApp {
@@ -233,6 +237,7 @@ impl ForgeApp {
             watcher: None,
             explorer_dialog: None,
             terminal: TerminalPanel::default(),
+            ai: Ai::new(cc.egui_ctx.clone(), folder.as_deref()),
         };
         if let Some(folder) = folder {
             app.folder_opened(&folder);
@@ -442,6 +447,7 @@ impl ForgeApp {
         self.status = format!("Opened folder {}", path.display());
         self.source_control.open(Some(&path));
         self.github.open(Some(&path));
+        self.ai.set_folder(Some(&path));
         self.panes.clear();
         self.active_pane = None;
         self.editor_git.clear();
@@ -479,6 +485,7 @@ impl ForgeApp {
             (Pane::History(a), Pane::History(b)) => a.path == b.path,
             (Pane::Log(a), Pane::Log(b)) => a.key == b.key,
             (Pane::Rebase(_), Pane::Rebase(_)) => true,
+            (Pane::Ai(a), Pane::Ai(b)) => a.id == b.id,
             _ => false,
         });
         match existing {
@@ -988,6 +995,12 @@ impl ForgeApp {
             Command::ShowExplorer => self.show_sidebar(SidebarView::Explorer),
             Command::ShowSourceControl => self.show_sidebar(SidebarView::SourceControl),
             Command::ShowPullRequests => self.show_sidebar(SidebarView::PullRequests),
+            Command::ShowAi => self.show_sidebar(SidebarView::Ai),
+            Command::NewAiThread => {
+                self.sidebar_view = SidebarView::Ai;
+                self.sidebar_open = true;
+                self.new_ai_thread();
+            }
             Command::ToggleBlame => self.editor_git.blame_on = !self.editor_git.blame_on,
             Command::NextChange => self.change_nav = Some(1),
             Command::PreviousChange => self.change_nav = Some(-1),
@@ -1157,6 +1170,7 @@ impl ForgeApp {
                 }
                 self.menu_item(ui, ShowSourceControl);
                 self.menu_item(ui, ShowPullRequests);
+                self.menu_item(ui, ShowAi);
                 self.menu_item(ui, ShowProblems);
                 ui.separator();
                 let mut blame = self.editor_git.blame_on;
@@ -1288,6 +1302,7 @@ impl ForgeApp {
                     None => {}
                 }
             }
+            SidebarView::Ai => self.ai_sidebar(ui),
         }
     }
 
@@ -2220,6 +2235,7 @@ impl eframe::App for ForgeApp {
         self.poll_watcher(&ctx);
         self.poll_disk(&ctx);
         self.source_control.poll();
+        self.poll_ai();
         self.github
             .watch_commit(self.source_control.status.branch.oid.clone());
         self.github
@@ -2242,6 +2258,7 @@ impl eframe::App for ForgeApp {
             .show(ui, |ui| {
                 let changes = self.source_control.status.change_count();
                 let review_requests = self.github.badge_count();
+                let agents = self.ai.running_count();
                 activity::show(
                     ui,
                     &mut self.sidebar_view,
@@ -2249,6 +2266,7 @@ impl eframe::App for ForgeApp {
                     |v| match v {
                         SidebarView::SourceControl => changes,
                         SidebarView::PullRequests => review_requests,
+                        SidebarView::Ai => agents,
                         SidebarView::Explorer | SidebarView::Search => 0,
                     },
                     &colors,
@@ -2277,7 +2295,14 @@ impl eframe::App for ForgeApp {
             .show(ui, |ui| {
                 self.tab_bar(ui);
                 ui.separator();
+                let ai_thread = match self.active_pane.and_then(|i| self.panes.get(i)) {
+                    Some(Pane::Ai(p)) => Some(p.id.clone()),
+                    _ => None,
+                };
                 match self.active_pane {
+                    Some(_) if ai_thread.is_some() => {
+                        self.ai_thread_pane(ui, ai_thread.as_deref().unwrap_or_default());
+                    }
                     Some(i) if i < self.panes.len() => {
                         let action = self.panes[i].show(ui, &mut self.source_control, &colors);
                         match action {
@@ -2317,6 +2342,7 @@ impl eframe::App for ForgeApp {
     }
 
     fn on_exit(&mut self) {
+        self.ai.shutdown();
         self.persist_session(true);
     }
 }

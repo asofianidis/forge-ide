@@ -27,6 +27,8 @@ pub enum Icon {
     Merge,
     History,
     Search,
+    Sparkle,
+    Stop,
 }
 
 /// Paints `icon` inside `rect` using `color`.
@@ -224,6 +226,36 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             ]);
             line(p(0.46, 0.54), p(0.82, 0.18));
             poly(vec![p(0.58, 0.18), p(0.82, 0.18), p(0.82, 0.42)]);
+        }
+        Icon::Sparkle => {
+            // A four-pointed star with curved sides, plus a small one.
+            let star = |cx: f32, cy: f32, r: f32| {
+                let c = p(cx, cy);
+                let pts = [p(cx, cy - r), p(cx + r, cy), p(cx, cy + r), p(cx - r, cy)];
+                let mut path = Vec::new();
+                for i in 0..4 {
+                    let a = pts[i];
+                    let b = pts[(i + 1) % 4];
+                    // Pull each side towards the center.
+                    let ctrl = c + ((a - c) + (b - c)) * 0.12;
+                    let n = 8;
+                    for k in 0..n {
+                        let t = k as f32 / n as f32;
+                        let u = 1.0 - t;
+                        path.push(pos2(
+                            u * u * a.x + 2.0 * u * t * ctrl.x + t * t * b.x,
+                            u * u * a.y + 2.0 * u * t * ctrl.y + t * t * b.y,
+                        ));
+                    }
+                }
+                painter.add(PathShape::closed_line(path, PathStroke::new(w, color)));
+            };
+            star(0.42, 0.56, 0.32);
+            star(0.78, 0.22, 0.12);
+        }
+        Icon::Stop => {
+            let r = Rect::from_min_max(p(0.28, 0.28), p(0.72, 0.72));
+            painter.rect_filled(r, 2.0, color);
         }
     }
 }
