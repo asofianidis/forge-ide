@@ -1,13 +1,21 @@
-//! Language server discovery: a catalog of known servers, detection of which
-//! are installed, and one-click installation through the usual toolchains.
+//! Language servers: a catalog of known servers, detection of which are
+//! installed, one-click installation through the usual toolchains, and an LSP
+//! client that runs them for the open files.
 //!
-//! This does not speak LSP yet; it gets servers onto the user's machine so a
-//! future client can launch them (see `ServerSpec::launch_args`).
+//! - [`ServerManager`] finds and installs servers.
+//! - [`Lsp`] (in `session`) starts installed servers, keeps them in sync with
+//!   the buffers and turns their replies into [`LspEvent`]s.
+//! - `client` runs one server process; `rpc` frames JSON-RPC over stdio;
+//!   `text` converts positions, URIs, snippets and edits.
 
 mod browser;
 pub mod catalog;
+mod client;
 pub mod detect;
 mod install;
+mod rpc;
+mod session;
+pub mod text;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -16,6 +24,10 @@ use std::sync::mpsc::{Receiver, channel};
 pub use browser::ServerBrowser;
 use catalog::{InstallMethod, ServerSpec};
 use install::{InstallJob, JobState};
+pub use session::{
+    Feature, Location, LocationKind, Lsp, LspEvent, Problem, ServerActivity, Severity,
+    workspace_edit_files,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerStatus {
@@ -157,6 +169,14 @@ impl ServerManager {
         if self.job_state(id) != Some(JobState::Running) {
             self.jobs.remove(id);
         }
+    }
+
+    /// The first installed server for `file_name` and its executable.
+    pub fn installed_server_for(&self, file_name: &str) -> Option<(&'static ServerSpec, PathBuf)> {
+        catalog::servers_for_file(file_name).find_map(|s| match self.status.get(s.id) {
+            Some(ServerStatus::Installed(path)) => Some((s, path.clone())),
+            _ => None,
+        })
     }
 
     /// Servers for `file_name` when none of them is installed yet — i.e. the
