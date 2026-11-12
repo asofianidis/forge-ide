@@ -25,6 +25,10 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
   (`forge-ide .` opens the current directory)
 - **File → Open Recent** (or Ctrl+R) lists the last 10 folders you opened
 - Syntax highlighting for many languages (via [syntect](https://github.com/trishume/syntect))
+- Markdown preview (Cmd/Ctrl+Shift+V, the eye button at the end of the tab bar, or
+  **View → Markdown Preview**): renders the open `.md` file beside the editor and follows your
+  edits as you type. Web links open in the browser; relative links (`docs/guide.md`,
+  `/src/main.rs`) open the file in the editor
 - Line-number gutter with current-line highlight
 - Cursor line/column in the status bar
 - Find and replace in the current file, with match case, whole word and regex options
@@ -291,6 +295,7 @@ src/
 │   ├── explorer.rs      # file tree, its new / rename / delete / reveal actions, watcher events
 │   ├── language.rs      # diagnostics, hover, completion, definition, rename, formatting UI
 │   ├── find_bar.rs      # find / replace bar
+│   ├── markdown_preview.rs # Markdown preview beside the editor, link resolution
 │   ├── search_panel.rs  # "Search" sidebar
 │   ├── preferences.rs   # Settings window, font size / word wrap / line numbers
 │   ├── pickers.rs       # quick open, command palette, theme picker
@@ -326,7 +331,7 @@ src/
 │   ├── activity.rs      # activity bar
 │   ├── diff_view.rs     # diff rendering (unified / split, line selection)
 │   ├── diff_style.rs    # diff syntax highlighting and word-level changes
-│   ├── markdown.rs      # Markdown for PR bodies and comments
+│   ├── markdown.rs      # Markdown for PR bodies, comments and the preview
 │   ├── icons.rs         # vector icons
 │   └── fmt.rs           # relative times
 ├── lsp/
