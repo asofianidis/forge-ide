@@ -242,7 +242,6 @@ impl ForgeApp {
         if let Some(folder) = folder {
             app.folder_opened(&folder);
         }
-        app.settings_open |= std::env::var_os("FORGE_DEBUG_PICKER").is_some(); // DEBUG-TEMP
         app
     }
 

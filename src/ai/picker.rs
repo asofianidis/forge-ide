@@ -1,6 +1,5 @@
-//! The model picker: favorites and providers on the left, a searchable model
-//! list in the middle, the reasoning level on the right and (for agents) the
-//! access mode along the bottom.
+//! The model picker: one popover with a filter box, provider chips, models
+//! grouped by provider, an effort meter and (for agents) an access switch.
 
 use egui::epaint::{PathShape, PathStroke};
 use egui::{Color32, Key, Modifiers, Painter, Pos2, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
@@ -10,11 +9,16 @@ use super::thread::ModelChoice;
 use crate::theme::UiColors;
 
 const CLAUDE_ORANGE: Color32 = Color32::from_rgb(0xD9, 0x77, 0x57);
-const ROW_HEIGHT: f32 = 30.0;
+/// The popover's fixed size: a popup has none of its own, so anything that
+/// fills "available" space would grow it every frame.
+const WIDTH: f32 = 380.0;
+const LIST_HEIGHT: f32 = 270.0;
+const ROW_HEIGHT: f32 = 28.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
-    Favorites,
+    All,
+    Starred,
     Provider(Provider),
 }
 
@@ -23,7 +27,10 @@ enum Tab {
 pub struct PickerState {
     search: String,
     tab: Tab,
-    show_more: bool,
+    /// Providers whose extra models are listed.
+    expanded: Vec<Provider>,
+    /// Keyboard highlight in the visible rows.
+    cursor: Option<usize>,
     focus_search: bool,
 }
 
@@ -31,8 +38,9 @@ impl Default for PickerState {
     fn default() -> Self {
         Self {
             search: String::new(),
-            tab: Tab::Provider(Provider::Claude),
-            show_more: false,
+            tab: Tab::All,
+            expanded: Vec::new(),
+            cursor: None,
             focus_search: false,
         }
     }
@@ -73,191 +81,6 @@ struct Row {
     custom: bool,
 }
 
-/// The pill that shows the current model and opens the picker. Returns
-/// whether anything (model, effort, access, favorites) changed.
-pub fn button(
-    ui: &mut Ui,
-    id_salt: &str,
-    choice: &mut ModelChoice,
-    access: Option<&mut Access>,
-    state: &mut PickerState,
-    catalog: Catalog<'_>,
-    colors: &UiColors,
-) -> bool {
-    let label = choice.label();
-    let font = egui::TextStyle::Button.resolve(ui.style());
-    let galley = ui.painter().layout_no_wrap(label, font, colors.text.0);
-    let size = vec2(galley.size().x + 40.0, 26.0);
-    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-    let fill = if response.hovered() {
-        colors.widget_hover.0
-    } else {
-        colors.widget.0
-    };
-    ui.painter().rect_filled(rect, 13.0, fill);
-    let icon = Rect::from_center_size(pos2(rect.left() + 17.0, rect.center().y), vec2(16.0, 16.0));
-    provider_icon(ui.painter(), icon, choice.provider, colors);
-    ui.painter().galley(
-        pos2(rect.left() + 30.0, rect.center().y - galley.size().y / 2.0),
-        galley,
-        colors.text.0,
-    );
-    let response = response.on_hover_text(format!(
-        "{} via the {} CLI",
-        choice.provider.model_name(&choice.model),
-        choice.provider.name()
-    ));
-    if response.clicked() {
-        state.tab = Tab::Provider(choice.provider);
-        state.search.clear();
-        state.show_more = false;
-        state.focus_search = true;
-    }
-
-    let mut changed = false;
-    let debug_open = std::env::var("FORGE_DEBUG_PICKER").is_ok_and(|v| v == id_salt);
-    let mut popup = egui::Popup::menu(&response)
-        .id(egui::Id::unique(("model_picker", id_salt)))
-        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-        .align(egui::RectAlign::TOP_START)
-        .gap(6.0);
-    if debug_open {
-        popup = popup.open(true);
-    }
-    popup
-        .show(|ui| {
-            changed = contents(ui, choice, access, state, catalog, colors);
-        });
-    changed
-}
-
-// Fixed layout: a popup has no size of its own, so anything that fills
-// "available" space would grow it every frame.
-const RAIL_W: f32 = 40.0;
-const LIST_W: f32 = 330.0;
-const REASON_W: f32 = 180.0;
-const GAP: f32 = 14.0;
-const BODY_H: f32 = 360.0;
-
-fn contents(
-    ui: &mut Ui,
-    choice: &mut ModelChoice,
-    access: Option<&mut Access>,
-    state: &mut PickerState,
-    mut catalog: Catalog<'_>,
-    colors: &UiColors,
-) -> bool {
-    let mut changed = false;
-    let width = RAIL_W + LIST_W + REASON_W + 2.0 * GAP;
-    ui.set_width(width);
-    ui.spacing_mut().item_spacing = vec2(0.0, 2.0);
-    let (body, _) = ui.allocate_exact_size(vec2(width, BODY_H), Sense::hover());
-    let column = |x: f32, w: f32| Rect::from_min_size(pos2(x, body.top()), vec2(w, BODY_H));
-    let rail_rect = column(body.left(), RAIL_W);
-    let list_rect = column(rail_rect.right() + GAP, LIST_W);
-    let reason_rect = column(list_rect.right() + GAP, REASON_W);
-    let divider = Stroke::new(1.0, colors.border.0);
-    ui.painter()
-        .vline(rail_rect.right() + GAP / 2.0, body.y_range(), divider);
-    ui.painter()
-        .vline(list_rect.right() + GAP / 2.0, body.y_range(), divider);
-    let mut child = |rect: Rect| {
-        let mut c = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(rect)
-                .layout(egui::Layout::top_down(egui::Align::Min)),
-        );
-        c.set_clip_rect(rect.intersect(ui.clip_rect()));
-        c
-    };
-    rail(&mut child(rail_rect), state, &catalog, colors);
-    changed |= model_list(&mut child(list_rect), choice, state, &mut catalog, colors);
-    changed |= reasoning(&mut child(reason_rect), choice, colors);
-
-    if let Some(access) = access {
-        ui.add_space(6.0);
-        let y = ui.cursor().top();
-        ui.painter().hline(body.x_range(), y, divider);
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            ui.label(RichText::new("Access").small().color(colors.text_muted.0));
-            ui.add_space(6.0);
-            for a in Access::ALL {
-                if ui
-                    .selectable_label(*access == a, RichText::new(a.label()).small())
-                    .on_hover_text(a.describe())
-                    .clicked()
-                    && *access != a
-                {
-                    *access = a;
-                    changed = true;
-                }
-            }
-        });
-    }
-    changed
-}
-
-fn rail(ui: &mut Ui, state: &mut PickerState, catalog: &Catalog<'_>, colors: &UiColors) {
-    {
-        let tabs = std::iter::once(Tab::Favorites).chain(Provider::ALL.map(Tab::Provider));
-        for (i, tab) in tabs.enumerate() {
-            if i == 1 {
-                ui.add_space(4.0);
-                let y = ui.cursor().top();
-                ui.painter().hline(
-                    ui.max_rect().x_range().shrink(6.0),
-                    y,
-                    Stroke::new(1.0, colors.border.0),
-                );
-                ui.add_space(6.0);
-            }
-            let (rect, response) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::click());
-            let active = state.tab == tab && state.search.is_empty();
-            if active || response.hovered() {
-                ui.painter()
-                    .rect_filled(rect.shrink(2.0), 6.0, colors.widget.0);
-            }
-            if active {
-                ui.painter().vline(
-                    rect.right() + 1.0,
-                    rect.y_range().shrink(8.0),
-                    Stroke::new(2.5, colors.accent.0),
-                );
-            }
-            let icon_rect = Rect::from_center_size(rect.center(), vec2(20.0, 20.0));
-            let tip = match tab {
-                Tab::Favorites => {
-                    star(ui.painter(), icon_rect, colors.text.0, true);
-                    "Favorites".to_owned()
-                }
-                Tab::Provider(p) => {
-                    provider_icon(ui.painter(), icon_rect, p, colors);
-                    if !(catalog.installed)(p) {
-                        // Dim providers whose CLI isn't installed.
-                        ui.painter().rect_filled(
-                            rect.shrink(2.0),
-                            6.0,
-                            colors.panel.0.gamma_multiply(0.6),
-                        );
-                    }
-                    if (catalog.installed)(p) {
-                        p.name().to_owned()
-                    } else {
-                        format!("{} (CLI not installed)", p.name())
-                    }
-                }
-            };
-            if response.on_hover_text(tip).clicked() {
-                state.tab = tab;
-                state.search.clear();
-                state.show_more = false;
-            }
-        }
-    }
-}
-
 fn rows_for(provider: Provider, show_more: bool, custom: &[String]) -> Vec<Row> {
     let mut rows: Vec<Row> = provider
         .models()
@@ -286,80 +109,206 @@ fn rows_for(provider: Provider, show_more: bool, custom: &[String]) -> Vec<Row> 
     rows
 }
 
-fn model_list(
+/// A model's name without the provider prefix, for rows under its heading.
+fn short_name(name: &str) -> &str {
+    name.strip_prefix("Claude ").unwrap_or(name)
+}
+
+/// The button that shows the current model and opens the picker. Returns
+/// whether anything (model, effort, access, favorites) changed.
+pub fn button(
     ui: &mut Ui,
+    id_salt: &str,
     choice: &mut ModelChoice,
+    access: Option<&mut Access>,
     state: &mut PickerState,
-    catalog: &mut Catalog<'_>,
+    catalog: Catalog<'_>,
     colors: &UiColors,
 ) -> bool {
+    let name = choice.provider.model_name(&choice.model);
+    let name = short_name(&name).to_owned();
+    let effort = choice.provider.effort_label(&choice.effort);
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let name_g = ui
+        .painter()
+        .layout_no_wrap(name, font.clone(), colors.text.0);
+    let effort_g = effort.map(|e| {
+        ui.painter()
+            .layout_no_wrap(format!("· {e}"), font, colors.text_muted.0)
+    });
+    let effort_w = effort_g.as_ref().map_or(0.0, |g| g.size().x + 5.0);
+    let size = vec2(26.0 + name_g.size().x + effort_w + 22.0, 26.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let open = egui::Popup::is_id_open(ui.ctx(), egui::Id::unique(("model_picker", id_salt)));
+    let border = if open || response.hovered() {
+        colors.accent.0
+    } else {
+        colors.border.0
+    };
+    ui.painter()
+        .rect_filled(rect, 5.0, colors.panel.0.gamma_multiply(0.6));
+    ui.painter().rect_stroke(
+        rect,
+        5.0,
+        Stroke::new(1.0, border),
+        egui::StrokeKind::Inside,
+    );
+    let icon = Rect::from_center_size(pos2(rect.left() + 14.0, rect.center().y), vec2(14.0, 14.0));
+    provider_icon(ui.painter(), icon, choice.provider, colors);
+    let mut x = rect.left() + 26.0;
+    let y = rect.center().y - name_g.size().y / 2.0;
+    let name_w = name_g.size().x;
+    ui.painter().galley(pos2(x, y), name_g, colors.text.0);
+    x += name_w + 5.0;
+    if let Some(g) = effort_g {
+        ui.painter().galley(pos2(x, y), g, colors.text_muted.0);
+    }
+    chevron(
+        ui.painter(),
+        pos2(rect.right() - 11.0, rect.center().y),
+        colors.text_muted.0,
+        open,
+    );
+    let response = response.on_hover_text(format!(
+        "{} via the {} CLI",
+        choice.provider.model_name(&choice.model),
+        choice.provider.name()
+    ));
+    if response.clicked() {
+        state.tab = Tab::All;
+        state.search.clear();
+        state.cursor = None;
+        state.focus_search = true;
+    }
+
     let mut changed = false;
-    // Search box with an accent underline.
+    egui::Popup::menu(&response)
+        .id(egui::Id::unique(("model_picker", id_salt)))
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .align(egui::RectAlign::TOP_START)
+        .gap(6.0)
+        .show(|ui| {
+            changed = contents(ui, choice, access, state, catalog, colors);
+        });
+    changed
+}
+
+fn contents(
+    ui: &mut Ui,
+    choice: &mut ModelChoice,
+    access: Option<&mut Access>,
+    state: &mut PickerState,
+    catalog: Catalog<'_>,
+    colors: &UiColors,
+) -> bool {
+    ui.set_width(WIDTH);
+    ui.spacing_mut().item_spacing = vec2(6.0, 4.0);
+    let mut changed = false;
+
+    // Filter box.
+    egui::Frame::new()
+        .fill(colors.panel.0)
+        .stroke(Stroke::new(1.0, colors.border.0))
+        .corner_radius(5.0)
+        .inner_margin(egui::Margin::symmetric(8, 5))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+                crate::ui::icons::paint(
+                    ui.painter(),
+                    r,
+                    crate::ui::icons::Icon::Search,
+                    colors.text_muted.0,
+                );
+                let edit = ui.add(
+                    egui::TextEdit::singleline(&mut state.search)
+                        .hint_text("Filter models, or type a model id")
+                        .frame(egui::Frame::NONE)
+                        .desired_width(f32::INFINITY),
+                );
+                if state.focus_search {
+                    edit.request_focus();
+                    state.focus_search = false;
+                }
+                if edit.changed() {
+                    state.cursor = None;
+                }
+            });
+        });
+
+    // Provider chips.
     ui.horizontal(|ui| {
-        ui.add_space(4.0);
-        let icon = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover()).0;
-        crate::ui::icons::paint(
-            ui.painter(),
-            icon,
-            crate::ui::icons::Icon::Search,
-            colors.text_muted.0,
-        );
-        ui.add_space(6.0);
-        let edit = ui.add(
-            egui::TextEdit::singleline(&mut state.search)
-                .hint_text("Search models…")
-                .frame(egui::Frame::NONE)
-                .desired_width(f32::INFINITY),
-        );
-        if state.focus_search {
-            edit.request_focus();
-            state.focus_search = false;
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let tabs = [Tab::All, Tab::Starred]
+            .into_iter()
+            .chain(Provider::ALL.map(Tab::Provider));
+        for tab in tabs {
+            if chip(ui, tab, state.tab == tab, &catalog, colors).clicked() {
+                state.tab = tab;
+                state.cursor = None;
+            }
         }
     });
-    ui.add_space(4.0);
+    ui.add_space(2.0);
     let y = ui.cursor().top();
     ui.painter().hline(
         ui.max_rect().x_range(),
         y,
-        Stroke::new(1.5, colors.accent.0),
+        Stroke::new(1.0, colors.border.0),
     );
-    ui.add_space(8.0);
+    ui.add_space(4.0);
 
+    // Which rows to show, grouped by provider.
     let query = state.search.trim().to_lowercase();
-    let mut rows: Vec<Row> = if !query.is_empty() {
-        Provider::ALL
-            .into_iter()
-            .flat_map(|p| rows_for(p, true, catalog.custom))
-            .filter(|r| {
+    let providers: Vec<Provider> = match state.tab {
+        Tab::Provider(p) => vec![p],
+        _ => Provider::ALL.to_vec(),
+    };
+    let mut groups: Vec<(Provider, Vec<Row>, usize)> = Vec::new();
+    for p in providers {
+        let expanded = state.expanded.contains(&p) || !query.is_empty();
+        let all = rows_for(p, true, catalog.custom);
+        let mut rows: Vec<Row> = rows_for(p, expanded, catalog.custom);
+        if state.tab == Tab::Starred {
+            rows = all
+                .iter()
+                .filter(|r| catalog.favorites.contains(&key(r.provider, &r.id)))
+                .cloned()
+                .collect();
+        }
+        if !query.is_empty() {
+            rows.retain(|r| {
                 r.name.to_lowercase().contains(&query)
                     || r.id.to_lowercase().contains(&query)
-                    || r.provider.name().to_lowercase().contains(&query)
-            })
-            .collect()
-    } else {
-        match state.tab {
-            Tab::Favorites => catalog
-                .favorites
-                .iter()
-                .filter_map(|k| parse_key(k))
-                .map(|(p, m)| Row {
-                    provider: p,
-                    id: m.to_owned(),
-                    name: p.model_name(m),
-                    custom: !p.models().iter().any(|x| x.id == m),
-                })
-                .collect(),
-            Tab::Provider(p) => rows_for(p, state.show_more, catalog.custom),
+                    || p.name().to_lowercase().contains(&query)
+            });
         }
-    };
-    // Typing a model id the list doesn't know offers to use it as-is.
+        let hidden = if expanded || state.tab == Tab::Starred {
+            0
+        } else {
+            all.len() - rows.len()
+        };
+        if !rows.is_empty() || (hidden > 0 && query.is_empty()) {
+            groups.push((p, rows, hidden));
+        }
+    }
+    // A model id the list doesn't know can be used as typed.
+    let raw = state.search.trim().to_owned();
     let custom_target = match state.tab {
         Tab::Provider(p) => p,
-        Tab::Favorites => choice.provider,
+        _ => choice.provider,
     };
-    let raw = state.search.trim().to_owned();
-    if !raw.is_empty() && !raw.contains(char::is_whitespace) && !rows.iter().any(|r| r.id == raw) {
-        rows.push(Row {
+    let offer_custom = !raw.is_empty()
+        && !raw.contains(char::is_whitespace)
+        && !groups
+            .iter()
+            .any(|(_, rows, _)| rows.iter().any(|r| r.id == raw));
+    let mut flat: Vec<Row> = groups
+        .iter()
+        .flat_map(|(_, rows, _)| rows.clone())
+        .collect();
+    if offer_custom {
+        flat.push(Row {
             provider: custom_target,
             id: raw.clone(),
             name: format!("Use “{raw}” with {}", custom_target.name()),
@@ -367,164 +316,103 @@ fn model_list(
         });
     }
 
-    if let Tab::Provider(p) = state.tab
-        && query.is_empty()
-        && !(catalog.installed)(p)
-    {
-        ui.label(
-            RichText::new(format!(
-                "The {} CLI isn't installed. Install it with:",
-                p.name()
-            ))
-            .small()
-            .color(colors.warning.0),
-        );
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(p.install_hint()).small().monospace());
-            if ui.small_button("Copy").clicked() {
-                ui.ctx().copy_text(p.install_hint().to_owned());
-            }
-        });
-        ui.add_space(6.0);
+    // Keyboard: ↑/↓ move, Enter picks.
+    let (down, up, enter) = ui.input_mut(|i| {
+        (
+            i.consume_key(Modifiers::NONE, Key::ArrowDown),
+            i.consume_key(Modifiers::NONE, Key::ArrowUp),
+            i.consume_key(Modifiers::NONE, Key::Enter),
+        )
+    });
+    if !flat.is_empty() {
+        let last = flat.len() - 1;
+        if down {
+            state.cursor = Some(state.cursor.map_or(0, |c| (c + 1).min(last)));
+        }
+        if up {
+            state.cursor = Some(state.cursor.map_or(0, |c| c.saturating_sub(1)));
+        }
+        state.cursor = state.cursor.map(|c| c.min(last));
+    }
+    let mut select: Option<Row> = None;
+    if enter {
+        let pick = state.cursor.unwrap_or(0);
+        select = flat.get(pick).cloned();
     }
 
-    // ⌘1–⌘9 pick the first rows.
-    let picked_by_key = ui.input_mut(|i| {
-        (0..rows.len().min(9)).find(|n| {
-            let key = Key::from_name(&(n + 1).to_string()).unwrap_or(Key::Num1);
-            i.consume_key(Modifiers::COMMAND, key)
-        })
-    });
-
-    let mut select: Option<Row> = picked_by_key.map(|n| rows[n].clone());
     let mut toggle_fav: Option<String> = None;
-    // Fill the rest of the column, and no more.
-    let list_height = (ui.available_height() - 4.0).max(80.0);
+    let mut toggle_more: Option<Provider> = None;
     egui::ScrollArea::vertical()
         .id_salt("model_rows")
-        .max_height(list_height)
-        .min_scrolled_height(list_height)
+        .max_height(LIST_HEIGHT)
+        .min_scrolled_height(LIST_HEIGHT)
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            if rows.is_empty() {
-                ui.add_space(8.0);
-                let text = if state.tab == Tab::Favorites && query.is_empty() {
-                    "Star a model to pin it here"
+            if flat.is_empty() {
+                ui.add_space(10.0);
+                let text = if state.tab == Tab::Starred && query.is_empty() {
+                    "No starred models yet. Hover a model and click ☆ to star it."
                 } else {
                     "No models match"
                 };
-                ui.label(RichText::new(text).color(colors.text_muted.0));
+                ui.label(RichText::new(text).small().color(colors.text_muted.0));
             }
-            for (i, row) in rows.iter().enumerate() {
-                let fav_key = key(row.provider, &row.id);
-                let is_fav = catalog.favorites.contains(&fav_key);
-                let selected = choice.provider == row.provider && choice.model == row.id;
-                let installed = (catalog.installed)(row.provider);
-                let (rect, response) =
-                    ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::click());
-                let hovered = response.hovered();
-                if selected || hovered {
-                    ui.painter().rect_filled(rect, 6.0, colors.widget.0);
-                }
-                let text_color = if installed {
-                    colors.text.0
-                } else {
-                    colors.text_muted.0
-                };
-                let icon = Rect::from_center_size(
-                    pos2(rect.left() + 16.0, rect.center().y),
-                    vec2(18.0, 18.0),
-                );
-                provider_icon(ui.painter(), icon, row.provider, colors);
-                let name = ui.painter().layout_no_wrap(
-                    row.name.clone(),
-                    egui::TextStyle::Body.resolve(ui.style()),
-                    text_color,
-                );
-                let name_w = name.size().x;
-                let name_pos = pos2(rect.left() + 34.0, rect.center().y - name.size().y / 2.0);
-                ui.painter().galley(name_pos, name, text_color);
-                if selected {
-                    let c = Rect::from_center_size(
-                        pos2(name_pos.x + name_w + 14.0, rect.center().y),
-                        vec2(14.0, 14.0),
-                    );
-                    crate::ui::icons::paint(
-                        ui.painter(),
-                        c,
-                        crate::ui::icons::Icon::Check,
-                        text_color,
-                    );
-                }
-                // Shortcut chip, then the star to its left.
-                let mut right = rect.right() - 6.0;
-                if i < 9 {
-                    let chip = ui.painter().layout_no_wrap(
-                        format!("⌘{}", i + 1),
-                        egui::FontId::proportional(11.0),
-                        colors.text_muted.0,
-                    );
-                    let r = Rect::from_min_size(
-                        pos2(right - chip.size().x - 10.0, rect.center().y - 10.0),
-                        vec2(chip.size().x + 10.0, 20.0),
-                    );
-                    ui.painter().rect_filled(r, 4.0, colors.widget_hover.0);
-                    ui.painter()
-                        .galley(r.center() - chip.size() / 2.0, chip, colors.text_muted.0);
-                    right = r.left() - 8.0;
-                }
-                let star_rect =
-                    Rect::from_center_size(pos2(right - 9.0, rect.center().y), vec2(16.0, 16.0));
-                if is_fav || hovered {
-                    let c = if is_fav {
-                        colors.accent.0
-                    } else {
-                        colors.text_muted.0
-                    };
-                    star(ui.painter(), star_rect, c, is_fav);
-                }
-                let response = if installed {
-                    response
-                } else {
-                    response.on_hover_text(format!(
-                        "Install the {} CLI to use this model",
-                        row.provider.name()
-                    ))
-                };
-                if response.clicked() {
-                    let on_star = response
-                        .interact_pointer_pos()
-                        .is_some_and(|p| star_rect.expand(4.0).contains(p));
-                    if on_star && !row.name.starts_with("Use “") {
-                        toggle_fav = Some(fav_key);
-                    } else if installed {
-                        select = Some(row.clone());
+            let mut index = 0;
+            for (p, rows, hidden) in &groups {
+                group_header(ui, *p, &catalog, colors);
+                for row in rows {
+                    let fav_key = key(row.provider, &row.id);
+                    let is_fav = catalog.favorites.contains(&fav_key);
+                    let selected = choice.provider == row.provider && choice.model == row.id;
+                    let highlighted = state.cursor == Some(index);
+                    let installed = (catalog.installed)(row.provider);
+                    match model_row(ui, row, selected, highlighted, is_fav, installed, colors) {
+                        RowClick::Select => select = Some(row.clone()),
+                        RowClick::Star => toggle_fav = Some(fav_key),
+                        RowClick::None => {}
                     }
+                    index += 1;
                 }
-            }
-            if state.tab != Tab::Favorites
-                && query.is_empty()
-                && let Tab::Provider(p) = state.tab
-                && p.models().iter().any(|m| m.more)
-            {
+                if *hidden > 0 || state.expanded.contains(p) && query.is_empty() {
+                    let text = if *hidden > 0 {
+                        format!("+ {hidden} more")
+                    } else {
+                        "− fewer".to_owned()
+                    };
+                    ui.horizontal(|ui| {
+                        ui.add_space(26.0);
+                        if ui
+                            .add(
+                                egui::Label::new(RichText::new(text).small().color(colors.link.0))
+                                    .sense(Sense::click()),
+                            )
+                            .clicked()
+                        {
+                            toggle_more = Some(*p);
+                        }
+                    });
+                }
                 ui.add_space(4.0);
-                let text = if state.show_more {
-                    "Show less"
-                } else {
-                    "Show more"
-                };
-                if ui
-                    .add(
-                        egui::Label::new(RichText::new(text).color(colors.text_muted.0))
-                            .sense(Sense::click()),
-                    )
-                    .clicked()
+            }
+            if offer_custom {
+                let row = flat.last().unwrap().clone();
+                let installed = (catalog.installed)(row.provider);
+                let highlighted = state.cursor == Some(flat.len() - 1);
+                if let RowClick::Select =
+                    model_row(ui, &row, false, highlighted, false, installed, colors)
                 {
-                    state.show_more = !state.show_more;
+                    select = Some(row);
                 }
             }
         });
 
+    if let Some(p) = toggle_more {
+        if let Some(i) = state.expanded.iter().position(|x| *x == p) {
+            state.expanded.remove(i);
+        } else {
+            state.expanded.push(p);
+        }
+    }
     if let Some(k) = toggle_fav {
         if let Some(i) = catalog.favorites.iter().position(|f| *f == k) {
             catalog.favorites.remove(i);
@@ -553,77 +441,359 @@ fn model_list(
                 choice.effort = row.provider.default_effort().to_owned();
             }
         }
-        choice.provider = row.provider;
-        choice.model = row.id;
-        state.tab = Tab::Provider(row.provider);
-        changed = true;
+        if choice.provider != row.provider || choice.model != row.id {
+            choice.provider = row.provider;
+            choice.model = row.id;
+            changed = true;
+        }
     }
-    changed
-}
 
-fn reasoning(ui: &mut Ui, choice: &mut ModelChoice, colors: &UiColors) -> bool {
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.add_space(4.0);
-        ui.label(RichText::new("Reasoning").color(colors.text.0));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let name = choice.provider.model_name(&choice.model);
-            let short = name.strip_prefix("Claude ").unwrap_or(&name);
-            ui.label(RichText::new(short).small().color(colors.text_muted.0));
-        });
-    });
-    ui.add_space(4.0);
+    // Effort and access.
     let y = ui.cursor().top();
     ui.painter().hline(
         ui.max_rect().x_range(),
         y,
         Stroke::new(1.0, colors.border.0),
     );
-    ui.add_space(8.0);
-    let efforts = choice.provider.efforts();
-    if efforts.is_empty() {
-        ui.label(
-            RichText::new(format!(
-                "{} picks reasoning per model (e.g. a “-high” model name).",
-                choice.provider.name()
-            ))
-            .small()
-            .color(colors.text_muted.0),
-        );
-        return false;
-    }
-    for (value, label) in efforts {
-        let selected = choice.effort == *value;
-        let (rect, response) =
-            ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::click());
-        if response.hovered() {
-            ui.painter().rect_filled(rect, 6.0, colors.widget.0);
-        }
-        ui.painter().text(
-            pos2(rect.left() + 8.0, rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            *label,
-            egui::TextStyle::Body.resolve(ui.style()),
-            colors.text.0,
-        );
-        if selected {
-            let c = Rect::from_center_size(
-                pos2(rect.right() - 14.0, rect.center().y),
-                vec2(14.0, 14.0),
-            );
-            crate::ui::icons::paint(
-                ui.painter(),
-                c,
-                crate::ui::icons::Icon::Check,
-                colors.text.0,
-            );
-        }
-        if response.clicked() && !selected {
-            choice.effort = (*value).to_owned();
-            changed = true;
-        }
+    ui.add_space(6.0);
+    changed |= effort_meter(ui, choice, colors);
+    if let Some(access) = access {
+        ui.add_space(2.0);
+        changed |= access_switch(ui, access, colors);
     }
     changed
+}
+
+/// A provider (or All / Starred) filter chip.
+fn chip(
+    ui: &mut Ui,
+    tab: Tab,
+    active: bool,
+    catalog: &Catalog<'_>,
+    colors: &UiColors,
+) -> egui::Response {
+    let (label, provider) = match tab {
+        Tab::All => ("All".to_owned(), None),
+        Tab::Starred => ("★ Starred".to_owned(), None),
+        Tab::Provider(p) => (p.name().to_owned(), Some(p)),
+    };
+    let dim = provider.is_some_and(|p| !(catalog.installed)(p));
+    let text_color = if active {
+        colors.accent_text.0
+    } else if dim {
+        colors.text_muted.0
+    } else {
+        colors.text.0
+    };
+    let font = egui::FontId::proportional(12.0);
+    let g = ui.painter().layout_no_wrap(label, font, text_color);
+    let icon_w = if provider.is_some() { 16.0 } else { 0.0 };
+    let size = vec2(g.size().x + icon_w + 16.0, 22.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let fill = if active {
+        colors.accent.0
+    } else if response.hovered() {
+        colors.widget_hover.0
+    } else {
+        colors.widget.0
+    };
+    ui.painter().rect_filled(rect, 11.0, fill);
+    let mut x = rect.left() + 8.0;
+    if let Some(p) = provider {
+        let r = Rect::from_center_size(pos2(x + 6.0, rect.center().y), vec2(12.0, 12.0));
+        provider_icon(ui.painter(), r, p, colors);
+        x += icon_w;
+    }
+    ui.painter()
+        .galley(pos2(x, rect.center().y - g.size().y / 2.0), g, text_color);
+    match provider {
+        Some(p) if dim => response.on_hover_text(format!("The {} CLI isn't installed", p.name())),
+        _ => response,
+    }
+}
+
+fn group_header(ui: &mut Ui, p: Provider, catalog: &Catalog<'_>, colors: &UiColors) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(p.name().to_uppercase())
+                .small()
+                .strong()
+                .color(colors.text_muted.0),
+        );
+        if !(catalog.installed)(p) {
+            ui.label(
+                RichText::new("not installed")
+                    .small()
+                    .color(colors.warning.0),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(
+                        egui::Label::new(
+                            RichText::new("copy install command")
+                                .small()
+                                .color(colors.link.0),
+                        )
+                        .sense(Sense::click()),
+                    )
+                    .on_hover_text(p.install_hint())
+                    .clicked()
+                {
+                    ui.ctx().copy_text(p.install_hint().to_owned());
+                }
+            });
+        }
+    });
+}
+
+enum RowClick {
+    None,
+    Select,
+    Star,
+}
+
+fn model_row(
+    ui: &mut Ui,
+    row: &Row,
+    selected: bool,
+    highlighted: bool,
+    is_fav: bool,
+    installed: bool,
+    colors: &UiColors,
+) -> RowClick {
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::click());
+    let hovered = response.hovered();
+    if hovered || highlighted {
+        ui.painter().rect_filled(rect, 4.0, colors.widget.0);
+    }
+    if highlighted {
+        ui.painter().rect_stroke(
+            rect,
+            4.0,
+            Stroke::new(1.0, colors.accent.0.gamma_multiply(0.6)),
+            egui::StrokeKind::Inside,
+        );
+    }
+    // Radio dot.
+    let dot = pos2(rect.left() + 12.0, rect.center().y);
+    ui.painter().circle_stroke(
+        dot,
+        5.5,
+        Stroke::new(
+            1.2,
+            if selected {
+                colors.accent.0
+            } else {
+                colors.text_muted.0
+            },
+        ),
+    );
+    if selected {
+        ui.painter().circle_filled(dot, 3.0, colors.accent.0);
+    }
+    let text_color = if installed {
+        colors.text.0
+    } else {
+        colors.text_muted.0
+    };
+    let name = ui.painter().layout_no_wrap(
+        short_name(&row.name).to_owned(),
+        egui::TextStyle::Body.resolve(ui.style()),
+        text_color,
+    );
+    let name_end = rect.left() + 26.0 + name.size().x;
+    ui.painter().galley(
+        pos2(rect.left() + 26.0, rect.center().y - name.size().y / 2.0),
+        name,
+        text_color,
+    );
+    // Star on the right; the model id just left of it.
+    let star_rect =
+        Rect::from_center_size(pos2(rect.right() - 12.0, rect.center().y), vec2(13.0, 13.0));
+    let is_use_row = row.name.starts_with("Use “");
+    if !is_use_row && (is_fav || hovered) {
+        star(
+            ui.painter(),
+            star_rect,
+            if is_fav {
+                colors.warning.0
+            } else {
+                colors.text_muted.0
+            },
+            is_fav,
+        );
+    }
+    let id_text = if row.id.is_empty() {
+        "default".to_owned()
+    } else if row.custom && !is_use_row {
+        format!("{} · custom", row.id)
+    } else if is_use_row {
+        String::new()
+    } else {
+        row.id.clone()
+    };
+    if !id_text.is_empty() {
+        let mut job = egui::text::LayoutJob::simple_singleline(
+            id_text,
+            egui::FontId::monospace(10.5),
+            colors.text_muted.0,
+        );
+        let room = (star_rect.left() - 8.0) - (name_end + 12.0);
+        if room > 30.0 {
+            job.wrap = egui::text::TextWrapping::truncate_at_width(room);
+            let g = ui.fonts_mut(|f| f.layout_job(job));
+            ui.painter().galley(
+                pos2(
+                    star_rect.left() - 8.0 - g.size().x,
+                    rect.center().y - g.size().y / 2.0,
+                ),
+                g,
+                colors.text_muted.0,
+            );
+        }
+    }
+    let response = if installed {
+        response
+    } else {
+        response.on_hover_text(format!(
+            "Install the {} CLI to use this model",
+            row.provider.name()
+        ))
+    };
+    if response.clicked() {
+        let on_star = response
+            .interact_pointer_pos()
+            .is_some_and(|p| star_rect.expand(5.0).contains(p));
+        if on_star && !is_use_row {
+            return RowClick::Star;
+        }
+        if installed {
+            return RowClick::Select;
+        }
+    }
+    RowClick::None
+}
+
+/// Reasoning effort as a row of bars: more filled bars, more thinking.
+fn effort_meter(ui: &mut Ui, choice: &mut ModelChoice, colors: &UiColors) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Effort").small().color(colors.text_muted.0));
+        ui.add_space(8.0);
+        let efforts = choice.provider.efforts();
+        if efforts.is_empty() {
+            ui.label(
+                RichText::new(format!("set by the model in {}", choice.provider.name()))
+                    .small()
+                    .color(colors.text_muted.0),
+            );
+            return;
+        }
+        let current = efforts.iter().position(|(v, _)| *v == choice.effort);
+        ui.spacing_mut().item_spacing.x = 3.0;
+        for (i, (value, label)) in efforts.iter().enumerate() {
+            // Bars step up in height like a signal meter.
+            let h = 6.0 + 3.0 * i as f32;
+            let (slot, response) = ui.allocate_exact_size(vec2(14.0, 20.0), Sense::click());
+            let bar = Rect::from_min_max(
+                pos2(slot.left() + 2.0, slot.bottom() - h - 2.0),
+                pos2(slot.right() - 2.0, slot.bottom() - 2.0),
+            );
+            let on = current.is_some_and(|c| i <= c);
+            let fill = if on {
+                colors.accent.0
+            } else if response.hovered() {
+                colors.accent.0.gamma_multiply(0.45)
+            } else {
+                colors.border.0
+            };
+            ui.painter().rect_filled(bar, 2.0, fill);
+            if response.on_hover_text(*label).clicked() && current != Some(i) {
+                choice.effort = (*value).to_owned();
+                changed = true;
+            }
+        }
+        ui.add_space(6.0);
+        let label = current.map_or("Default", |c| efforts[c].1);
+        ui.label(RichText::new(label).small().color(colors.text.0));
+    });
+    changed
+}
+
+/// Access as a three-way segmented switch.
+fn access_switch(ui: &mut Ui, access: &mut Access, colors: &UiColors) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Access").small().color(colors.text_muted.0));
+        ui.add_space(4.0);
+        ui.spacing_mut().item_spacing.x = 0.0;
+        let short = |a: Access| match a {
+            Access::Full => "Full",
+            Access::Edits => "Edit files",
+            Access::ReadOnly => "Read only",
+        };
+        let n = Access::ALL.len();
+        let start = ui.cursor().min;
+        for (i, a) in Access::ALL.into_iter().enumerate() {
+            let on = *access == a;
+            let g = ui.painter().layout_no_wrap(
+                short(a).to_owned(),
+                egui::FontId::proportional(12.0),
+                if on {
+                    colors.accent_text.0
+                } else {
+                    colors.text.0
+                },
+            );
+            let (rect, response) =
+                ui.allocate_exact_size(vec2(g.size().x + 18.0, 22.0), Sense::click());
+            let r = 5;
+            let corners = egui::CornerRadius {
+                nw: if i == 0 { r } else { 0 },
+                sw: if i == 0 { r } else { 0 },
+                ne: if i == n - 1 { r } else { 0 },
+                se: if i == n - 1 { r } else { 0 },
+            };
+            let fill = if on {
+                colors.accent.0
+            } else if response.hovered() {
+                colors.widget_hover.0
+            } else {
+                colors.widget.0
+            };
+            ui.painter().rect_filled(rect, corners, fill);
+            ui.painter()
+                .galley(rect.center() - g.size() / 2.0, g, colors.text.0);
+            if response.on_hover_text(a.describe()).clicked() && !on {
+                *access = a;
+                changed = true;
+            }
+        }
+        // One outline around the whole switch.
+        let end = ui.min_rect().right();
+        let outline = Rect::from_min_max(start, pos2(end, start.y + 22.0));
+        ui.painter().rect_stroke(
+            outline,
+            5.0,
+            Stroke::new(1.0, colors.border.0),
+            egui::StrokeKind::Inside,
+        );
+    });
+    changed
+}
+
+/// A small down (or, when open, up) chevron.
+fn chevron(painter: &Painter, c: Pos2, color: Color32, up: bool) {
+    let d = if up { -1.0 } else { 1.0 };
+    painter.add(PathShape::line(
+        vec![
+            c + vec2(-3.5, -1.5 * d),
+            c + vec2(0.0, 2.0 * d),
+            c + vec2(3.5, -1.5 * d),
+        ],
+        PathStroke::new(1.3, color),
+    ));
 }
 
 // ---- icons -----------------------------------------------------------------
@@ -721,6 +891,48 @@ fn star(painter: &Painter, rect: Rect, color: Color32, filled: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Draws the picker for several frames with no input: it must keep its
+    /// tab and size (a popup that grows every frame never settles).
+    #[test]
+    fn picker_is_stable_without_input() {
+        let ctx = egui::Context::default();
+        let colors = crate::theme::load_all(None).0[0].ui.clone();
+        let mut choice = ModelChoice::new(Provider::Claude, "claude-opus-5-5");
+        let mut access = Access::Full;
+        let mut state = PickerState::default();
+        let mut favorites = Vec::new();
+        let mut custom = Vec::new();
+        let installed = |p: Provider| p == Provider::Claude;
+        let mut sizes = Vec::new();
+        for _ in 0..6 {
+            let mut size = egui::Vec2::ZERO;
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let r = ui.scope(|ui| {
+                    contents(
+                        ui,
+                        &mut choice,
+                        Some(&mut access),
+                        &mut state,
+                        Catalog {
+                            installed: &installed,
+                            favorites: &mut favorites,
+                            custom: &mut custom,
+                        },
+                        &colors,
+                    )
+                });
+                assert!(!r.inner, "nothing should change without input");
+                size = r.response.rect.size();
+            });
+            out.textures_delta.clear();
+            sizes.push(size);
+        }
+        assert_eq!(state.tab, Tab::All);
+        assert!(sizes.windows(2).skip(1).all(|w| w[0] == w[1]), "{sizes:?}");
+        assert!(sizes[5].y < 600.0, "{sizes:?}");
+        assert_eq!(choice.model, "claude-opus-5-5");
+    }
 
     #[test]
     fn keys_round_trip() {
