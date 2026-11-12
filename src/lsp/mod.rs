@@ -12,6 +12,7 @@ mod browser;
 pub mod catalog;
 mod client;
 pub mod detect;
+pub mod features;
 mod install;
 mod rpc;
 mod session;
@@ -26,7 +27,7 @@ use catalog::{InstallMethod, ServerSpec};
 use install::{InstallJob, JobState};
 pub use session::{
     Feature, FormatOptions, Location, LocationKind, Lsp, LspEvent, Problem, ServerActivity,
-    Severity, workspace_edit_files,
+    Severity, View, workspace_edit_files,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -35,6 +35,10 @@ pub struct Settings {
     pub word_wrap: bool,
     /// Show line numbers in the editor gutter.
     pub line_numbers: bool,
+    /// Show the language server's inline type and parameter-name hints.
+    pub inlay_hints: bool,
+    /// Show the file path and enclosing symbols above the editor.
+    pub breadcrumbs: bool,
     /// Show a zoomed-out overview of the file beside the editor.
     pub minimap: bool,
     /// Shell for the integrated terminal, with optional arguments (e.g. `"bash --login"`).
@@ -80,6 +84,8 @@ impl Default for Settings {
             font_size: DEFAULT_FONT_SIZE,
             word_wrap: false,
             line_numbers: true,
+            inlay_hints: true,
+            breadcrumbs: true,
             minimap: true,
             terminal_shell: None,
             disabled_extensions: Vec::new(),
@@ -294,6 +300,8 @@ mod tests {
             font_size: 16.0,
             word_wrap: true,
             line_numbers: false,
+            inlay_hints: false,
+            breadcrumbs: false,
             minimap: false,
             terminal_shell: Some("bash --login".into()),
             keybindings: [

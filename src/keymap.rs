@@ -284,6 +284,7 @@ mod tests {
         // Cmd+Z would also match Cmd+Shift+Z.
         assert!(pos(Command::Redo) < pos(Command::Undo));
         assert!(pos(Command::SaveAs) < pos(Command::Save));
+        assert!(pos(Command::GoToSymbol) < pos(Command::OpenFile));
         assert!(pos(Command::PreviousTab) < pos(Command::NextTab));
     }
 

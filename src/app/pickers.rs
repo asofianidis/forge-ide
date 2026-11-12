@@ -17,6 +17,10 @@ pub(super) enum PickerMode {
     RecentFolders,
     /// Definitions, references or problems from the language server.
     Locations,
+    /// Symbols in the active file.
+    Symbols,
+    /// Symbols anywhere in the workspace, searched as you type.
+    WorkspaceSymbols,
 }
 
 /// A command palette entry.
@@ -277,6 +281,27 @@ impl ForgeApp {
                 if let Some(i) = self.picker.show(ctx, hint, &items, None, &style) {
                     let location = self.language.locations[indices[i]].location.clone();
                     self.go_to_location(ctx, &location);
+                }
+            }
+            PickerMode::Symbols => {
+                let (items, indices) = self.symbol_picker_items(&self.picker.query);
+                if let Some(i) = self
+                    .picker
+                    .show(ctx, "Go to symbol in file", &items, None, &style)
+                {
+                    self.go_to_symbol_item(ctx, indices[i]);
+                }
+            }
+            PickerMode::WorkspaceSymbols => {
+                let (items, indices, footer) = self.workspace_symbol_items();
+                if let Some(i) = self.picker.show(
+                    ctx,
+                    "Go to symbol in workspace",
+                    &items,
+                    footer.as_deref(),
+                    &style,
+                ) {
+                    self.go_to_workspace_symbol_item(ctx, indices[i]);
                 }
             }
             PickerMode::RecentFolders => {

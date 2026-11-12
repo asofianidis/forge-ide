@@ -32,10 +32,14 @@ pub enum Command {
     MoveLineUp,
     MoveLineDown,
     TriggerSuggest,
+    TriggerParameterHints,
+    QuickFix,
     RenameSymbol,
     FormatDocument,
     QuickOpen,
     GoToLine,
+    GoToSymbol,
+    GoToWorkspaceSymbol,
     NextTab,
     PreviousTab,
     GoToDefinition,
@@ -55,6 +59,8 @@ pub enum Command {
     RepositoryHistory,
     ToggleWordWrap,
     ToggleLineNumbers,
+    ToggleInlayHints,
+    ToggleBreadcrumbs,
     ToggleMinimap,
     ToggleMarkdownPreview,
     IncreaseFontSize,
@@ -121,10 +127,14 @@ impl Command {
         Command::MoveLineUp,
         Command::MoveLineDown,
         Command::TriggerSuggest,
+        Command::TriggerParameterHints,
+        Command::QuickFix,
         Command::RenameSymbol,
         Command::FormatDocument,
         Command::QuickOpen,
         Command::GoToLine,
+        Command::GoToSymbol,
+        Command::GoToWorkspaceSymbol,
         Command::NextTab,
         Command::PreviousTab,
         Command::GoToDefinition,
@@ -144,6 +154,8 @@ impl Command {
         Command::RepositoryHistory,
         Command::ToggleWordWrap,
         Command::ToggleLineNumbers,
+        Command::ToggleInlayHints,
+        Command::ToggleBreadcrumbs,
         Command::ToggleMinimap,
         Command::ToggleMarkdownPreview,
         Command::IncreaseFontSize,
@@ -191,10 +203,14 @@ impl Command {
             Command::MoveLineUp => "Move Line Up",
             Command::MoveLineDown => "Move Line Down",
             Command::TriggerSuggest => "Trigger Suggest",
+            Command::TriggerParameterHints => "Trigger Parameter Hints",
+            Command::QuickFix => "Quick Fix…",
             Command::RenameSymbol => "Rename Symbol…",
             Command::FormatDocument => "Format Document",
             Command::QuickOpen => "Go to File…",
             Command::GoToLine => "Go to Line…",
+            Command::GoToSymbol => "Go to Symbol in File…",
+            Command::GoToWorkspaceSymbol => "Go to Symbol in Workspace…",
             Command::NextTab => "Next Tab",
             Command::PreviousTab => "Previous Tab",
             Command::GoToDefinition => "Go to Definition",
@@ -214,6 +230,8 @@ impl Command {
             Command::RepositoryHistory => "Repository History",
             Command::ToggleWordWrap => "Toggle Word Wrap",
             Command::ToggleLineNumbers => "Toggle Line Numbers",
+            Command::ToggleInlayHints => "Toggle Inlay Hints",
+            Command::ToggleBreadcrumbs => "Toggle Breadcrumbs",
             Command::ToggleMinimap => "Toggle Minimap",
             Command::ToggleMarkdownPreview => "Markdown Preview",
             Command::IncreaseFontSize => "Increase Font Size",
@@ -241,11 +259,25 @@ impl Command {
         match self {
             NewFile | OpenFile | OpenFolder | OpenRecent | Save | SaveAs | CloseTab
             | RevealActiveFile | OpenSettings | OpenSettingsFile | ShowKeybindings | Quit => "File",
-            Undo | Redo | Find | Replace | FindInProject | ToggleComment | Indent | Outdent
-            | DuplicateLine | MoveLineUp | MoveLineDown | TriggerSuggest | RenameSymbol
+            Undo
+            | Redo
+            | Find
+            | Replace
+            | FindInProject
+            | ToggleComment
+            | Indent
+            | Outdent
+            | DuplicateLine
+            | MoveLineUp
+            | MoveLineDown
+            | TriggerSuggest
+            | TriggerParameterHints
+            | QuickFix
+            | RenameSymbol
             | FormatDocument => "Edit",
-            QuickOpen | GoToLine | NextTab | PreviousTab | GoToDefinition | FindReferences
-            | NextProblem | PreviousProblem | NextChange | PreviousChange => "Go",
+            QuickOpen | GoToLine | GoToSymbol | GoToWorkspaceSymbol | NextTab | PreviousTab
+            | GoToDefinition | FindReferences | NextProblem | PreviousProblem | NextChange
+            | PreviousChange => "Go",
             ShowCommandPalette
             | ShowExplorer
             | ShowSourceControl
@@ -257,6 +289,8 @@ impl Command {
             | RepositoryHistory
             | ToggleWordWrap
             | ToggleLineNumbers
+            | ToggleInlayHints
+            | ToggleBreadcrumbs
             | ToggleMinimap
             | ToggleMarkdownPreview
             | IncreaseFontSize
@@ -361,6 +395,10 @@ impl Command {
             Command::NextChange => &const { one(shortcut(ALT, Key::F5)) },
             // Ctrl+Space on every platform, as in other editors.
             Command::TriggerSuggest => &const { one(shortcut(Modifiers::CTRL, Key::Space)) },
+            Command::TriggerParameterHints => &const { one(shortcut(CMD_SHIFT, Key::Space)) },
+            Command::QuickFix => &const { one(shortcut(CMD, Key::Period)) },
+            Command::GoToSymbol => &const { one(shortcut(CMD_SHIFT, Key::O)) },
+            Command::GoToWorkspaceSymbol => &const { one(shortcut(CMD, Key::T)) },
             Command::RenameSymbol => &const { one(shortcut(Modifiers::NONE, Key::F2)) },
             Command::FormatDocument => &const { one(shortcut(CMD_SHIFT, Key::I)) },
             Command::GoToDefinition => &const { one(shortcut(Modifiers::NONE, Key::F12)) },
@@ -400,6 +438,8 @@ impl Command {
                 | Command::MoveLineUp
                 | Command::MoveLineDown
                 | Command::TriggerSuggest
+                | Command::TriggerParameterHints
+                | Command::QuickFix
                 | Command::RenameSymbol
                 | Command::FormatDocument
         )

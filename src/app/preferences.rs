@@ -51,6 +51,18 @@ impl ForgeApp {
         self.status = format!("Line numbers {}", if on { "on" } else { "off" });
     }
 
+    pub(super) fn toggle_inlay_hints(&mut self) {
+        let on = !self.settings.inlay_hints;
+        self.update_settings(|s| s.inlay_hints = on);
+        self.status = format!("Inlay hints {}", if on { "on" } else { "off" });
+    }
+
+    pub(super) fn toggle_breadcrumbs(&mut self) {
+        let on = !self.settings.breadcrumbs;
+        self.update_settings(|s| s.breadcrumbs = on);
+        self.status = format!("Breadcrumbs {}", if on { "on" } else { "off" });
+    }
+
     pub(super) fn toggle_minimap(&mut self) {
         let on = !self.settings.minimap;
         self.update_settings(|s| s.minimap = on);
@@ -202,6 +214,8 @@ impl ForgeApp {
         let mut font_size = self.settings.font_size;
         let mut word_wrap = self.settings.word_wrap;
         let mut line_numbers = self.settings.line_numbers;
+        let mut inlay_hints = self.settings.inlay_hints;
+        let mut breadcrumbs = self.settings.breadcrumbs;
         let mut minimap = self.settings.minimap;
         let mut format_on_save = self.settings.format_on_save;
         let mut auto_update = self
@@ -254,6 +268,12 @@ impl ForgeApp {
                         changed |= ui.checkbox(&mut line_numbers, "").changed();
                         ui.end_row();
 
+                        ui.label("Inlay hints");
+                        changed |= ui.checkbox(&mut inlay_hints, "").changed();
+                        ui.end_row();
+
+                        ui.label("Breadcrumbs");
+                        changed |= ui.checkbox(&mut breadcrumbs, "").changed();
                         ui.label("Minimap");
                         changed |= ui.checkbox(&mut minimap, "").changed();
                         ui.end_row();
@@ -286,6 +306,8 @@ impl ForgeApp {
             let auto_changed = auto_update != s.auto_update.unwrap_or(updater::IS_RELEASE_BUILD);
             if word_wrap != s.word_wrap
                 || line_numbers != s.line_numbers
+                || inlay_hints != s.inlay_hints
+                || breadcrumbs != s.breadcrumbs
                 || minimap != s.minimap
                 || format_on_save != s.format_on_save
                 || auto_changed
@@ -293,6 +315,8 @@ impl ForgeApp {
                 self.update_settings(|s| {
                     s.word_wrap = word_wrap;
                     s.line_numbers = line_numbers;
+                    s.inlay_hints = inlay_hints;
+                    s.breadcrumbs = breadcrumbs;
                     s.minimap = minimap;
                     s.format_on_save = format_on_save;
                     if auto_changed {
