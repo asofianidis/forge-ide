@@ -92,6 +92,8 @@ pub enum Command {
     ExtensionGuide,
     ToggleTerminal,
     RestartTerminal,
+    NewWindow,
+    CloseWindow,
     CheckForUpdates,
 }
 
@@ -201,6 +203,8 @@ impl Command {
         Command::ExtensionGuide,
         Command::ToggleTerminal,
         Command::RestartTerminal,
+        Command::NewWindow,
+        Command::CloseWindow,
         Command::CheckForUpdates,
     ];
 
@@ -291,6 +295,8 @@ impl Command {
             Command::ExtensionGuide => "Extension Authoring Guide",
             Command::ToggleTerminal => "Toggle Terminal",
             Command::RestartTerminal => "Restart Shell",
+            Command::NewWindow => "New Window",
+            Command::CloseWindow => "Close Window",
             Command::CheckForUpdates => "Check for Updates",
         }
     }
@@ -354,6 +360,7 @@ impl Command {
                 "Extensions"
             }
             ToggleTerminal | RestartTerminal => "Terminal",
+            NewWindow | CloseWindow => "Window",
             CheckForUpdates => "Help",
         }
     }
@@ -400,6 +407,8 @@ impl Command {
             Command::OpenFile => &const { one(shortcut(CMD, Key::O)) },
             Command::Save => &const { one(shortcut(CMD, Key::S)) },
             Command::SaveAs => &const { one(shortcut(CMD_SHIFT, Key::S)) },
+            Command::NewWindow => &const { one(shortcut(CMD_SHIFT, Key::N)) },
+            Command::CloseWindow => &const { one(shortcut(CMD_SHIFT, Key::W)) },
             Command::CloseTab => &const { one(shortcut(CMD, Key::W)) },
             Command::Undo => &const { one(shortcut(CMD, Key::Z)) },
             // Cmd+Shift+Z is the usual redo on macOS, Ctrl+Y on Windows and Linux.

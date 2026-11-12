@@ -22,13 +22,19 @@ mod theme;
 mod ui;
 mod updater;
 mod watcher;
+mod windows;
 mod workspace;
 
 use app::ForgeApp;
 
 fn main() -> eframe::Result {
-    // A folder given on the command line; otherwise the last one opened.
-    let root = std::env::args().nth(1).map(std::path::PathBuf::from);
+    // A folder given on the command line; otherwise the last one opened,
+    // unless this is a new empty window.
+    let arg = std::env::args_os().nth(1);
+    let new_window = arg
+        .as_deref()
+        .is_some_and(|a| a == windows::NEW_WINDOW_FLAG);
+    let root = arg.filter(|_| !new_window).map(std::path::PathBuf::from);
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -41,6 +47,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Forge IDE",
         options,
-        Box::new(move |cc| Ok(Box::new(ForgeApp::new(cc, root)))),
+        Box::new(move |cc| Ok(Box::new(ForgeApp::new(cc, root, new_window)))),
     )
 }
