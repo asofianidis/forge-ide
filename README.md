@@ -334,10 +334,12 @@ src/
 │   ├── find_bar.rs      # find / replace bar
 │   ├── markdown_preview.rs # Markdown preview beside the editor, link resolution
 │   ├── search_panel.rs  # "Search" sidebar
-│   ├── preferences.rs   # Settings window, font size / word wrap / line numbers
+│   ├── preferences.rs   # Settings and Keyboard Shortcuts windows, font size / wrap / minimap
 │   ├── pickers.rs       # quick open, command palette, theme picker
 │   └── terminal_panel.rs # terminal panel: show / hide, restart
-├── commands.rs          # every action: name, menu, shortcut (menus + palette use it)
+├── commands.rs          # every action: name, menu, default shortcut (menus + palette use it)
+├── keymap.rs            # shortcuts in effect: defaults + [keybindings] from settings.toml
+├── editorconfig.rs      # .editorconfig parsing, glob matching, save rules
 ├── palette.rs           # list picker used by quick open and the command palette
 ├── fuzzy.rs             # fuzzy matcher for file and command names
 ├── search.rs            # project file listing and text search (ignore + grep-searcher)
@@ -385,6 +387,7 @@ src/
     ├── document.rs      # open file buffer, load/save, dirty tracking
     ├── find.rs          # in-file find / replace
     ├── ops.rs           # comment, indent, move lines, auto-indent/pairs, brackets
+    ├── minimap.rs       # zoomed-out file overview beside the editor
     ├── gutter.rs        # line-number gutter and change markers
     ├── highlight.rs     # syntect → egui LayoutJob highlighting
     ├── scm.rs           # change peek, blame column, conflict actions
