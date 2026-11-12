@@ -527,14 +527,11 @@ impl Ai {
                         );
                     });
                 }
-                for m in &thread.messages {
-                    message(ui, m, running, colors);
-                }
+                let streaming = self.runs.get(id).map(|a| a.streaming.as_str());
+                transcript(ui, thread, streaming, running, colors);
                 if let Some(active) = self.runs.get(id) {
-                    if !active.streaming.is_empty() {
-                        crate::ui::markdown::show(ui, &active.streaming);
-                    }
                     ui.horizontal(|ui| {
+                        ui.add_space(14.0);
                         ui.spinner();
                         let secs = active.run.started.elapsed().as_secs();
                         ui.label(
@@ -689,77 +686,285 @@ fn flow_tip(kind: FlowKind, git: &GitSummary) -> String {
     }
 }
 
-fn message(ui: &mut Ui, m: &Message, running: bool, colors: &UiColors) {
-    match m {
-        Message::User { text } => {
-            ui.add_space(6.0);
-            egui::Frame::new()
-                .fill(colors.widget.0)
-                .corner_radius(8.0)
-                .inner_margin(egui::Margin::symmetric(10, 8))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.label(text);
-                });
-            ui.add_space(4.0);
-        }
-        Message::Assistant { text } => {
-            crate::ui::markdown::show(ui, text);
-            ui.add_space(4.0);
-        }
-        Message::Tool {
-            id,
-            name,
-            detail,
-            output,
-            is_error,
-        } => {
-            let (glyph, color) = match (output, is_error) {
-                (None, _) if running => ("…", colors.text_muted.0),
-                (None, _) => ("•", colors.text_muted.0),
-                (Some(_), true) => ("✗", colors.error.0),
-                (Some(_), false) => ("✓", colors.added.0),
-            };
-            let header = RichText::new(format!("{glyph} {name}  {detail}"))
-                .small()
-                .monospace()
-                .color(if *is_error {
-                    colors.error.0
-                } else {
-                    colors.text_muted.0
-                });
-            match output.as_deref().filter(|o| !o.trim().is_empty()) {
-                Some(out) => {
-                    egui::CollapsingHeader::new(header)
-                        .id_salt(("tool", id))
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            ui.label(RichText::new(out).small().monospace());
-                        });
+/// A run of the transcript drawn as one piece.
+#[derive(Debug, PartialEq)]
+enum Block<'a> {
+    User(&'a str),
+    Reply(&'a str),
+    /// Consecutive tool calls, shown as one accordion.
+    Tools(&'a [Message]),
+    Error(&'a str),
+    Info(&'a str),
+}
+
+fn blocks(messages: &[Message]) -> Vec<Block<'_>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < messages.len() {
+        match &messages[i] {
+            Message::Tool { .. } => {
+                let start = i;
+                while i < messages.len() && matches!(messages[i], Message::Tool { .. }) {
+                    i += 1;
                 }
-                None => {
-                    ui.horizontal(|ui| {
-                        ui.add_space(18.0);
-                        ui.label(header).on_hover_text(name);
-                    });
-                    let _ = color;
-                }
+                out.push(Block::Tools(&messages[start..i]));
+                continue;
+            }
+            Message::User { text } => out.push(Block::User(text)),
+            Message::Assistant { text } => out.push(Block::Reply(text)),
+            Message::Error { text } => out.push(Block::Error(text)),
+            Message::Info { text } => out.push(Block::Info(text)),
+        }
+        i += 1;
+    }
+    out
+}
+
+/// "4 tool calls · Read ×2, Bash, Edit · 1 failed"
+fn tool_summary(tools: &[Message]) -> String {
+    let mut names: Vec<(String, usize)> = Vec::new();
+    let mut failed = 0;
+    for m in tools {
+        if let Message::Tool { name, is_error, .. } = m {
+            match names.iter_mut().find(|(n, _)| n == name) {
+                Some((_, c)) => *c += 1,
+                None => names.push((name.clone(), 1)),
+            }
+            if *is_error {
+                failed += 1;
             }
         }
-        Message::Error { text } => {
-            egui::Frame::new()
-                .stroke(egui::Stroke::new(1.0, colors.error.0))
-                .corner_radius(6.0)
-                .inner_margin(egui::Margin::symmetric(8, 6))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.label(RichText::new(text).color(colors.error.0));
-                });
+    }
+    let n = tools.len();
+    let list: Vec<String> = names
+        .iter()
+        .map(|(name, c)| {
+            if *c > 1 {
+                format!("{name} ×{c}")
+            } else {
+                name.clone()
+            }
+        })
+        .collect();
+    let mut text = format!(
+        "{n} tool call{} · {}",
+        if n == 1 { "" } else { "s" },
+        list.join(", ")
+    );
+    if failed > 0 {
+        text.push_str(&format!(" · {failed} failed"));
+    }
+    text
+}
+
+fn transcript(
+    ui: &mut Ui,
+    thread: &super::thread::Thread,
+    streaming: Option<&str>,
+    running: bool,
+    colors: &UiColors,
+) {
+    let accent = picker::provider_color(thread.choice.provider, colors);
+    let list = blocks(&thread.messages);
+    // Each agent turn gets one header, above its first reply or tool use.
+    let mut need_header = true;
+    let header = |ui: &mut Ui, need: &mut bool| {
+        if *need {
+            agent_header(ui, thread, colors);
+            *need = false;
         }
-        Message::Info { text } => {
-            ui.label(RichText::new(text).small().color(colors.text_muted.0));
+    };
+    let last = list.len().saturating_sub(1);
+    let streaming = streaming.filter(|s| !s.trim().is_empty());
+    for (i, block) in list.iter().enumerate() {
+        match block {
+            Block::User(text) => {
+                user_bubble(ui, text, colors);
+                need_header = true;
+            }
+            Block::Reply(text) => {
+                header(ui, &mut need_header);
+                reply(ui, text, accent);
+            }
+            Block::Tools(tools) => {
+                header(ui, &mut need_header);
+                // Still running when nothing has come after it yet.
+                let live = running && i == last && streaming.is_none();
+                tool_group(ui, &thread.id, tools, live, colors);
+            }
+            Block::Error(text) => {
+                egui::Frame::new()
+                    .stroke(egui::Stroke::new(1.0, colors.error.0))
+                    .corner_radius(6.0)
+                    .inner_margin(egui::Margin::symmetric(8, 6))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(RichText::new(*text).color(colors.error.0));
+                    });
+                ui.add_space(4.0);
+            }
+            Block::Info(text) => {
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    ui.label(RichText::new(*text).small().color(colors.text_muted.0));
+                });
+            }
         }
     }
+    if running {
+        header(ui, &mut need_header);
+    }
+    if let Some(text) = streaming {
+        reply(ui, text, accent);
+    }
+}
+
+/// Provider mark, name and model at the start of an agent's turn.
+fn agent_header(ui: &mut Ui, thread: &super::thread::Thread, colors: &UiColors) {
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        let (rect, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+        picker::provider_icon(ui.painter(), rect, thread.choice.provider, colors);
+        ui.label(
+            RichText::new(thread.choice.provider.name())
+                .strong()
+                .color(colors.text.0),
+        );
+        ui.label(
+            RichText::new(thread.choice.label())
+                .small()
+                .color(colors.text_muted.0),
+        );
+    });
+    ui.add_space(2.0);
+}
+
+/// The agent's words: Markdown with an accent bar down the left edge.
+fn reply(ui: &mut Ui, text: &str, accent: egui::Color32) {
+    let rect = egui::Frame::new()
+        .inner_margin(egui::Margin {
+            left: 14,
+            right: 4,
+            top: 2,
+            bottom: 2,
+        })
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            crate::ui::markdown::show(ui, text);
+        })
+        .response
+        .rect;
+    ui.painter().vline(
+        rect.left() + 4.0,
+        rect.y_range(),
+        egui::Stroke::new(2.5, accent),
+    );
+    ui.add_space(6.0);
+}
+
+/// The user's message, right-aligned in a bubble.
+fn user_bubble(ui: &mut Ui, text: &str, colors: &UiColors) {
+    ui.add_space(10.0);
+    let max = (ui.available_width() * 0.8).max(120.0);
+    ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
+        ui.label(RichText::new("You").small().color(colors.text_muted.0));
+        egui::Frame::new()
+            .fill(colors.widget.0)
+            .corner_radius(10.0)
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.set_max_width(max);
+                ui.add(egui::Label::new(RichText::new(text).color(colors.text.0)).wrap());
+            });
+    });
+    ui.add_space(4.0);
+}
+
+/// Consecutive tool calls folded into one accordion; each call with output
+/// folds again inside it.
+fn tool_group(ui: &mut Ui, thread_id: &str, tools: &[Message], live: bool, colors: &UiColors) {
+    let first_id = match tools.first() {
+        Some(Message::Tool { id, .. }) => id.as_str(),
+        _ => "",
+    };
+    let title = if live {
+        match tools.last() {
+            Some(Message::Tool { name, detail, .. }) => {
+                format!(
+                    "Running {name} {}…",
+                    super::provider::first_line(detail, 60)
+                )
+            }
+            _ => "Running…".to_owned(),
+        }
+    } else {
+        tool_summary(tools)
+    };
+    let any_failed = tools
+        .iter()
+        .any(|m| matches!(m, Message::Tool { is_error: true, .. }));
+    let color = if any_failed && !live {
+        colors.error.0
+    } else {
+        colors.text_muted.0
+    };
+    ui.horizontal(|ui| {
+        ui.add_space(10.0);
+        ui.vertical(|ui| {
+            egui::CollapsingHeader::new(RichText::new(title).small().color(color))
+                .id_salt(("tools", thread_id, first_id))
+                .default_open(false)
+                .show(ui, |ui| {
+                    for m in tools {
+                        let Message::Tool {
+                            id,
+                            name,
+                            detail,
+                            output,
+                            is_error,
+                        } = m
+                        else {
+                            continue;
+                        };
+                        let (glyph, c) = match (output, is_error) {
+                            (None, _) if live => ("…", colors.text_muted.0),
+                            (None, _) => ("•", colors.text_muted.0),
+                            (Some(_), true) => ("✗", colors.error.0),
+                            (Some(_), false) => ("✓", colors.added.0),
+                        };
+                        let line = RichText::new(format!("{glyph} {name}  {detail}"))
+                            .small()
+                            .monospace()
+                            .color(if *is_error { colors.error.0 } else { c });
+                        match output.as_deref().filter(|o| !o.trim().is_empty()) {
+                            Some(out) => {
+                                egui::CollapsingHeader::new(line)
+                                    .id_salt(("tool", thread_id, id))
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        egui::Frame::new()
+                                            .fill(colors.panel.0)
+                                            .corner_radius(4.0)
+                                            .inner_margin(egui::Margin::same(6))
+                                            .show(ui, |ui| {
+                                                ui.set_width(ui.available_width());
+                                                ui.label(RichText::new(out).small().monospace());
+                                            });
+                                    });
+                            }
+                            None => {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(18.0);
+                                    ui.label(line);
+                                });
+                            }
+                        }
+                    }
+                });
+        });
+    });
+    ui.add_space(2.0);
 }
 
 #[cfg(test)]
@@ -808,6 +1013,40 @@ mod tests {
         g.branch = Some("main".into());
         g.changes = 1;
         assert_eq!(g.flows(), vec![FlowKind::CommitPush, FlowKind::Commit]);
+    }
+
+    fn tool(name: &str, err: bool) -> Message {
+        Message::Tool {
+            id: name.into(),
+            name: name.into(),
+            detail: String::new(),
+            output: Some(String::new()),
+            is_error: err,
+        }
+    }
+
+    #[test]
+    fn consecutive_tools_group_together() {
+        let msgs = vec![
+            Message::User { text: "hi".into() },
+            tool("Read", false),
+            tool("Read", false),
+            tool("Bash", true),
+            Message::Assistant {
+                text: "done".into(),
+            },
+            tool("Edit", false),
+        ];
+        let b = blocks(&msgs);
+        assert_eq!(b.len(), 4);
+        assert!(matches!(b[1], Block::Tools(t) if t.len() == 3));
+        assert_eq!(b[2], Block::Reply("done"));
+        assert!(matches!(b[3], Block::Tools(t) if t.len() == 1));
+        assert_eq!(
+            tool_summary(&msgs[1..4]),
+            "3 tool calls · Read ×2, Bash · 1 failed"
+        );
+        assert_eq!(tool_summary(&msgs[5..]), "1 tool call · Edit");
     }
 
     #[test]

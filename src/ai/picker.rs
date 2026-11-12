@@ -604,6 +604,14 @@ fn reasoning(ui: &mut Ui, choice: &mut ModelChoice, colors: &UiColors) -> bool {
 
 // ---- icons -----------------------------------------------------------------
 
+/// The provider's color, used to mark its replies.
+pub fn provider_color(provider: Provider, colors: &UiColors) -> Color32 {
+    match provider {
+        Provider::Claude => CLAUDE_ORANGE,
+        Provider::Cursor | Provider::Codex => colors.accent.0,
+    }
+}
+
 /// The provider's mark, drawn with shapes so no image assets are needed.
 pub fn provider_icon(painter: &Painter, rect: Rect, provider: Provider, colors: &UiColors) {
     let c = rect.center();
