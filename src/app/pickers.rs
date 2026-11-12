@@ -1,6 +1,9 @@
 //! Quick open (Go to File), the command palette and the theme picker.
 
+use std::path::PathBuf;
+
 use super::ForgeApp;
+use super::session::display_folder;
 use crate::commands::Command;
 use crate::fuzzy::{self, FuzzyMatch};
 use crate::palette::{MAX_ROWS, PickerItem, PickerStyle};
@@ -11,6 +14,7 @@ pub(super) enum PickerMode {
     Files,
     Commands,
     Themes,
+    RecentFolders,
 }
 
 /// Fuzzy-matched file list, cached until the query or the index changes.
@@ -51,6 +55,45 @@ impl ForgeApp {
         self.go_to_line = None;
         self.picker_mode = PickerMode::Themes;
         self.picker.open("");
+    }
+
+    pub(super) fn open_recent_picker(&mut self) {
+        if self.other_recent_folders().is_empty() {
+            self.status = "No recent folders".to_owned();
+            return;
+        }
+        self.go_to_line = None;
+        self.picker_mode = PickerMode::RecentFolders;
+        self.picker.open("");
+    }
+
+    fn recent_folder_items(&self) -> (Vec<PickerItem>, Vec<PathBuf>) {
+        let folders = self.other_recent_folders();
+        let labels: Vec<String> = folders.iter().map(|f| display_folder(f)).collect();
+        let matches: Vec<_> = labels
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| fuzzy::score(&self.picker.query, l).map(|m| (i, m)))
+            .collect();
+        // Keep most-recent-first order until the user types something.
+        let ranked = if self.picker.query.trim().is_empty() {
+            matches
+        } else {
+            rank(matches)
+        };
+        ranked
+            .into_iter()
+            .map(|(i, m)| {
+                (
+                    PickerItem {
+                        label: labels[i].clone(),
+                        detail: String::new(),
+                        highlights: m.indices,
+                    },
+                    folders[i].clone(),
+                )
+            })
+            .unzip()
     }
 
     fn command_items(&self, ctx: &egui::Context) -> (Vec<PickerItem>, Vec<Command>) {
@@ -180,6 +223,15 @@ impl ForgeApp {
                     .show(ctx, "Select a color theme", &items, None, &style)
                 {
                     self.set_theme(ctx, themes[i]);
+                }
+            }
+            PickerMode::RecentFolders => {
+                let (items, folders) = self.recent_folder_items();
+                if let Some(i) = self
+                    .picker
+                    .show(ctx, "Open a recent folder", &items, None, &style)
+                {
+                    self.open_recent_folder(folders[i].clone());
                 }
             }
             PickerMode::Files => {

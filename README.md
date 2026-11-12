@@ -9,6 +9,10 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
 - Activity bar with four sidebar views: **Explorer**, **Search**, **Source Control** and **Pull Requests**
 - File explorer with lazily-loaded directory tree, colored by git status
 - Tabbed editing with unsaved-change indicators
+- Session restore: each folder reopens with the tabs, selected tab and cursor positions it had
+  last time. Starting Forge without a folder argument opens the last folder you used
+  (`forge-ide .` opens the current directory)
+- **File → Open Recent** (or Ctrl+R) lists the last 10 folders you opened
 - Syntax highlighting for many languages (via [syntect](https://github.com/trishume/syntect))
 - Line-number gutter with current-line highlight
 - Cursor line/column in the status bar
