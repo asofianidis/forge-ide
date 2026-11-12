@@ -1,5 +1,5 @@
-//! Line-oriented editing operations: comment toggling, indentation, duplicating
-//! and moving lines, plus bracket matching.
+//! Editing operations: comment toggling, indentation, duplicating and moving
+//! lines, auto-indent and auto-closing pairs while typing, and bracket matching.
 //!
 //! Every operation works on plain text and a selection given as character
 //! indices (what egui's `CCursor` uses), and returns the new text together with
@@ -428,6 +428,171 @@ pub fn move_lines(text: &str, sel: Selection, up: bool) -> Option<Edit> {
     })
 }
 
+// ---- typing -----------------------------------------------------------------
+
+/// Quote characters that auto-close in this language. Languages where `'` is
+/// mostly an apostrophe or a lifetime (prose, Rust, Lisps) don't pair it.
+pub fn auto_close_quotes(extension: &str) -> &'static [char] {
+    match extension.to_ascii_lowercase().as_str() {
+        "js" | "mjs" | "cjs" | "jsx" | "ts" | "mts" | "cts" | "tsx" | "go" | "sh" | "bash"
+        | "zsh" | "sql" => &['"', '\'', '`'],
+        "md" | "markdown" => &['"', '`'],
+        "rs" | "ml" | "mli" | "clj" | "cljs" | "edn" | "lisp" | "el" | "scm" | "rkt" | "tex"
+        | "sty" | "vim" => &['"'],
+        "txt" | "text" | "log" => &[],
+        _ => &['"', '\''],
+    }
+}
+
+fn closer_for(open: char) -> Option<char> {
+    match open {
+        '(' => Some(')'),
+        '[' => Some(']'),
+        '{' => Some('}'),
+        _ => None,
+    }
+}
+
+fn is_closer(c: char) -> bool {
+    matches!(c, ')' | ']' | '}')
+}
+
+/// Languages where a line ending in `:` opens an indented block.
+fn colon_opens_block(extension: &str) -> bool {
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "py" | "pyi" | "nim" | "yaml" | "yml"
+    )
+}
+
+/// Handles typing `ch` over `sel` when it should do more than insert itself:
+/// wrap a selection in brackets or quotes, auto-close an opening bracket or
+/// quote, or step over the closing character that is already there.
+///
+/// Returns `None` when plain insertion is right.
+pub fn type_char(text: &str, sel: Selection, ch: char, quotes: &[char]) -> Option<Edit> {
+    let start = char_to_byte(text, sel.start);
+    let end = char_to_byte(text, sel.end);
+    let before = text[..start].chars().next_back();
+    let after = text[end..].chars().next();
+    let is_quote = quotes.contains(&ch);
+    let close = closer_for(ch).or(is_quote.then_some(ch));
+
+    if !sel.is_empty() {
+        // Wrap the selection, keeping it selected.
+        let close = close?;
+        let mut out = String::with_capacity(text.len() + 2);
+        out.push_str(&text[..start]);
+        out.push(ch);
+        out.push_str(&text[start..end]);
+        out.push(close);
+        out.push_str(&text[end..]);
+        return Some(Edit {
+            text: out,
+            selection: Selection::new(sel.start + 1, sel.end + 1),
+        });
+    }
+
+    // Step over a closer that's already there instead of doubling it, as long
+    // as it actually closes something (so a stray one can still be typed).
+    let steps_over = after == Some(ch)
+        && ((is_closer(ch) && scan_backward(text.as_bytes(), end).is_some()) || is_quote);
+    if steps_over {
+        return Some(Edit {
+            text: text.to_owned(),
+            selection: Selection::caret(sel.start + 1),
+        });
+    }
+
+    let close = close?;
+    // Only auto-close in front of whitespace, a closer or punctuation, so that
+    // typing `(` right before a word doesn't produce `()word`.
+    let room_after = after.is_none_or(|c| c.is_whitespace() || is_closer(c) || ";,.:".contains(c));
+    if !room_after {
+        return None;
+    }
+    // A quote right after a word character is an apostrophe or a string
+    // prefix (`it's`, `r"`), and after the same quote it's ending a string.
+    if is_quote && before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == ch) {
+        return None;
+    }
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push_str(&text[..start]);
+    out.push(ch);
+    out.push(close);
+    out.push_str(&text[end..]);
+    Some(Edit {
+        text: out,
+        selection: Selection::caret(sel.start + 1),
+    })
+}
+
+/// Backspace between an empty pair, as in `(|)`, deletes both characters.
+pub fn backspace_pair(text: &str, sel: Selection, quotes: &[char]) -> Option<Edit> {
+    if !sel.is_empty() {
+        return None;
+    }
+    let at = char_to_byte(text, sel.start);
+    let before = text[..at].chars().next_back()?;
+    let after = text[at..].chars().next()?;
+    let pairs = closer_for(before) == Some(after) || (before == after && quotes.contains(&before));
+    if !pairs {
+        return None;
+    }
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..at - before.len_utf8()]);
+    out.push_str(&text[at + after.len_utf8()..]);
+    Some(Edit {
+        text: out,
+        selection: Selection::caret(sel.start - 1),
+    })
+}
+
+/// Enter: a newline that keeps the current line's indentation, one level
+/// deeper after an opening bracket (or `:` in Python-like languages). Between
+/// a bracket pair, as in `{|}`, the closer moves to its own line.
+pub fn newline(text: &str, sel: Selection, unit: &str, extension: &str) -> Edit {
+    let start = char_to_byte(text, sel.start);
+    let mut end = char_to_byte(text, sel.end);
+    // Whitespace after the caret would end up at the start of the new line,
+    // in front of its indentation, so drop it.
+    end += text[end..].len() - text[end..].trim_start_matches([' ', '\t']).len();
+
+    let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
+    let line_before = &text[line_start..start];
+    let indent = &line_before[..leading_whitespace(line_before)];
+    let trimmed = line_before.trim_end();
+    let last = trimmed.chars().next_back();
+    let opens = last.is_some_and(|c| closer_for(c).is_some())
+        || (last == Some(':') && colon_opens_block(extension));
+    let closes_pair = last
+        .and_then(closer_for)
+        .is_some_and(|close| text[end..].starts_with(close));
+
+    // Keep the text before the caret, minus trailing whitespace (an indented
+    // blank line stays empty rather than keeping its indentation).
+    let mut insert = String::from(trimmed);
+    insert.push('\n');
+    insert.push_str(indent);
+    if opens {
+        insert.push_str(unit);
+    }
+    let caret = line_start + insert.len();
+    if closes_pair {
+        insert.push('\n');
+        insert.push_str(indent);
+    }
+
+    let mut out = String::with_capacity(text.len() + insert.len());
+    out.push_str(&text[..line_start]);
+    out.push_str(&insert);
+    out.push_str(&text[end..]);
+    Edit {
+        selection: Selection::caret(byte_to_char(&out, caret)),
+        text: out,
+    }
+}
+
 /// How far bracket matching scans before giving up, in bytes.
 const BRACKET_SCAN_LIMIT: usize = 200_000;
 
@@ -632,6 +797,89 @@ mod tests {
         assert_eq!(indent_unit("a\n  b\n    c"), "  ");
         assert_eq!(indent_unit("a\n\tb\n\tc\n  d"), "\t");
         assert_eq!(indent_unit("plain"), "    ");
+    }
+
+    const QUOTES: &[char] = &['"', '\''];
+
+    /// Applies `f` to `text` with the caret at `|`, returning the result with
+    /// `|` (or `[..]` for a selection) marking the new selection.
+    fn typed(text: &str, f: impl Fn(&str, Selection) -> Option<Edit>) -> Option<String> {
+        let (text, sel) = parse_marked(text);
+        let e = f(&text, sel)?;
+        let mut out: Vec<char> = e.text.chars().collect();
+        if e.selection.is_empty() {
+            out.insert(e.selection.start, '|');
+        } else {
+            out.insert(e.selection.end, ']');
+            out.insert(e.selection.start, '[');
+        }
+        Some(out.into_iter().collect())
+    }
+
+    fn parse_marked(text: &str) -> (String, Selection) {
+        if let Some(caret) = text.find('|') {
+            let at = text[..caret].chars().count();
+            return (text.replacen('|', "", 1), Selection::caret(at));
+        }
+        let a = text[..text.find('[').unwrap()].chars().count();
+        let b = text[..text.find(']').unwrap()].chars().count() - 1;
+        (text.replacen('[', "", 1).replacen(']', "", 1), sel(a, b))
+    }
+
+    fn ty(text: &str, ch: char) -> Option<String> {
+        typed(text, |t, s| type_char(t, s, ch, QUOTES))
+    }
+
+    #[test]
+    fn brackets_and_quotes_auto_close() {
+        assert_eq!(ty("f|", '(').as_deref(), Some("f(|)"));
+        assert_eq!(ty("x = |;", '[').as_deref(), Some("x = [|];"));
+        assert_eq!(ty("say |", '"').as_deref(), Some("say \"|\""));
+        // Not in front of a word, after a word character, or for other chars.
+        assert_eq!(ty("|word", '('), None);
+        assert_eq!(ty("it|", '\''), None);
+        assert_eq!(ty("a|", 'b'), None);
+        // Quotes the language doesn't pair are plain.
+        assert_eq!(typed(" |", |t, s| type_char(t, s, '\'', &['"'])), None);
+    }
+
+    #[test]
+    fn typing_a_closer_steps_over_it() {
+        assert_eq!(ty("f(|)", ')').as_deref(), Some("f()|"));
+        assert_eq!(ty("\"ab|\"", '"').as_deref(), Some("\"ab\"|"));
+        // An unmatched closer is typed normally.
+        assert_eq!(ty("x|)", ')'), None);
+    }
+
+    #[test]
+    fn typing_wraps_selection() {
+        assert_eq!(ty("a [bc] d", '(').as_deref(), Some("a ([bc]) d"));
+        assert_eq!(ty("[é]", '"').as_deref(), Some("\"[é]\""));
+        assert_eq!(ty("[bc]", 'x'), None);
+    }
+
+    #[test]
+    fn backspace_deletes_empty_pair() {
+        let bs = |t: &str| typed(t, |t, s| backspace_pair(t, s, QUOTES));
+        assert_eq!(bs("f(|)").as_deref(), Some("f|"));
+        assert_eq!(bs("'|'").as_deref(), Some("|"));
+        assert_eq!(bs("f(|x)"), None);
+        assert_eq!(bs("(|]"), None);
+    }
+
+    #[test]
+    fn enter_keeps_and_adds_indentation() {
+        let nl = |t: &str, ext: &str| typed(t, |t, s| Some(newline(t, s, "    ", ext))).unwrap();
+        assert_eq!(nl("    let a = 1;|", "rs"), "    let a = 1;\n    |");
+        assert_eq!(nl("fn f() {|", "rs"), "fn f() {\n    |");
+        assert_eq!(nl("  fn f() {|}", "rs"), "  fn f() {\n      |\n  }");
+        assert_eq!(nl("call(a,|  b)", "rs"), "call(a,\n|b)");
+        assert_eq!(nl("if x:|", "py"), "if x:\n    |");
+        assert_eq!(nl("a:|", "rs"), "a:\n|");
+        // A whitespace-only line doesn't keep its trailing spaces.
+        assert_eq!(nl("x\n    |", "rs"), "x\n\n    |");
+        // Replaces a selection.
+        assert_eq!(nl("  a[bc]d", "rs"), "  a\n  |d");
     }
 
     #[test]

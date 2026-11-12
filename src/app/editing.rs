@@ -1,8 +1,8 @@
-//! Editing commands on the active buffer, cursor/selection access, and the
-//! Go to Line dialog.
+//! Editing commands on the active buffer, typing aids (auto-indent and
+//! auto-closing pairs), cursor/selection access, and the Go to Line dialog.
 
 use egui::text::{CCursor, CCursorRange};
-use egui::{Align2, Key, Modifiers};
+use egui::{Align2, Event, Key, Modifiers};
 
 use super::ForgeApp;
 use crate::commands::Command;
@@ -61,6 +61,63 @@ impl ForgeApp {
         };
         doc.text = edit.text;
         self.set_selection(ctx, edit.selection, true);
+        // Keep the caret in view without re-centering the editor on every edit.
+        self.scroll_to = None;
+        self.reveal = Some(edit.selection.end);
+    }
+
+    /// Typing aids, applied before the editor widget sees the input: Enter
+    /// keeps indentation, brackets and quotes auto-close (or wrap the
+    /// selection), typing a closer steps over it, and Backspace in an empty
+    /// pair deletes both halves. Everything else is left to the widget.
+    pub(super) fn handle_typing(&mut self, ctx: &egui::Context) {
+        if self.active_pane.is_some() || !self.editor_has_focus(ctx) {
+            return;
+        }
+        let events = ctx.input(|i| i.events.clone());
+        let mut removed = 0;
+        for (idx, event) in events.iter().enumerate() {
+            let sel = self.selection(ctx);
+            let Some(doc) = self.documents.get(self.active) else {
+                return;
+            };
+            let ext = doc.language_key();
+            let quotes = ops::auto_close_quotes(&ext);
+            let text = doc.text.as_str();
+            let edit = match event {
+                Event::Text(t) => {
+                    let mut chars = t.chars();
+                    match (chars.next(), chars.next()) {
+                        (Some(c), None) => ops::type_char(text, sel, c, quotes),
+                        _ => None,
+                    }
+                }
+                Event::Key {
+                    key: Key::Enter,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if modifiers.is_none() => {
+                    Some(ops::newline(text, sel, &ops::indent_unit(text), &ext))
+                }
+                Event::Key {
+                    key: Key::Backspace,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if modifiers.is_none() => ops::backspace_pair(text, sel, quotes),
+                _ => None,
+            };
+            if let Some(edit) = edit {
+                ctx.input_mut(|i| i.events.remove(idx - removed));
+                removed += 1;
+                self.apply_edit(ctx, edit);
+            } else if changes_text_or_cursor(event) {
+                // Later events must run after this one, which the widget
+                // handles, so leave them to it too.
+                break;
+            }
+        }
     }
 
     /// Runs one of the line-editing commands on the active buffer.
@@ -177,6 +234,19 @@ impl ForgeApp {
             }
         }
     }
+}
+
+/// Whether the editor widget would act on `event`.
+fn changes_text_or_cursor(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Text(_)
+            | Event::Paste(_)
+            | Event::Cut
+            | Event::Ime(_)
+            | Event::Key { pressed: true, .. }
+            | Event::PointerButton { .. }
+    )
 }
 
 /// Parses "12" or "12:5" (1-based). Column defaults to 1.

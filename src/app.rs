@@ -103,6 +103,8 @@ pub struct ForgeApp {
     go_to_line: Option<String>,
     /// Character index to scroll the editor to on the next frame.
     scroll_to: Option<usize>,
+    /// Character to scroll into view (minimally) after an edit.
+    reveal: Option<usize>,
     /// Unsaved-changes dialog being shown, if any.
     pending_close: Option<PendingClose>,
     /// Unsaved changes were saved or discarded, so the window may close.
@@ -201,6 +203,7 @@ impl ForgeApp {
             file_matches: FileMatches::default(),
             go_to_line: None,
             scroll_to: None,
+            reveal: None,
             pending_close: None,
             allow_close: false,
             last_disk_poll: Instant::now(),
@@ -805,6 +808,7 @@ impl ForgeApp {
             self.close_find(ctx);
         }
         self.handle_tab(ctx);
+        self.handle_typing(ctx);
 
         // Editing shortcuts only apply when typing in the editor, so that
         // e.g. Alt+Up in the find field doesn't move lines.
@@ -1488,6 +1492,7 @@ impl ForgeApp {
         let gutter_width = gutter::width(doc.line_count(), digit_width);
         let current_line = self.cursor.0;
         let mut scroll_to = self.scroll_to.take();
+        let reveal = self.reveal.take();
         let matches: &[Match] = if self.find.open {
             &self.find.matches
         } else {
@@ -1648,6 +1653,9 @@ impl ForgeApp {
                     if let Some(c) = scroll_to {
                         let r = galley.pos_from_cursor(CCursor::new(c)).translate(offset);
                         ui.scroll_to_rect(r.expand(digit_width * 4.0), Some(egui::Align::Center));
+                    } else if let Some(c) = reveal {
+                        let r = galley.pos_from_cursor(CCursor::new(c)).translate(offset);
+                        ui.scroll_to_rect(r.expand(digit_width * 2.0), None);
                     }
                     output
                 })
