@@ -360,7 +360,6 @@ src/
 - [x] Integrated terminal
 - [x] Language server discovery and installation
 - [x] LSP client: diagnostics, hover, go to definition, completion, rename, references, formatting
-- [ ] LSP client (diagnostics, completion, go to definition)
 - [x] Themes
 - [x] Git source control and GitHub pull requests
 - [x] Settings UI
