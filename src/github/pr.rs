@@ -10,7 +10,7 @@ use super::GhEvent;
 use super::list::{check_glyph, label_chip, review_badge, state_color, state_label};
 use super::model::{self, PrDetail, ReviewComment};
 use crate::cli::Cli;
-use crate::git::diff::{self, DiffLine, FileDiff};
+use crate::git::diff::{self, DiffLine, FileDiff, LineKind};
 use crate::task::{self, Pending};
 use crate::theme::UiColors;
 use crate::ui::diff_view::{self, DiffColors, DiffHooks, LineRef, Side, line_anchor};
@@ -63,12 +63,29 @@ struct InlineDraft {
     side: Side,
     line: u32,
     body: String,
+    /// The line's current text, for "Suggest change".
+    line_text: String,
 }
 
 enum Submit {
     Inline(InlineDraft),
     Reply(u64, String),
+    /// Add to the pending review instead of posting now.
+    Pending(InlineDraft),
+    RemovePending(usize),
+    /// Resolve (true) or unresolve a thread by GraphQL id.
+    Resolve(String, bool),
+    ToggleViewed(String, bool),
+    ApplySuggestion {
+        path: String,
+        start: u32,
+        end: u32,
+        text: String,
+    },
 }
+
+/// Label of the review action, so a successful submit clears pending comments.
+const SUBMIT_REVIEW: &str = "Submit review";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Confirm {
@@ -153,6 +170,25 @@ pub struct PrPane {
     /// Running action: label, whether it changes local git state, result.
     action: Option<Action>,
     events: Vec<GhEvent>,
+
+    extra: Option<model::PrExtra>,
+    extra_task: Option<Pending<Result<model::PrExtra, String>>>,
+    /// Edits that don't block other actions (viewed files, labels, …).
+    quiet: Vec<(String, Pending<Result<String, String>>)>,
+    /// Review comments collected before submitting a review.
+    pending: Vec<InlineDraft>,
+    /// Resolved threads the user expanded.
+    expanded_resolved: std::collections::HashSet<u64>,
+    editing_title: Option<String>,
+    editing_body: Option<String>,
+    labels: Option<Vec<model::RepoLabel>>,
+    labels_task: Option<Pending<Vec<model::RepoLabel>>>,
+    milestones: Option<Vec<model::Milestone>>,
+    milestones_task: Option<Pending<Vec<model::Milestone>>>,
+    assignee_input: String,
+    /// Repository root and checked-out branch, for applying suggestions.
+    local_root: Option<std::path::PathBuf>,
+    local_branch: Option<String>,
 }
 
 impl PrPane {
@@ -189,6 +225,20 @@ impl PrPane {
             scroll_to_file: None,
             action: None,
             events: Vec::new(),
+            extra: None,
+            extra_task: None,
+            quiet: Vec::new(),
+            pending: Vec::new(),
+            expanded_resolved: Default::default(),
+            editing_title: None,
+            editing_body: None,
+            labels: None,
+            labels_task: None,
+            milestones: None,
+            milestones_task: None,
+            assignee_input: String::new(),
+            local_root: None,
+            local_branch: None,
         };
         pane.reload();
         pane
@@ -215,8 +265,172 @@ impl PrPane {
             serde_json::from_str(&out).map_err(|e| format!("unexpected response from gh: {e}"))
         }));
         self.load_comments();
+        self.load_extra();
         if self.diff.is_some() || self.tab == Tab::Files {
             self.load_diff();
+        }
+    }
+
+    /// Thread ids/resolution and viewed files (GraphQL only).
+    fn load_extra(&mut self) {
+        let cli = self.cli.clone();
+        let n = format!("n={}", self.number);
+        self.extra_task = Some(Pending::spawn(&self.ctx, move || {
+            let query = format!("query={}", model::EXTRA_QUERY);
+            let out = cli.run(&[
+                "api",
+                "graphql",
+                "-f",
+                &query,
+                "-F",
+                "owner={owner}",
+                "-F",
+                "repo={repo}",
+                "-F",
+                &n,
+            ])?;
+            model::parse_pr_extra(&out)
+        }));
+    }
+
+    /// Where this PR could be applied locally (for suggestions).
+    pub fn set_local(&mut self, root: Option<&std::path::Path>, branch: Option<String>) {
+        self.local_root = root.map(std::path::Path::to_path_buf);
+        self.local_branch = branch;
+    }
+
+    /// Whether the PR's branch is checked out here, so suggestions can be
+    /// applied to the working tree.
+    fn can_apply_suggestions(&self) -> bool {
+        self.local_root.is_some()
+            && self
+                .detail
+                .as_ref()
+                .is_some_and(|d| Some(&d.head_ref_name) == self.local_branch.as_ref())
+    }
+
+    /// Runs a command without blocking other actions; refreshes when done.
+    fn quiet(
+        &mut self,
+        label: &str,
+        work: impl FnOnce(&Cli) -> Result<String, String> + Send + 'static,
+    ) {
+        let cli = self.cli.clone();
+        self.quiet.push((
+            label.to_owned(),
+            Pending::spawn(&self.ctx, move || work(&cli)),
+        ));
+    }
+
+    fn quiet_args(&mut self, label: &str, args: Vec<String>) {
+        self.quiet(label, move |cli| cli.run(&args));
+    }
+
+    fn graphql(&mut self, label: &str, mutation: &'static str, vars: Vec<(&'static str, String)>) {
+        self.quiet(label, move |cli| {
+            let mut args = vec![
+                "api".to_owned(),
+                "graphql".to_owned(),
+                "-f".to_owned(),
+                format!("query={mutation}"),
+            ];
+            for (k, v) in vars {
+                args.extend(["-f".to_owned(), format!("{k}={v}")]);
+            }
+            cli.run(&args)
+        });
+    }
+
+    fn resolve_thread(&mut self, thread: String, resolve: bool) {
+        if let Some(extra) = &mut self.extra {
+            for (tid, resolved) in extra.threads.values_mut() {
+                if *tid == thread {
+                    *resolved = resolve;
+                }
+            }
+        }
+        let (label, m) = if resolve {
+            (
+                "Resolve conversation",
+                "mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{isResolved}}}",
+            )
+        } else {
+            (
+                "Unresolve conversation",
+                "mutation($id:ID!){unresolveReviewThread(input:{threadId:$id}){thread{isResolved}}}",
+            )
+        };
+        self.graphql(label, m, vec![("id", thread)]);
+    }
+
+    fn set_viewed(&mut self, path: String, viewed: bool) {
+        let Some(extra) = &mut self.extra else { return };
+        let pr = extra.pr_id.clone();
+        if viewed {
+            extra.viewed.insert(path.clone());
+        } else {
+            extra.viewed.remove(&path);
+        }
+        let m = if viewed {
+            "mutation($pr:ID!,$path:String!){markFileAsViewed(input:{pullRequestId:$pr,path:$path}){clientMutationId}}"
+        } else {
+            "mutation($pr:ID!,$path:String!){unmarkFileAsViewed(input:{pullRequestId:$pr,path:$path}){clientMutationId}}"
+        };
+        self.graphql("", m, vec![("pr", pr), ("path", path)]);
+    }
+
+    /// Replaces lines `start..=end` of the local file with a suggestion.
+    fn apply_suggestion(&mut self, path: &str, start: u32, end: u32, text: &str) {
+        let Some(root) = &self.local_root else { return };
+        let file = root.join(path);
+        let result = std::fs::read_to_string(&file)
+            .map_err(|e| e.to_string())
+            .and_then(|content| replace_lines(&content, start, end, text))
+            .and_then(|new| std::fs::write(&file, new).map_err(|e| e.to_string()));
+        match result {
+            Ok(()) => {
+                self.events.push(GhEvent::Done(format!(
+                    "Applied suggestion to {path}; commit and push to update the PR"
+                )));
+                self.events.push(GhEvent::GitChanged);
+            }
+            Err(e) => self
+                .events
+                .push(GhEvent::Failed(format!("Could not apply suggestion: {e}"))),
+        }
+    }
+
+    fn ensure_labels(&mut self) {
+        if self.labels.is_none() && self.labels_task.is_none() {
+            let cli = self.cli.clone();
+            self.labels_task = Some(Pending::spawn(&self.ctx, move || {
+                cli.run(&[
+                    "label",
+                    "list",
+                    "--limit",
+                    "200",
+                    "--json",
+                    "name,color,description",
+                ])
+                .ok()
+                .and_then(|o| serde_json::from_str(&o).ok())
+                .unwrap_or_default()
+            }));
+        }
+    }
+
+    fn ensure_milestones(&mut self) {
+        if self.milestones.is_none() && self.milestones_task.is_none() {
+            let cli = self.cli.clone();
+            self.milestones_task = Some(Pending::spawn(&self.ctx, move || {
+                cli.run(&[
+                    "api",
+                    "repos/{owner}/{repo}/milestones?state=open&per_page=100",
+                ])
+                .ok()
+                .and_then(|o| serde_json::from_str(&o).ok())
+                .unwrap_or_default()
+            }));
         }
     }
 
@@ -319,6 +533,47 @@ impl PrPane {
         if let Some(people) = task::poll(&mut self.people_task) {
             self.people = Some(people);
         }
+        if let Some(Ok(extra)) = task::poll(&mut self.extra_task) {
+            self.extra = Some(extra);
+        }
+        if let Some(labels) = task::poll(&mut self.labels_task) {
+            self.labels = Some(labels);
+        }
+        if let Some(m) = task::poll(&mut self.milestones_task) {
+            self.milestones = Some(m);
+        }
+        let mut done = Vec::new();
+        self.quiet.retain(|(label, t)| match t.try_take() {
+            Some(r) => {
+                done.push((label.clone(), r));
+                false
+            }
+            None => true,
+        });
+        if !done.is_empty() {
+            for (label, r) in done {
+                match r {
+                    Ok(_) if label.is_empty() => {}
+                    Ok(_) => self.events.push(GhEvent::Done(format!("{label}: done"))),
+                    Err(e) => self.events.push(GhEvent::Failed(format!(
+                        "{} failed: {e}",
+                        if label.is_empty() { "Update" } else { &label }
+                    ))),
+                }
+            }
+            if self.quiet.is_empty() {
+                // Re-read what changed without reloading the diff.
+                let cli = self.cli.clone();
+                let n = self.number.to_string();
+                self.detail_task = Some(Pending::spawn(&self.ctx, move || {
+                    let out = cli.run(&["pr", "view", &n, "--json", model::DETAIL_FIELDS])?;
+                    serde_json::from_str(&out)
+                        .map_err(|e| format!("unexpected response from gh: {e}"))
+                }));
+                self.load_extra();
+                self.events.push(GhEvent::PrsChanged);
+            }
+        }
         if let Some(Ok(comments)) = task::poll(&mut self.comments_task) {
             self.threads = Threads::build(&comments);
             self.comments = comments;
@@ -332,7 +587,12 @@ impl PrPane {
             && let Some(result) = pending.try_take()
         {
             match result {
-                Ok(_) => self.events.push(GhEvent::Done(format!("{label}: done"))),
+                Ok(_) => {
+                    if label == SUBMIT_REVIEW {
+                        self.pending.clear();
+                    }
+                    self.events.push(GhEvent::Done(format!("{label}: done")));
+                }
                 Err(e) => self
                     .events
                     .push(GhEvent::Failed(format!("{label} failed: {e}"))),
@@ -349,6 +609,10 @@ impl PrPane {
     // ---- actions ---------------------------------------------------------
 
     fn submit_review(&mut self) {
+        if !self.pending.is_empty() {
+            self.submit_review_with_comments();
+            return;
+        }
         let n = self.number.to_string();
         let body = std::mem::take(&mut self.review_body);
         let (flag, label) = match self.review_kind {
@@ -362,6 +626,44 @@ impl PrPane {
             } else {
                 cli.run_with_input(&["pr", "review", &n, flag, "--body-file", "-"], &body)
             }
+        });
+    }
+
+    /// Submits the pending inline comments together with the review.
+    fn submit_review_with_comments(&mut self) {
+        let Some(oid) = self.detail.as_ref().map(|d| d.head_ref_oid.clone()) else {
+            return;
+        };
+        let event = match self.review_kind {
+            ReviewKind::Comment => "COMMENT",
+            ReviewKind::Approve => "APPROVE",
+            ReviewKind::RequestChanges => "REQUEST_CHANGES",
+        };
+        let comments: Vec<serde_json::Value> = self
+            .pending
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "path": p.path,
+                    "line": p.line,
+                    "side": p.side.api_name(),
+                    "body": p.body,
+                })
+            })
+            .collect();
+        let payload = serde_json::json!({
+            "commit_id": oid,
+            "body": std::mem::take(&mut self.review_body),
+            "event": event,
+            "comments": comments,
+        })
+        .to_string();
+        let path = format!("repos/{{owner}}/{{repo}}/pulls/{}/reviews", self.number);
+        self.run(SUBMIT_REVIEW, false, move |cli| {
+            cli.run_with_input(
+                &["api", "--method", "POST", &path, "--input", "-"],
+                &payload,
+            )
         });
     }
 
@@ -477,14 +779,41 @@ impl PrPane {
     }
 
     fn header(&mut self, ui: &mut Ui, d: &PrDetail, colors: &UiColors) {
+        let mut save_title = None;
         ui.horizontal(|ui| {
+            if let Some(title) = &mut self.editing_title {
+                ui.add(
+                    egui::TextEdit::singleline(title)
+                        .font(egui::FontId::proportional(17.0))
+                        .desired_width(ui.available_width() - 140.0),
+                );
+                if ui.button("Save").clicked() && !title.trim().is_empty() {
+                    save_title = Some(title.trim().to_owned());
+                }
+                if ui.button("Cancel").clicked() {
+                    self.editing_title = None;
+                }
+                return;
+            }
             ui.label(RichText::new(&d.title).size(19.0).strong());
             ui.label(
                 RichText::new(format!("#{}", d.number))
                     .size(19.0)
                     .color(colors.text_muted.0),
             );
+            if ui
+                .small_button("Edit")
+                .on_hover_text("Edit the title")
+                .clicked()
+            {
+                self.editing_title = Some(d.title.clone());
+            }
         });
+        if let Some(title) = save_title {
+            self.editing_title = None;
+            let args = self.args(&["edit", "--title", &title]);
+            self.quiet_args("Edit title", args);
+        }
         ui.horizontal_wrapped(|ui| {
             let color = state_color(&d.state, d.is_draft, colors);
             egui::Frame::new()
@@ -605,8 +934,12 @@ impl PrPane {
     }
 
     fn review_button(&mut self, ui: &mut Ui, d: &PrDetail, colors: &UiColors) {
+        let label = match self.pending.len() {
+            0 => "Review changes ▾".to_owned(),
+            n => format!("Finish review ({n}) ▾"),
+        };
         let button = ui.add(
-            egui::Button::new(RichText::new("Review changes ▾").color(colors.accent_text.0))
+            egui::Button::new(RichText::new(label).color(colors.accent_text.0))
                 .fill(colors.accent.0),
         );
         egui::Popup::menu(&button)
@@ -638,7 +971,18 @@ impl PrPane {
                 if own && self.review_kind != ReviewKind::Comment {
                     self.review_kind = ReviewKind::Comment;
                 }
-                let needs_body = self.review_kind != ReviewKind::Approve;
+                let pending = self.pending.len();
+                if pending > 0 {
+                    ui.label(
+                        RichText::new(format!(
+                            "{pending} pending comment(s) will be submitted with this review"
+                        ))
+                        .small()
+                        .color(colors.warning.0),
+                    );
+                }
+                // A review with inline comments may have an empty summary.
+                let needs_body = self.review_kind != ReviewKind::Approve && pending == 0;
                 let ok = !needs_body || !self.review_body.trim().is_empty();
                 ui.horizontal(|ui| {
                     if ui
@@ -724,11 +1068,109 @@ impl PrPane {
         if d.assignees.is_empty() {
             ui.label(RichText::new("No one").weak().small());
         }
+        let mut remove_assignee = None;
         for a in &d.assignees {
-            ui.label(a.display());
+            ui.horizontal(|ui| {
+                ui.label(a.display());
+                if ui.small_button("×").on_hover_text("Unassign").clicked() {
+                    remove_assignee = Some(a.login.clone());
+                }
+            });
         }
+        let mut add_assignee = None;
+        if !self.me.is_empty()
+            && !d.assignees.iter().any(|a| a.login == self.me)
+            && ui.link(RichText::new("Assign yourself").small()).clicked()
+        {
+            add_assignee = Some(self.me.clone());
+        }
+        ui.add(
+            egui::TextEdit::singleline(&mut self.assignee_input)
+                .hint_text("Assign: search people")
+                .desired_width(f32::INFINITY),
+        );
+        if !self.assignee_input.trim().is_empty() {
+            if self.people.is_none() && self.people_task.is_none() {
+                self.load_people();
+            }
+            let exclude: Vec<&str> = d.assignees.iter().map(|a| a.login.as_str()).collect();
+            if let Some(people) = &self.people {
+                for p in model::search_people(people, &self.assignee_input, &exclude)
+                    .into_iter()
+                    .take(5)
+                {
+                    if ui
+                        .add(
+                            egui::Button::new(&p.login)
+                                .right_text(RichText::new(p.detail()).small().weak())
+                                .frame(false),
+                        )
+                        .clicked()
+                    {
+                        add_assignee = Some(p.login.clone());
+                    }
+                }
+            }
+        }
+        if let Some(login) = add_assignee {
+            self.assignee_input.clear();
+            let args = self.args(&["edit", "--add-assignee", &login]);
+            self.quiet_args(&format!("Assign {login}"), args);
+        }
+        if let Some(login) = remove_assignee {
+            let args = self.args(&["edit", "--remove-assignee", &login]);
+            self.quiet_args(&format!("Unassign {login}"), args);
+        }
+
         ui.add_space(8.0);
-        heading(ui, "Labels");
+        ui.horizontal(|ui| {
+            heading(ui, "Labels");
+            let edit = ui.small_button("Edit");
+            if edit.clicked() {
+                self.ensure_labels();
+            }
+            egui::Popup::menu(&edit)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .show(|ui| {
+                    ui.set_min_width(320.0);
+                    let Some(all) = self.labels.clone() else {
+                        ui.spinner();
+                        return;
+                    };
+                    if all.is_empty() {
+                        ui.label(RichText::new("This repository has no labels").weak());
+                    }
+                    let height = (all.len() as f32 * 26.0).min(300.0);
+                    egui::ScrollArea::vertical()
+                        .max_height(300.0)
+                        .min_scrolled_height(height)
+                        .show(ui, |ui| {
+                            for l in &all {
+                                let on = d.labels.iter().any(|x| x.name == l.name);
+                                let row = ui
+                                    .horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(if on { "✔" } else { " " })
+                                                .monospace()
+                                                .color(colors.accent.0),
+                                        );
+                                        label_chip(ui, &l.name, &l.color);
+                                        if !l.description.is_empty() {
+                                            ui.label(RichText::new(&l.description).small().weak());
+                                        }
+                                    })
+                                    .response
+                                    .interact(egui::Sense::click())
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                if row.clicked() {
+                                    let flag = if on { "--remove-label" } else { "--add-label" };
+                                    let args = self.args(&["edit", flag, &l.name]);
+                                    self.quiet_args(&format!("Label {}", l.name), args);
+                                }
+                            }
+                        });
+                });
+        });
         if d.labels.is_empty() {
             ui.label(RichText::new("None yet").weak().small());
         }
@@ -737,6 +1179,37 @@ impl PrPane {
                 label_chip(ui, &l.name, &l.color);
             }
         });
+
+        ui.add_space(8.0);
+        heading(ui, "Milestone");
+        self.ensure_milestones();
+        let current = d.milestone.as_ref().map(|m| m.title.clone());
+        let mut pick: Option<Option<String>> = None;
+        egui::ComboBox::from_id_salt(("milestone", d.number))
+            .selected_text(current.clone().unwrap_or_else(|| "None".to_owned()))
+            .width(ui.available_width() - 8.0)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(current.is_none(), "None").clicked() {
+                    pick = Some(None);
+                }
+                for m in self.milestones.iter().flatten() {
+                    if ui
+                        .selectable_label(current.as_deref() == Some(m.title.as_str()), &m.title)
+                        .clicked()
+                    {
+                        pick = Some(Some(m.title.clone()));
+                    }
+                }
+            });
+        if let Some(choice) = pick
+            && choice != current
+        {
+            let args = match &choice {
+                Some(t) => self.args(&["edit", "--milestone", t]),
+                None => self.args(&["edit", "--remove-milestone"]),
+            };
+            self.quiet_args("Set milestone", args);
+        }
     }
 
     /// Search box listing repository contributors and users with access;
@@ -856,7 +1329,36 @@ impl PrPane {
             &format!("opened {}", fmt::relative_iso(&d.created_at)),
             None,
             |ui| {
-                markdown::show(ui, &d.body);
+                let mut save = None;
+                let mut cancel = false;
+                if let Some(body) = &mut self.editing_body {
+                    ui.add(
+                        egui::TextEdit::multiline(body)
+                            .desired_rows(10)
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            save = Some(body.clone());
+                        }
+                        cancel = ui.button("Cancel").clicked();
+                    });
+                    if cancel {
+                        self.editing_body = None;
+                    }
+                } else {
+                    markdown::show(ui, &d.body);
+                    if ui.small_button("Edit description").clicked() {
+                        self.editing_body = Some(d.body.clone());
+                    }
+                }
+                if let Some(body) = save {
+                    self.editing_body = None;
+                    let n = self.number.to_string();
+                    self.quiet("Edit description", move |cli| {
+                        cli.run_with_input(&["pr", "edit", &n, "--body-file", "-"], &body)
+                    });
+                }
             },
         );
 
@@ -978,6 +1480,7 @@ impl PrPane {
         if d.status_check_rollup.is_empty() {
             return;
         }
+        let mut rerun = None;
         boxed(ui, colors, |ui| {
             let outcome = model::rollup(&d.status_check_rollup);
             if let Some(o) = outcome {
@@ -1007,11 +1510,41 @@ impl PrPane {
                     if !c.url().is_empty() {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.hyperlink_to("Details", c.url());
+                            if let Some((run, job)) = model::actions_job(c.url()) {
+                                let failed = c.outcome() == model::CheckOutcome::Fail;
+                                if failed
+                                    && ui
+                                        .small_button("Re-run failed")
+                                        .on_hover_text(
+                                            "Re-run the failed jobs of this workflow run",
+                                        )
+                                        .clicked()
+                                {
+                                    rerun = Some(run);
+                                }
+                                if ui
+                                    .small_button(if failed { "Failed log" } else { "Log" })
+                                    .on_hover_text("Show the job's log in a tab")
+                                    .clicked()
+                                {
+                                    self.events.push(GhEvent::OpenLog {
+                                        title: format!("Log: {}", c.title()),
+                                        run,
+                                        job,
+                                        failed_only: failed,
+                                    });
+                                }
+                            }
                         });
                     }
                 });
             }
         });
+        if let Some(run) = rerun {
+            self.quiet("Re-run failed jobs", move |cli| {
+                cli.run(&["run", "rerun", &run.to_string(), "--failed"])
+            });
+        }
     }
 
     fn merge_box(&mut self, ui: &mut Ui, d: &PrDetail, colors: &UiColors) {
@@ -1186,14 +1719,21 @@ impl PrPane {
             }
             return;
         };
+        let viewed = self
+            .extra
+            .as_ref()
+            .map(|e| e.viewed.clone())
+            .unwrap_or_default();
+        let mut submit = None;
         egui::Panel::left(egui::Id::unique(("pr_file_list", self.number)))
             .resizable(true)
-            .default_size(230.0)
+            .default_size(240.0)
             .show(ui, |ui| {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
+                    let seen = files.iter().filter(|f| viewed.contains(f.path())).count();
                     ui.label(
-                        RichText::new(format!("{} files", files.len()))
+                        RichText::new(format!("{} files · {seen} viewed", files.len()))
                             .small()
                             .strong()
                             .color(colors.text_muted.0),
@@ -1212,7 +1752,14 @@ impl PrPane {
                                 .keys()
                                 .filter(|(p, _, _)| p == f.path())
                                 .count();
+                            let is_viewed = viewed.contains(f.path());
                             ui.horizontal(|ui| {
+                                let mut v = is_viewed;
+                                if ui.checkbox(&mut v, "").on_hover_text("Viewed").changed()
+                                    && self.extra.is_some()
+                                {
+                                    submit = Some(Submit::ToggleViewed(f.path().to_owned(), v));
+                                }
                                 let dc = DiffColors::from_theme(colors);
                                 ui.label(
                                     RichText::new(diff_view::status_letter(f.status))
@@ -1220,9 +1767,14 @@ impl PrPane {
                                         .color(diff_view::status_color(f.status, &dc)),
                                 );
                                 let name = f.path().rsplit('/').next().unwrap_or(f.path());
+                                let text = if is_viewed {
+                                    RichText::new(name).color(colors.text_muted.0)
+                                } else {
+                                    RichText::new(name)
+                                };
                                 if ui
                                     .add(
-                                        egui::Label::new(name)
+                                        egui::Label::new(text)
                                             .truncate()
                                             .sense(egui::Sense::click()),
                                     )
@@ -1242,8 +1794,23 @@ impl PrPane {
 
         // GitHub accepts review comments on open, closed and merged PRs.
         let can_comment = true;
-        let mut submit = None;
         let scroll_to = self.scroll_to_file.take();
+        let can_apply = self.can_apply_suggestions();
+        if !self.pending.is_empty() {
+            egui::Frame::new()
+                .fill(colors.warning.0.gamma_multiply(0.12))
+                .inner_margin(egui::Margin::symmetric(10, 4))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(
+                        RichText::new(format!(
+                            "{} pending review comment(s). Submit them with “Finish review” above.",
+                            self.pending.len()
+                        ))
+                        .color(colors.warning.0),
+                    );
+                });
+        }
         egui::ScrollArea::both()
             .id_salt(("pr_diff", self.number))
             .auto_shrink(false)
@@ -1252,11 +1819,16 @@ impl PrPane {
                 let mut hooks = FilesHooks {
                     comments: &self.comments,
                     threads: &self.threads,
+                    extra: self.extra.as_ref(),
+                    pending: &self.pending,
+                    expanded: &mut self.expanded_resolved,
                     inline: &mut self.inline,
                     reply: &mut self.reply,
                     submit: &mut submit,
                     colors,
                     can_comment,
+                    can_apply,
+                    viewed: &viewed,
                     busy: self.action.is_some(),
                 };
                 let id = ui.make_persistent_id(("pr_files", self.number));
@@ -1272,6 +1844,22 @@ impl PrPane {
         match submit {
             Some(Submit::Inline(draft)) => self.submit_inline(draft),
             Some(Submit::Reply(root, body)) => self.submit_reply(root, body),
+            Some(Submit::Pending(draft)) => self.pending.push(draft),
+            Some(Submit::RemovePending(i)) => {
+                if i < self.pending.len() {
+                    self.pending.remove(i);
+                }
+            }
+            Some(Submit::Resolve(thread, resolve)) => self.resolve_thread(thread, resolve),
+            Some(Submit::ToggleViewed(path, v)) => self.set_viewed(path, v),
+            Some(Submit::ApplySuggestion {
+                path,
+                start,
+                end,
+                text,
+            }) => {
+                self.apply_suggestion(&path, start, end, &text);
+            }
             None => {}
         }
     }
@@ -1341,103 +1929,231 @@ impl PrPane {
     }
 }
 
-/// Inline comment threads and the comment composer inside the diff.
+/// Inline comment threads, pending review comments, suggestions and the
+/// comment composer inside the diff.
 struct FilesHooks<'a> {
     comments: &'a [ReviewComment],
     threads: &'a Threads,
+    extra: Option<&'a model::PrExtra>,
+    pending: &'a [InlineDraft],
+    expanded: &'a mut std::collections::HashSet<u64>,
     inline: &'a mut Option<InlineDraft>,
     reply: &'a mut Option<(u64, String)>,
     submit: &'a mut Option<Submit>,
     colors: &'a UiColors,
     can_comment: bool,
+    can_apply: bool,
+    viewed: &'a std::collections::HashSet<String>,
     busy: bool,
 }
 
+fn thread_frame(colors: &UiColors, stroke: Color32) -> egui::Frame {
+    egui::Frame::new()
+        .fill(colors.surface.0)
+        .stroke(egui::Stroke::new(1.0, stroke))
+        .corner_radius(6)
+        .inner_margin(10)
+        .outer_margin(egui::Margin {
+            left: 60,
+            right: 8,
+            top: 4,
+            bottom: 6,
+        })
+}
+
 impl FilesHooks<'_> {
-    fn thread(&mut self, ui: &mut Ui, root_idx: usize, outdated: bool) {
+    fn thread(&mut self, ui: &mut Ui, root_idx: usize, outdated: bool, file: Option<&FileDiff>) {
         let root = &self.comments[root_idx];
         let colors = self.colors;
-        let width = ui.available_width().min(760.0);
-        egui::Frame::new()
-            .fill(colors.surface.0)
-            .stroke(egui::Stroke::new(1.0, colors.border.0))
-            .corner_radius(6)
-            .inner_margin(10)
-            .outer_margin(egui::Margin {
-                left: 60,
-                right: 8,
-                top: 4,
-                bottom: 6,
-            })
-            .show(ui, |ui| {
+        // Wide diffs scroll horizontally; size cards to what's visible.
+        let width = ui.clip_rect().width().min(760.0);
+        let info = self.extra.and_then(|e| e.threads.get(&root.id)).cloned();
+        let resolved = info.as_ref().is_some_and(|(_, r)| *r);
+        let replies = self
+            .threads
+            .replies
+            .get(&root.id)
+            .cloned()
+            .unwrap_or_default();
+        if resolved && !self.expanded.contains(&root.id) {
+            thread_frame(colors, colors.border.0).show(ui, |ui| {
                 ui.set_width(width - 90.0);
-                ui.spacing_mut().item_spacing.y = 4.0;
-                if outdated {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("✔ Resolved").color(colors.added.0).strong());
                     ui.label(
                         RichText::new(format!(
-                            "Outdated · originally line {}",
-                            root.original_line.map_or("?".to_owned(), |l| l.to_string())
+                            "{} · {} comment(s)",
+                            root.user.login,
+                            replies.len() + 1
                         ))
                         .small()
-                        .color(colors.warning.0),
+                        .color(colors.text_muted.0),
                     );
-                }
-                let replies = self
-                    .threads
-                    .replies
-                    .get(&root.id)
-                    .cloned()
-                    .unwrap_or_default();
-                for idx in std::iter::once(root_idx).chain(replies) {
-                    let c = &self.comments[idx];
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(&c.user.login).strong());
-                        ui.label(
-                            RichText::new(fmt::relative_iso(&c.created_at))
-                                .small()
-                                .color(colors.text_muted.0),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if !c.html_url.is_empty()
-                                && icons::button_sized(ui, Icon::External, "Open on GitHub", 18.0)
-                                    .clicked()
-                            {
-                                ui.ctx().open_url(egui::OpenUrl::new_tab(&c.html_url));
-                            }
-                        });
+                    if ui.small_button("Show").clicked() {
+                        self.expanded.insert(root.id);
+                    }
+                    if let Some((tid, _)) = &info
+                        && ui.small_button("Unresolve").clicked()
+                    {
+                        *self.submit = Some(Submit::Resolve(tid.clone(), false));
+                    }
+                });
+            });
+            return;
+        }
+        thread_frame(colors, colors.border.0).show(ui, |ui| {
+            ui.set_width(width - 90.0);
+            ui.spacing_mut().item_spacing.y = 4.0;
+            if outdated {
+                ui.label(
+                    RichText::new(format!(
+                        "Outdated · originally line {}",
+                        root.original_line.map_or("?".to_owned(), |l| l.to_string())
+                    ))
+                    .small()
+                    .color(colors.warning.0),
+                );
+            }
+            for idx in std::iter::once(root_idx).chain(replies) {
+                let c = &self.comments[idx];
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&c.user.login).strong());
+                    ui.label(
+                        RichText::new(fmt::relative_iso(&c.created_at))
+                            .small()
+                            .color(colors.text_muted.0),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if !c.html_url.is_empty()
+                            && icons::button_sized(ui, Icon::External, "Open on GitHub", 18.0)
+                                .clicked()
+                        {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(&c.html_url));
+                        }
                     });
-                    markdown::show(ui, &c.body);
-                    ui.add_space(2.0);
+                });
+                let (parts, tail) = model::split_suggestions(&c.body);
+                for (before, suggestion) in &parts {
+                    if !before.trim().is_empty() {
+                        markdown::show(ui, before);
+                    }
+                    self.suggestion(ui, c, suggestion, file);
                 }
-                let replying = self.reply.as_ref().is_some_and(|(id, _)| *id == root.id);
-                if replying {
-                    let mut send = false;
-                    let mut cancel = false;
-                    if let Some((_, body)) = self.reply.as_mut() {
-                        ui.add(
-                            egui::TextEdit::multiline(body)
-                                .hint_text("Reply…")
-                                .desired_rows(3)
-                                .desired_width(f32::INFINITY),
-                        );
-                        ui.horizontal(|ui| {
-                            send = ui
-                                .add_enabled(
-                                    !body.trim().is_empty() && !self.busy,
-                                    egui::Button::new("Reply"),
-                                )
-                                .clicked();
-                            cancel = ui.button("Cancel").clicked();
-                        });
+                if !tail.trim().is_empty() || parts.is_empty() {
+                    markdown::show(ui, &tail);
+                }
+                ui.add_space(2.0);
+            }
+            let replying = self.reply.as_ref().is_some_and(|(id, _)| *id == root.id);
+            if replying {
+                let mut send = false;
+                let mut cancel = false;
+                if let Some((_, body)) = self.reply.as_mut() {
+                    ui.add(
+                        egui::TextEdit::multiline(body)
+                            .hint_text("Reply…")
+                            .desired_rows(3)
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.horizontal(|ui| {
+                        send = ui
+                            .add_enabled(
+                                !body.trim().is_empty() && !self.busy,
+                                egui::Button::new("Reply"),
+                            )
+                            .clicked();
+                        cancel = ui.button("Cancel").clicked();
+                    });
+                }
+                if send && let Some((id, body)) = self.reply.take() {
+                    *self.submit = Some(Submit::Reply(id, body));
+                }
+                if cancel {
+                    *self.reply = None;
+                }
+            } else {
+                ui.horizontal(|ui| {
+                    if ui.button("Reply…").clicked() {
+                        *self.reply = Some((root.id, String::new()));
                     }
-                    if send && let Some((id, body)) = self.reply.take() {
-                        *self.submit = Some(Submit::Reply(id, body));
+                    if let Some((tid, resolved)) = &info {
+                        if !resolved && ui.button("Resolve conversation").clicked() {
+                            *self.submit = Some(Submit::Resolve(tid.clone(), true));
+                        }
+                        if *resolved {
+                            if ui.button("Unresolve").clicked() {
+                                *self.submit = Some(Submit::Resolve(tid.clone(), false));
+                            }
+                            if ui.button("Hide").clicked() {
+                                self.expanded.remove(&root.id);
+                            }
+                        }
                     }
-                    if cancel {
-                        *self.reply = None;
-                    }
-                } else if ui.button("Reply…").clicked() {
-                    *self.reply = Some((root.id, String::new()));
+                });
+            }
+        });
+    }
+
+    /// A ```suggestion block: the lines it replaces and the new ones.
+    fn suggestion(&mut self, ui: &mut Ui, c: &ReviewComment, text: &str, file: Option<&FileDiff>) {
+        let colors = self.colors;
+        let end = c.line;
+        let start = c.start_line.or(c.line);
+        let original: Vec<String> = match (file, start, end) {
+            (Some(f), Some(s), Some(e)) if c.side != "LEFT" => f
+                .hunks
+                .iter()
+                .flat_map(|h| &h.lines)
+                .filter(|l| {
+                    l.kind != LineKind::Removed && l.new_no.is_some_and(|n| n >= s && n <= e)
+                })
+                .map(|l| l.text.clone())
+                .collect(),
+            _ => Vec::new(),
+        };
+        egui::Frame::new()
+            .stroke(egui::Stroke::new(1.0, colors.border.0))
+            .corner_radius(4)
+            .inner_margin(6)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Suggested change").small().strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let applicable = self.can_apply && start.is_some() && c.side != "LEFT";
+                        let tip = if applicable {
+                            "Replace these lines in your working copy"
+                        } else {
+                            "Check out this pull request's branch to apply suggestions"
+                        };
+                        if ui
+                            .add_enabled(applicable, egui::Button::new("Apply suggestion").small())
+                            .on_hover_text(tip)
+                            .on_disabled_hover_text(tip)
+                            .clicked()
+                            && let (Some(s), Some(e)) = (start, end)
+                        {
+                            *self.submit = Some(Submit::ApplySuggestion {
+                                path: c.path.clone(),
+                                start: s,
+                                end: e,
+                                text: text.to_owned(),
+                            });
+                        }
+                    });
+                });
+                let mono = |t: &str, sign: &str, bg: Color32, ui: &mut Ui| {
+                    egui::Frame::new().fill(bg).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(RichText::new(format!("{sign} {t}")).monospace());
+                    });
+                };
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for l in &original {
+                    mono(l, "−", colors.deleted.0.gamma_multiply(0.16), ui);
+                }
+                for l in text.split('\n') {
+                    mono(l, "+", colors.added.0.gamma_multiply(0.16), ui);
                 }
             });
     }
@@ -1460,8 +2176,19 @@ impl DiffHooks for FilesHooks<'_> {
                     side,
                     line: n,
                     body: String::new(),
+                    line_text: line.text.trim_end_matches('\r').to_owned(),
                 });
             }
+        }
+    }
+
+    fn file_actions(&mut self, ui: &mut Ui, _idx: usize, file: &FileDiff) {
+        if self.extra.is_none() {
+            return;
+        }
+        let mut v = self.viewed.contains(file.path());
+        if ui.checkbox(&mut v, "Viewed").changed() {
+            *self.submit = Some(Submit::ToggleViewed(file.path().to_owned(), v));
         }
     }
 
@@ -1472,7 +2199,7 @@ impl DiffHooks for FilesHooks<'_> {
                     .color(self.colors.warning.0),
                 |ui| {
                     for idx in roots {
-                        self.thread(ui, idx, true);
+                        self.thread(ui, idx, true, None);
                     }
                 },
             );
@@ -1483,6 +2210,7 @@ impl DiffHooks for FilesHooks<'_> {
         let Some((side, n)) = line_anchor(line) else {
             return;
         };
+        let colors = self.colors;
         if let Some(roots) = self
             .threads
             .by_line
@@ -1490,8 +2218,33 @@ impl DiffHooks for FilesHooks<'_> {
             .cloned()
         {
             for idx in roots {
-                self.thread(ui, idx, false);
+                self.thread(ui, idx, false, Some(file));
             }
+        }
+        // Pending review comments on this line.
+        // Wide diffs scroll horizontally; size cards to what's visible.
+        let width = ui.clip_rect().width().min(760.0);
+        for (i, p) in self.pending.iter().enumerate() {
+            if p.path != file.path() || p.side != side || p.line != n {
+                continue;
+            }
+            thread_frame(colors, colors.warning.0).show(ui, |ui| {
+                ui.set_width(width - 90.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Pending")
+                            .small()
+                            .strong()
+                            .color(colors.warning.0),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Delete").clicked() {
+                            *self.submit = Some(Submit::RemovePending(i));
+                        }
+                    });
+                });
+                markdown::show(ui, &p.body);
+            });
         }
         let editing = self
             .inline
@@ -1500,24 +2253,11 @@ impl DiffHooks for FilesHooks<'_> {
         if !editing {
             return;
         }
-        let colors = self.colors;
-        let width = ui.available_width().min(760.0);
-        let mut send = false;
-        let mut cancel = false;
-        egui::Frame::new()
-            .fill(colors.surface.0)
-            .stroke(egui::Stroke::new(1.0, colors.accent.0))
-            .corner_radius(6)
-            .inner_margin(10)
-            .outer_margin(egui::Margin {
-                left: 60,
-                right: 8,
-                top: 4,
-                bottom: 6,
-            })
-            .show(ui, |ui| {
-                ui.set_width(width - 90.0);
-                if let Some(draft) = self.inline.as_mut() {
+        let mut action: Option<u8> = None;
+        thread_frame(colors, colors.accent.0).show(ui, |ui| {
+            ui.set_width(width - 90.0);
+            if let Some(draft) = self.inline.as_mut() {
+                ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(format!(
                             "Comment on line {} ({})",
@@ -1527,34 +2267,85 @@ impl DiffHooks for FilesHooks<'_> {
                         .small()
                         .color(colors.text_muted.0),
                     );
-                    let edit = ui.add(
-                        egui::TextEdit::multiline(&mut draft.body)
-                            .hint_text("Leave a comment (Markdown)")
-                            .desired_rows(3)
-                            .desired_width(f32::INFINITY),
-                    );
-                    if draft.body.is_empty() && !edit.has_focus() {
-                        edit.request_focus();
+                    if side == Side::Right
+                        && ui
+                            .small_button("Suggest change")
+                            .on_hover_text("Propose replacement code the author can apply")
+                            .clicked()
+                    {
+                        draft
+                            .body
+                            .push_str(&format!("```suggestion\n{}\n```\n", draft.line_text));
                     }
-                    ui.horizontal(|ui| {
-                        send = ui
-                            .add_enabled(
-                                !draft.body.trim().is_empty() && !self.busy,
-                                egui::Button::new("Add comment"),
-                            )
-                            .on_hover_text("Posts immediately as a single comment")
-                            .clicked();
-                        cancel = ui.button("Cancel").clicked();
-                    });
+                });
+                let edit = ui.add(
+                    egui::TextEdit::multiline(&mut draft.body)
+                        .hint_text("Leave a comment (Markdown)")
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY),
+                );
+                if draft.body.is_empty() && !edit.has_focus() {
+                    edit.request_focus();
                 }
-            });
-        if send && let Some(draft) = self.inline.take() {
-            *self.submit = Some(Submit::Inline(draft));
-        }
-        if cancel {
-            *self.inline = None;
+                let ok = !draft.body.trim().is_empty();
+                ui.horizontal(|ui| {
+                    let label = if self.pending.is_empty() {
+                        "Start a review"
+                    } else {
+                        "Add review comment"
+                    };
+                    if ui
+                        .add_enabled(
+                            ok,
+                            egui::Button::new(RichText::new(label).color(colors.accent_text.0))
+                                .fill(colors.accent.0),
+                        )
+                        .on_hover_text(
+                            "Saved as pending; submitted together when you finish your review",
+                        )
+                        .clicked()
+                    {
+                        action = Some(1);
+                    }
+                    if ui
+                        .add_enabled(ok && !self.busy, egui::Button::new("Add single comment"))
+                        .on_hover_text("Post this comment right away")
+                        .clicked()
+                    {
+                        action = Some(0);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        action = Some(2);
+                    }
+                });
+            }
+        });
+        match action {
+            Some(0) => {
+                if let Some(d) = self.inline.take() {
+                    *self.submit = Some(Submit::Inline(d));
+                }
+            }
+            Some(1) => {
+                if let Some(d) = self.inline.take() {
+                    *self.submit = Some(Submit::Pending(d));
+                }
+            }
+            Some(_) => *self.inline = None,
+            None => {}
         }
     }
+}
+
+/// `content` with 1-based lines `start..=end` replaced by `text`.
+fn replace_lines(content: &str, start: u32, end: u32, text: &str) -> Result<String, String> {
+    let mut lines: Vec<&str> = content.split('\n').collect();
+    let (s, e) = ((start as usize).saturating_sub(1), end as usize);
+    if start == 0 || s >= e || e > lines.len() {
+        return Err("the file no longer has those lines; pull the latest changes".to_owned());
+    }
+    lines.splice(s..e, text.split('\n'));
+    Ok(lines.join("\n"))
 }
 
 /// A timeline card: author, action, then content.
@@ -1600,4 +2391,22 @@ fn boxed(ui: &mut Ui, colors: &UiColors, body: impl FnOnce(&mut Ui)) {
             ui.set_width(ui.available_width());
             body(ui);
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suggestions_replace_line_ranges() {
+        let content = "a\nb\nc\nd\n";
+        assert_eq!(replace_lines(content, 2, 2, "B").unwrap(), "a\nB\nc\nd\n");
+        assert_eq!(
+            replace_lines(content, 2, 3, "x\ny\nz").unwrap(),
+            "a\nx\ny\nz\nd\n"
+        );
+        assert_eq!(replace_lines(content, 1, 1, "").unwrap(), "\nb\nc\nd\n");
+        assert!(replace_lines(content, 9, 9, "x").is_err());
+        assert!(replace_lines(content, 0, 1, "x").is_err());
+    }
 }

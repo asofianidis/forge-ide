@@ -5,6 +5,7 @@ mod cli;
 mod editor;
 mod git;
 mod github;
+mod history;
 mod lsp;
 mod panes;
 mod settings;

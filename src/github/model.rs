@@ -294,12 +294,31 @@ pub struct PrDetail {
     #[serde(deserialize_with = "null_default")]
     pub files: Vec<PrFile>,
     pub is_cross_repository: bool,
+    pub milestone: Option<Milestone>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Milestone {
+    pub title: String,
+    #[serde(deserialize_with = "null_default")]
+    pub number: u64,
+}
+
+/// A label defined in the repository (`gh label list`).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RepoLabel {
+    pub name: String,
+    pub color: String,
+    #[serde(deserialize_with = "null_default")]
+    pub description: String,
 }
 
 pub const DETAIL_FIELDS: &str = "number,title,body,author,state,isDraft,url,headRefName,\
 baseRefName,headRefOid,createdAt,updatedAt,mergedAt,mergeable,mergeStateStatus,reviewDecision,\
 additions,deletions,changedFiles,commits,comments,reviews,labels,statusCheckRollup,\
-reviewRequests,assignees,files,isCrossRepository";
+reviewRequests,assignees,files,isCrossRepository,milestone";
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -323,6 +342,8 @@ pub struct ReviewComment {
     pub user: RestUser,
     pub created_at: String,
     pub in_reply_to_id: Option<u64>,
+    /// First line of a multi-line comment.
+    pub start_line: Option<u32>,
     pub html_url: String,
     #[serde(deserialize_with = "null_default")]
     pub diff_hunk: String,
@@ -475,6 +496,185 @@ pub fn search_people<'a>(people: &'a [Person], query: &str, exclude: &[&str]) ->
     hits.into_iter().map(|(_, p)| p).collect()
 }
 
+/// Thread ids, resolved state and per-file "viewed" state for a PR, which
+/// only the GraphQL API exposes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrExtra {
+    /// GraphQL node id of the pull request (for mutations).
+    pub pr_id: String,
+    /// Root comment database id → (thread node id, resolved).
+    pub threads: std::collections::HashMap<u64, (String, bool)>,
+    /// Paths the signed-in user marked as viewed.
+    pub viewed: std::collections::HashSet<String>,
+}
+
+pub const EXTRA_QUERY: &str = "query($owner:String!,$repo:String!,$n:Int!){repository(owner:$owner,\
+name:$repo){pullRequest(number:$n){id reviewThreads(first:100){nodes{id isResolved \
+comments(first:1){nodes{databaseId}}}} files(first:100){nodes{path viewerViewedState}}}}}";
+
+pub fn parse_pr_extra(json: &str) -> Result<PrExtra, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("unexpected response from gh: {e}"))?;
+    let pr = v
+        .pointer("/data/repository/pullRequest")
+        .ok_or("pull request not found")?;
+    let mut extra = PrExtra {
+        pr_id: pr
+            .get("id")
+            .and_then(|i| i.as_str())
+            .unwrap_or_default()
+            .to_owned(),
+        ..PrExtra::default()
+    };
+    let nodes = |path: &str| {
+        pr.pointer(path)
+            .and_then(|n| n.as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
+    for t in nodes("/reviewThreads/nodes") {
+        let id = t.get("id").and_then(|i| i.as_str()).unwrap_or_default();
+        let resolved = t
+            .get("isResolved")
+            .and_then(|r| r.as_bool())
+            .unwrap_or(false);
+        if let Some(db) = t
+            .pointer("/comments/nodes/0/databaseId")
+            .and_then(|d| d.as_u64())
+        {
+            extra.threads.insert(db, (id.to_owned(), resolved));
+        }
+    }
+    for f in nodes("/files/nodes") {
+        if f.get("viewerViewedState").and_then(|s| s.as_str()) == Some("VIEWED")
+            && let Some(p) = f.get("path").and_then(|p| p.as_str())
+        {
+            extra.viewed.insert(p.to_owned());
+        }
+    }
+    Ok(extra)
+}
+
+/// A GitHub notification thread (`GET /notifications`).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Notification {
+    pub id: String,
+    /// review_requested, comment, mention, author, ci_activity, …
+    pub reason: String,
+    pub unread: bool,
+    pub updated_at: String,
+    pub subject: NotificationSubject,
+    pub repository: NotificationRepo,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct NotificationSubject {
+    pub title: String,
+    #[serde(deserialize_with = "null_default")]
+    pub url: String,
+    /// PullRequest, Issue, CheckSuite, …
+    #[serde(rename = "type")]
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct NotificationRepo {
+    pub full_name: String,
+}
+
+impl Notification {
+    pub fn is_pull_request(&self) -> bool {
+        self.subject.kind == "PullRequest"
+    }
+
+    /// PR number from the subject URL (`…/pulls/42`).
+    pub fn pr_number(&self) -> Option<u64> {
+        let (rest, n) = self.subject.url.rsplit_once('/')?;
+        rest.ends_with("/pulls").then(|| n.parse().ok()).flatten()
+    }
+
+    pub fn reason_label(&self) -> &str {
+        match self.reason.as_str() {
+            "review_requested" => "Review requested",
+            "comment" => "New comment",
+            "mention" | "team_mention" => "Mentioned",
+            "author" => "On your PR",
+            "assign" => "Assigned",
+            "state_change" => "State changed",
+            "ci_activity" => "CI",
+            "subscribed" | "manual" => "Watching",
+            other => other,
+        }
+    }
+}
+
+/// A GitHub Actions workflow run (`gh run list`).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WorkflowRun {
+    pub database_id: u64,
+    pub name: String,
+    pub display_title: String,
+    /// queued, in_progress, completed, …
+    pub status: String,
+    /// success, failure, cancelled, skipped, … (empty until completed)
+    pub conclusion: String,
+    pub workflow_name: String,
+    pub head_sha: String,
+    pub head_branch: String,
+    pub url: String,
+    pub event: String,
+    pub created_at: String,
+}
+
+pub const RUN_FIELDS: &str = "databaseId,name,displayTitle,status,conclusion,workflowName,headSha,headBranch,url,event,createdAt";
+
+impl WorkflowRun {
+    pub fn outcome(&self) -> CheckOutcome {
+        if self.status != "completed" {
+            return CheckOutcome::Pending;
+        }
+        match self.conclusion.as_str() {
+            "success" => CheckOutcome::Pass,
+            "skipped" | "neutral" => CheckOutcome::Skipped,
+            _ => CheckOutcome::Fail,
+        }
+    }
+}
+
+/// Run and job ids from a GitHub Actions check URL
+/// (`…/actions/runs/{run}/job/{job}`).
+pub fn actions_job(url: &str) -> Option<(u64, Option<u64>)> {
+    let rest = url.split("/actions/runs/").nth(1)?;
+    let mut parts = rest.split('/');
+    let run = parts.next()?.parse().ok()?;
+    let job = match (parts.next(), parts.next()) {
+        (Some("job"), Some(j)) => j.split(['?', '#']).next()?.parse().ok(),
+        _ => None,
+    };
+    Some((run, job))
+}
+
+/// The ```` ```suggestion ```` blocks in a review comment body, as
+/// `(text before, suggested lines)` pieces plus trailing text.
+pub fn split_suggestions(body: &str) -> (Vec<(String, String)>, String) {
+    let mut parts = Vec::new();
+    let mut rest = body;
+    while let Some(start) = rest.find("```suggestion") {
+        let before = &rest[..start];
+        let after = &rest[start + "```suggestion".len()..];
+        let after = after.split_once('\n').map_or("", |(_, a)| a);
+        let Some(end) = after.find("```") else { break };
+        let suggestion = after[..end].strip_suffix('\n').unwrap_or(&after[..end]);
+        parts.push((before.to_owned(), suggestion.replace("\r\n", "\n")));
+        rest = after[end + 3..].trim_start_matches(['\r', '\n']);
+    }
+    (parts, rest.to_owned())
+}
+
 /// Parses one or more concatenated JSON arrays (`gh api --paginate`
 /// prints one array per page) into a single list.
 pub fn parse_paginated<T: for<'de> Deserialize<'de>>(text: &str) -> Result<Vec<T>, String> {
@@ -552,6 +752,55 @@ mod tests {
         assert_eq!(hits[0].login, "asofianidis");
         assert!(search_people(&people, "zzz", &[]).is_empty());
         assert!(parse_assignable("not json").is_empty());
+    }
+
+    #[test]
+    fn parses_extras_notifications_and_runs() {
+        let extra = parse_pr_extra(
+            r#"{"data":{"repository":{"pullRequest":{"id":"PR_1","reviewThreads":{"nodes":[
+                {"id":"T1","isResolved":true,"comments":{"nodes":[{"databaseId":7}]}}]},
+                "files":{"nodes":[{"path":"a.rs","viewerViewedState":"VIEWED"},
+                {"path":"b.rs","viewerViewedState":"UNVIEWED"}]}}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(extra.pr_id, "PR_1");
+        assert_eq!(extra.threads.get(&7), Some(&("T1".to_owned(), true)));
+        assert!(extra.viewed.contains("a.rs") && !extra.viewed.contains("b.rs"));
+
+        let n: Notification = serde_json::from_str(
+            r#"{"id":"1","reason":"review_requested","unread":true,
+                "subject":{"title":"T","url":"https://api.github.com/repos/o/r/pulls/42","type":"PullRequest"},
+                "repository":{"full_name":"o/r"}}"#,
+        )
+        .unwrap();
+        assert_eq!(n.pr_number(), Some(42));
+        assert!(n.is_pull_request());
+        let ci: Notification =
+            serde_json::from_str(r#"{"subject":{"url":null,"type":"CheckSuite"}}"#).unwrap();
+        assert_eq!(ci.pr_number(), None);
+
+        assert_eq!(
+            actions_job("https://github.com/o/r/actions/runs/123/job/456"),
+            Some((123, Some(456)))
+        );
+        assert_eq!(
+            actions_job("https://github.com/o/r/actions/runs/9"),
+            Some((9, None))
+        );
+        assert_eq!(actions_job("https://example.com/x"), None);
+    }
+
+    #[test]
+    fn splits_suggestion_blocks() {
+        let (parts, tail) = split_suggestions("Use this:\n```suggestion\nlet x = 2;\n```\nthanks");
+        assert_eq!(
+            parts,
+            vec![("Use this:\n".to_owned(), "let x = 2;".to_owned())]
+        );
+        assert_eq!(tail, "thanks");
+        let (parts, tail) = split_suggestions("no suggestion");
+        assert!(parts.is_empty());
+        assert_eq!(tail, "no suggestion");
     }
 
     #[test]

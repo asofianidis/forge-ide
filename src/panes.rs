@@ -9,6 +9,7 @@ use crate::git::diff::{DiffLine, FileDiff, LineKind};
 use crate::git::status::Entry;
 use crate::git::{CommitDetail, SourceControl};
 use crate::github::PrPane;
+use crate::history::{HistoryAction, HistoryPane, RebasePane};
 use crate::task::{self, Pending};
 use crate::theme::UiColors;
 use crate::ui::diff_view::{self, DiffColors, DiffHooks, LineRef};
@@ -19,12 +20,20 @@ use crate::ui::icons::{self, Icon};
 pub enum PaneAction {
     /// Open a repository-relative file in the editor.
     OpenFile(String),
+    OpenCommit(String),
+    /// Open the interactive rebase tab (onto this base, or the fork point).
+    OpenRebase(Option<String>),
+    /// Close the pane that returned this.
+    Close,
 }
 
 pub enum Pane {
     Changes(ChangesPane),
     Commit(CommitPane),
     PullRequest(Box<PrPane>),
+    History(Box<HistoryPane>),
+    Rebase(Box<RebasePane>),
+    Log(LogPane),
 }
 
 impl Pane {
@@ -40,6 +49,9 @@ impl Pane {
             }
             Pane::Commit(p) => format!("Commit {}", &p.hash[..p.hash.len().min(7)]),
             Pane::PullRequest(p) => p.title(),
+            Pane::History(p) => p.title(),
+            Pane::Rebase(p) => p.title(),
+            Pane::Log(p) => p.title.clone(),
         }
     }
 
@@ -48,6 +60,8 @@ impl Pane {
             Pane::Changes(_) => Icon::Branch,
             Pane::Commit(_) => Icon::Commit,
             Pane::PullRequest(_) => Icon::PullRequest,
+            Pane::History(_) | Pane::Rebase(_) => Icon::History,
+            Pane::Log(_) => Icon::OpenFile,
         }
     }
 
@@ -61,10 +75,117 @@ impl Pane {
             Pane::Changes(p) => p.show(ui, sc, colors),
             Pane::Commit(p) => p.show(ui, colors),
             Pane::PullRequest(p) => {
+                p.set_local(sc.root(), sc.status.branch.head.clone());
+                p.show(ui, colors);
+                None
+            }
+            Pane::History(p) => p.show(ui, sc, colors).map(history_action),
+            Pane::Rebase(p) => p.show(ui, sc, colors).map(history_action),
+            Pane::Log(p) => {
                 p.show(ui, colors);
                 None
             }
         }
+    }
+}
+
+fn history_action(a: HistoryAction) -> PaneAction {
+    match a {
+        HistoryAction::OpenCommit(h) => PaneAction::OpenCommit(h),
+        HistoryAction::OpenRebase(b) => PaneAction::OpenRebase(b),
+        HistoryAction::Close => PaneAction::Close,
+    }
+}
+
+/// Plain-text output of a command (CI job logs), with a filter box.
+pub struct LogPane {
+    pub title: String,
+    /// Identifies the log so reopening reuses the tab.
+    pub key: String,
+    text: Option<Result<String, String>>,
+    task: Option<Pending<Result<String, String>>>,
+    filter: String,
+}
+
+impl LogPane {
+    pub fn new(title: String, key: String, task: Pending<Result<String, String>>) -> Self {
+        Self {
+            title,
+            key,
+            text: None,
+            task: Some(task),
+            filter: String::new(),
+        }
+    }
+
+    fn show(&mut self, ui: &mut Ui, colors: &UiColors) {
+        if let Some(r) = task::poll(&mut self.task) {
+            self.text = Some(r);
+        }
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&self.title).strong().size(15.0));
+                    if self.task.is_some() {
+                        ui.spinner();
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if let Some(Ok(t)) = &self.text
+                            && ui.button("Copy").clicked()
+                        {
+                            ui.ctx().copy_text(t.clone());
+                        }
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.filter)
+                                .hint_text("Filter lines")
+                                .desired_width(200.0),
+                        );
+                    });
+                });
+            });
+        ui.separator();
+        let text = match &self.text {
+            Some(Ok(t)) => t,
+            Some(Err(e)) => {
+                ui.colored_label(colors.error.0, e);
+                return;
+            }
+            None => return,
+        };
+        let filter = self.filter.to_lowercase();
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|l| filter.is_empty() || l.to_lowercase().contains(&filter))
+            .collect();
+        let font = egui::TextStyle::Monospace.resolve(ui.style());
+        let row_h = ui.fonts_mut(|f| f.row_height(&font)) + 2.0;
+        egui::ScrollArea::both()
+            .id_salt(("log", &self.key))
+            .auto_shrink(false)
+            .stick_to_bottom(true)
+            .show_rows(ui, row_h, lines.len(), |ui, range| {
+                for line in &lines[range] {
+                    // gh prefixes each line with "job\tstep\ttimestamp"; keep the message.
+                    let msg = line.rsplit('\t').next().unwrap_or(line);
+                    let lower = msg.to_lowercase();
+                    // "0 failed" in a passing summary isn't a failure.
+                    let failed = lower.contains("failed") && !lower.contains(" 0 failed");
+                    let color = if lower.contains("error") || failed || lower.contains("panicked") {
+                        colors.error.0
+                    } else if lower.contains("warning") {
+                        colors.warning.0
+                    } else {
+                        colors.text.0
+                    };
+                    ui.add(
+                        egui::Label::new(RichText::new(msg).monospace().color(color))
+                            .extend()
+                            .selectable(true),
+                    )
+                    .on_hover_text(*line);
+                }
+            });
     }
 }
 

@@ -35,6 +35,19 @@ your existing config, hooks, credentials and SSH keys:
 - Branch picker: switch, create, track remote branches; merge and delete from the Branches list
 - Push / pull / fetch / sync with ahead-behind counts; publish new branches; force push with lease
 - Stashes (stash, apply, pop, drop), commit history with full commit diffs
+- **Commit graph** (View → Repository History, or the History section's graph button): branch
+  lanes, merges, branch and tag labels; filter by author, message or all branches. Right-click a
+  commit to cherry-pick, revert, create a branch or tag there, check it out, or start an
+  interactive rebase from it
+- **File history** (right-click a file or folder in the explorer → Show History, or View → File
+  History)
+- **Interactive rebase** (⋯ → Interactive Rebase…): reorder commits and pick, reword, edit, squash,
+  fixup or drop each one; no text editor involved. Paused rebases, merges, cherry-picks and reverts
+  show a banner with Continue / Skip / Abort
+- **Tags**: create (lightweight or annotated) at HEAD or any commit, push one or all, delete locally
+  and on the remote
+- Commit message guide (subject ≤ 50 characters, body lines ≤ 72); amending prefills the previous
+  message and shows what will change
 - Merge conflicts: conflicted files open with the current and incoming blocks highlighted and
   **Accept Current / Incoming / Both** actions on each conflict (or for the whole file), then
   **Save & Mark Resolved**; also accept ours/theirs for a whole file and abort merge
@@ -60,7 +73,16 @@ handles sign-in and finds the GitHub repository from the folder's remotes. Insta
 - Open a PR as a tab: description, comments and reviews, checks, reviewers, labels
 - **Files changed** with the full diff and inline review threads; click any line to comment,
   reply to threads
-- Review changes: comment, approve or request changes
+- Review changes: comment, approve or request changes. Inline comments can be posted right away
+  or collected into a **pending review** and submitted together with your verdict
+- **Suggested changes**: insert a suggestion for a line, and apply others' suggestions to your
+  working copy when the PR branch is checked out
+- Resolve / unresolve comment threads; mark files as **viewed**
+- Edit the title, description, labels, assignees and milestone
+- **CI**: check status for the current commit in the status bar, failed-job logs in a tab, and
+  re-run failed jobs (also from the PR's checks list)
+- **Inbox**: unread review requests, comments and mentions on this repository's PRs, with a badge
+  on the Pull Requests icon
 - Merge (squash, merge commit or rebase), update branch, ready for review / convert to draft,
   close or reopen, request reviewers, check out the PR locally
 - Create a pull request from the current branch (pushing it first if needed)
@@ -152,7 +174,8 @@ cargo run --release -- path/to/project
 src/
 ├── main.rs              # entry point, window setup
 ├── app.rs               # application state and UI layout
-├── panes.rs             # diff / commit / pull request tabs
+├── panes.rs             # diff / commit / pull request / log tabs
+├── history.rs           # commit graph tab and interactive rebase tab
 ├── cli.rs               # running git and gh
 ├── task.rs              # background work helper
 ├── settings.rs          # persisted preferences (settings.toml)
@@ -165,6 +188,7 @@ src/
 │   ├── diff.rs          # unified diff parser, single-hunk patches
 │   ├── line_changes.rs  # gutter change markers and change hunks
 │   ├── blame.rs         # `git blame --porcelain` parser
+│   ├── graph.rs         # commit graph lane layout
 │   └── panel.rs         # Source Control sidebar
 ├── github/
 │   ├── mod.rs           # gh connection, PR list, creating PRs

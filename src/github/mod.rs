@@ -13,12 +13,18 @@ use std::time::{Duration, Instant};
 
 use crate::cli::Cli;
 use crate::task::{self, Pending};
-pub use list::{BranchContext, ListAction, PrListPanel};
-use model::{PrSummary, RepoInfo};
+pub use list::{BranchContext, ListAction, PrListPanel, check_glyph};
+use model::{Notification, PrSummary, RepoInfo, WorkflowRun};
 pub use pr::PrPane;
 
 /// How often the PR list refreshes while visible and focused.
 const LIST_REFRESH: Duration = Duration::from_secs(90);
+/// How often notifications are checked (for the activity bar badge).
+const NOTIFICATION_REFRESH: Duration = Duration::from_secs(60);
+/// How often the current branch's CI runs are checked, while some are
+/// running and when all are finished.
+const RUNS_REFRESH_ACTIVE: Duration = Duration::from_secs(15);
+const RUNS_REFRESH_IDLE: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Connection {
@@ -99,6 +105,13 @@ pub enum GhEvent {
     GitChanged,
     /// PR data changed; refresh the list.
     PrsChanged,
+    /// Show a GitHub Actions log in a tab.
+    OpenLog {
+        title: String,
+        run: u64,
+        job: Option<u64>,
+        failed_only: bool,
+    },
 }
 
 /// Options for creating a pull request.
@@ -134,6 +147,19 @@ pub struct GitHub {
 
     create_task: Option<Pending<Result<String, String>>>,
     events: Vec<GhEvent>,
+
+    /// Unread notifications for this repository.
+    pub notifications: Vec<Notification>,
+    notifications_task: Option<Pending<Result<Vec<Notification>, String>>>,
+    last_notifications: Option<Instant>,
+
+    /// CI runs for the commit `runs_commit`, newest first.
+    pub runs: Vec<WorkflowRun>,
+    runs_commit: Option<String>,
+    runs_task: Option<Pending<Result<Vec<WorkflowRun>, String>>>,
+    last_runs: Option<Instant>,
+    /// Background fire-and-forget commands (mark read, re-run).
+    side_tasks: Vec<(String, Pending<Result<String, String>>)>,
 }
 
 impl GitHub {
@@ -156,6 +182,14 @@ impl GitHub {
             last_list: None,
             create_task: None,
             events: Vec::new(),
+            notifications: Vec::new(),
+            notifications_task: None,
+            last_notifications: None,
+            runs: Vec::new(),
+            runs_commit: None,
+            runs_task: None,
+            last_runs: None,
+            side_tasks: Vec::new(),
         };
         gh.open(folder);
         gh
@@ -178,6 +212,11 @@ impl GitHub {
         self.prs.clear();
         self.list_error = None;
         self.last_list = None;
+        self.notifications.clear();
+        self.last_notifications = None;
+        self.runs.clear();
+        self.runs_commit = None;
+        self.last_runs = None;
         self.connect();
     }
 
@@ -321,6 +360,60 @@ impl GitHub {
                     .push(GhEvent::Failed(format!("Create pull request failed: {e}"))),
             }
         }
+        if let Some(result) = task::poll(&mut self.notifications_task)
+            && let Ok(all) = result
+        {
+            let repo = self.repo.name_with_owner.to_lowercase();
+            self.notifications = all
+                .into_iter()
+                .filter(|n| n.unread && n.repository.full_name.to_lowercase() == repo)
+                .collect();
+        }
+        if let Some(result) = task::poll(&mut self.runs_task)
+            && let Ok(runs) = result
+        {
+            self.runs = runs;
+        }
+        let mut finished = Vec::new();
+        self.side_tasks.retain(|(label, t)| match t.try_take() {
+            Some(r) => {
+                finished.push((label.clone(), r));
+                false
+            }
+            None => true,
+        });
+        for (label, r) in finished {
+            match r {
+                Ok(_) if label.is_empty() => {}
+                Ok(_) => self.events.push(GhEvent::Done(format!("{label}: done"))),
+                Err(e) => self
+                    .events
+                    .push(GhEvent::Failed(format!("{label} failed: {e}"))),
+            }
+            self.last_runs = None;
+        }
+        if self.is_ready() && self.ctx.input(|i| i.focused) {
+            if self.notifications_task.is_none()
+                && self
+                    .last_notifications
+                    .is_none_or(|t| t.elapsed() >= NOTIFICATION_REFRESH)
+            {
+                self.refresh_notifications();
+            }
+            let busy_runs = self.runs.iter().any(|r| r.status != "completed");
+            let every = if busy_runs {
+                RUNS_REFRESH_ACTIVE
+            } else {
+                RUNS_REFRESH_IDLE
+            };
+            if self.runs_task.is_none()
+                && self.runs_commit.is_some()
+                && self.last_runs.is_none_or(|t| t.elapsed() >= every)
+            {
+                self.refresh_runs();
+            }
+            self.ctx.request_repaint_after(RUNS_REFRESH_ACTIVE);
+        }
         if visible && self.is_ready() && self.list_task.is_none() {
             let focused = self.ctx.input(|i| i.focused);
             if focused && self.last_list.is_none_or(|t| t.elapsed() >= LIST_REFRESH) {
@@ -328,6 +421,122 @@ impl GitHub {
             }
             self.ctx.request_repaint_after(LIST_REFRESH);
         }
+    }
+
+    pub fn refresh_notifications(&mut self) {
+        let Some(cli) = self.cli.clone() else { return };
+        self.last_notifications = Some(Instant::now());
+        self.notifications_task = Some(Pending::spawn(&self.ctx, move || {
+            let out = cli.run(&["api", "notifications?per_page=50"])?;
+            serde_json::from_str(&out).map_err(|e| format!("unexpected response from gh: {e}"))
+        }));
+    }
+
+    /// Unread pull request notifications (the activity bar badge).
+    pub fn badge_count(&self) -> usize {
+        self.notifications
+            .iter()
+            .filter(|n| n.is_pull_request())
+            .count()
+    }
+
+    pub fn mark_read(&mut self, id: &str) {
+        let Some(cli) = self.cli.clone() else { return };
+        self.notifications.retain(|n| n.id != id);
+        let path = format!("notifications/threads/{id}");
+        let task = Pending::spawn(&self.ctx, move || cli.run(&["api", "-X", "PATCH", &path]));
+        self.side_tasks.push((String::new(), task));
+    }
+
+    pub fn mark_all_read(&mut self) {
+        let Some(cli) = self.cli.clone() else { return };
+        self.notifications.clear();
+        let task = Pending::spawn(&self.ctx, move || {
+            cli.run(&["api", "-X", "PUT", "repos/{owner}/{repo}/notifications"])
+        });
+        self.side_tasks
+            .push(("Mark notifications read".into(), task));
+    }
+
+    /// Tracks CI runs for `commit` (the checked-out commit).
+    pub fn watch_commit(&mut self, commit: Option<String>) {
+        if commit != self.runs_commit {
+            self.runs_commit = commit;
+            self.runs.clear();
+            self.last_runs = None;
+        }
+    }
+
+    pub fn refresh_runs(&mut self) {
+        let (Some(cli), Some(sha)) = (self.cli.clone(), self.runs_commit.clone()) else {
+            return;
+        };
+        self.last_runs = Some(Instant::now());
+        self.runs_task = Some(Pending::spawn(&self.ctx, move || {
+            let out = cli.run(&[
+                "run",
+                "list",
+                "--commit",
+                &sha,
+                "--limit",
+                "20",
+                "--json",
+                model::RUN_FIELDS,
+            ])?;
+            serde_json::from_str(&out).map_err(|e| format!("unexpected response from gh: {e}"))
+        }));
+    }
+
+    /// The latest run of each workflow for commit `sha`.
+    pub fn runs_for(&self, sha: &str) -> Vec<&WorkflowRun> {
+        let mut seen = std::collections::HashSet::new();
+        self.runs
+            .iter()
+            .filter(|r| r.head_sha.starts_with(sha) || sha.starts_with(&r.head_sha))
+            .filter(|r| seen.insert(r.workflow_name.clone()))
+            .collect()
+    }
+
+    /// Re-runs a workflow run (only its failed jobs when `failed_only`).
+    pub fn rerun(&mut self, run: u64, failed_only: bool) {
+        let Some(cli) = self.cli.clone() else { return };
+        let task = Pending::spawn(&self.ctx, move || {
+            let id = run.to_string();
+            let mut args = vec!["run", "rerun", id.as_str()];
+            if failed_only {
+                args.push("--failed");
+            }
+            cli.run(&args)
+        });
+        self.side_tasks.push(("Re-run".into(), task));
+    }
+
+    /// Loads a run's (or one job's) log.
+    pub fn load_log(
+        &self,
+        run: u64,
+        job: Option<u64>,
+        failed_only: bool,
+    ) -> Option<Pending<Result<String, String>>> {
+        let cli = self.cli.clone()?;
+        Some(Pending::spawn(&self.ctx, move || {
+            let run = run.to_string();
+            let job = job.map(|j| j.to_string());
+            let mut args = vec!["run", "view"];
+            match &job {
+                Some(j) => args.extend(["--job", j.as_str()]),
+                None => args.push(run.as_str()),
+            }
+            args.push(if failed_only { "--log-failed" } else { "--log" });
+            let out = cli.run(&args)?;
+            if out.trim().is_empty() && failed_only {
+                // Nothing failed: show the whole log instead.
+                args.pop();
+                args.push("--log");
+                return cli.run(&args);
+            }
+            Ok(out)
+        }))
     }
 
     /// The open PR whose head is `branch`, if any.

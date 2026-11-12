@@ -240,6 +240,12 @@ fn file_header(
 
 type Styles = Arc<Vec<Vec<LineStyle>>>;
 
+/// Style for lines whose highlighting hasn't been computed.
+static NO_STYLE: LineStyle = LineStyle {
+    spans: Vec::new(),
+    emph: Vec::new(),
+};
+
 /// Syntax and word styles for `file`, cached until its content or the
 /// theme changes.
 fn file_styles(ctx: &egui::Context, id: egui::Id, file: &FileDiff) -> Styles {
@@ -294,10 +300,19 @@ fn file_body(
         ui.label(RichText::new(msg).weak());
         return;
     }
-    let styles = file_styles(ui.ctx(), id, file);
     let font = TextStyle::Monospace.resolve(ui.style());
     let char_w = ui.fonts_mut(|f| f.glyph_width(&font, '0'));
     let row_h = ui.fonts_mut(|f| f.row_height(&font)) + 3.0;
+    // Highlighting is the expensive part: only do it for files on screen
+    // (rows outside the viewport aren't painted anyway).
+    let rows: usize = file.hunks.iter().map(|h| h.lines.len() + 1).sum();
+    let estimate = Rect::from_min_size(
+        ui.cursor().min,
+        vec2(ui.available_width(), rows as f32 * row_h),
+    );
+    let styles = ui
+        .is_rect_visible(estimate)
+        .then(|| file_styles(ui.ctx(), id, file));
     let max_no = file
         .hunks
         .iter()
@@ -322,7 +337,7 @@ fn file_body(
     ui.spacing_mut().item_spacing.y = 0.0;
     for (h_idx, hunk) in file.hunks.iter().enumerate() {
         hunk_header(ui, idx, h_idx, file, hunk, colors, hooks, row_h);
-        let st = &styles[h_idx];
+        let st: &[LineStyle] = styles.as_ref().map_or(&[], |s| &s[h_idx]);
         if split {
             split_rows(ui, idx, h_idx, file, hunk, st, &g, colors, hooks);
         } else {
@@ -334,7 +349,8 @@ fn file_body(
                     hunk: h_idx,
                     line: i,
                 };
-                unified_row(ui, at, file, line, &st[i], width, &g, colors, hooks);
+                let style = st.get(i).unwrap_or(&NO_STYLE);
+                unified_row(ui, at, file, line, style, width, &g, colors, hooks);
                 hooks.after_line(ui, file, line);
             }
         }
@@ -602,7 +618,7 @@ fn split_rows(
                     &p,
                     pos2(text_x + g.char_w + 6.0, y),
                     &line.text,
-                    &styles[i],
+                    styles.get(i).unwrap_or(&NO_STYLE),
                     &g.font,
                     colors.text,
                     emph,

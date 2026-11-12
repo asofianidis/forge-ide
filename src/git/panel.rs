@@ -3,7 +3,7 @@
 
 use egui::{Color32, Key, KeyboardShortcut, Modifiers, RichText, Sense, Ui, UiBuilder, vec2};
 
-use super::status::{Change, Entry};
+use super::status::{self, Change, Entry};
 use super::{Branch, RepoState, SourceControl};
 use crate::theme::UiColors;
 use crate::ui::fmt;
@@ -23,6 +23,10 @@ pub enum PanelAction {
     OpenCommit(String),
     /// Switch to the Pull Requests view and start creating a PR.
     CreatePullRequest,
+    /// Open the commit graph tab.
+    OpenHistory,
+    /// Open the interactive rebase tab for the current branch.
+    OpenRebase,
 }
 
 /// Actions that need a confirmation dialog first.
@@ -32,6 +36,7 @@ enum Confirm {
     DeleteBranch(String),
     ForcePush,
     DropStash(String),
+    DeleteTag(String),
 }
 
 /// Deferred changes collected while drawing (status is borrowed then).
@@ -50,6 +55,13 @@ pub struct ScmPanel {
     confirm: Option<Confirm>,
     stash_message: String,
     history_shown: usize,
+    /// Name and message for a new tag (popup open when `Some`).
+    new_tag: Option<(String, String)>,
+    delete_tag_remote: bool,
+    /// Action chosen from a menu, returned on the next `show`.
+    pending_action: Option<PanelAction>,
+    /// Loading HEAD's message to prefill an amend.
+    amend_task: Option<crate::task::Pending<Option<String>>>,
 }
 
 pub fn change_color(change: Change, colors: &UiColors) -> Color32 {
@@ -68,7 +80,7 @@ impl ScmPanel {
         sc: &mut SourceControl,
         colors: &UiColors,
     ) -> Option<PanelAction> {
-        let mut action = None;
+        let mut action = self.pending_action.take();
         self.title_bar(ui, sc, colors);
 
         match &sc.state {
@@ -100,6 +112,7 @@ impl ScmPanel {
         }
 
         self.branch_bar(ui, sc, colors, &mut action);
+        self.operation_banner(ui, sc, colors);
         ui.add_space(4.0);
         self.commit_box(ui, sc, colors);
         ui.add_space(6.0);
@@ -112,6 +125,7 @@ impl ScmPanel {
                 self.changes(ui, sc, colors, &mut action, &mut deferred);
                 self.stashes(ui, sc, colors);
                 self.branches(ui, sc, colors);
+                self.tags(ui, sc, colors);
                 self.history(ui, sc, colors, &mut action);
             });
         for d in deferred {
@@ -200,6 +214,17 @@ impl ScmPanel {
                 ui.close();
             }
         });
+        ui.separator();
+        if ui
+            .button("Interactive Rebase…")
+            .on_hover_text("Reorder, reword, squash or drop this branch's commits")
+            .clicked()
+        {
+            self.pending_action = Some(PanelAction::OpenRebase);
+        }
+        if ui.button("Commit Graph").clicked() {
+            self.pending_action = Some(PanelAction::OpenHistory);
+        }
         ui.separator();
         let has_commits = !sc.status.branch.is_unborn();
         if ui
@@ -365,6 +390,11 @@ impl ScmPanel {
             "Message ({} to commit on “{branch}”)",
             ui.ctx().format_shortcut(&COMMIT_SHORTCUT)
         );
+        if let Some(Some(previous)) = crate::task::poll(&mut self.amend_task)
+            && self.message.trim().is_empty()
+        {
+            self.message = previous;
+        }
         ui.add(
             egui::TextEdit::multiline(&mut self.message)
                 .id(id)
@@ -372,6 +402,7 @@ impl ScmPanel {
                 .desired_rows(3)
                 .desired_width(f32::INFINITY),
         );
+        message_guide(ui, &self.message, colors);
 
         let staged = sc.status.staged().count();
         let changed = sc.status.entries.len();
@@ -420,15 +451,50 @@ impl ScmPanel {
                     commit = true;
                     push_after = true;
                 }
-                ui.checkbox(&mut self.amend, "Amend previous commit");
+                if ui
+                    .checkbox(&mut self.amend, "Amend previous commit")
+                    .changed()
+                    && self.amend
+                    && self.message.trim().is_empty()
+                {
+                    // Start from the previous message, like `git commit --amend`.
+                    self.amend_task = sc.load_last_message();
+                }
             });
         });
         if self.amend {
-            ui.label(
-                RichText::new("Amending: leave the message empty to keep the previous one.")
-                    .small()
-                    .color(colors.warning.0),
-            );
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new("Amending")
+                        .small()
+                        .strong()
+                        .color(colors.warning.0),
+                );
+                if let Some(last) = sc.log.first() {
+                    ui.label(
+                        RichText::new(format!("{} {}", last.short, last.subject))
+                            .small()
+                            .color(colors.text_muted.0),
+                    );
+                }
+                let unpushed = sc.status.branch.ahead > 0 || sc.status.branch.upstream.is_none();
+                if !unpushed {
+                    ui.label(
+                        RichText::new("— already pushed; you'll need to force push")
+                            .small()
+                            .color(colors.warning.0),
+                    );
+                }
+            });
+            let staged: Vec<&str> = sc.status.staged().map(|e| e.path.as_str()).collect();
+            if !staged.is_empty() {
+                ui.label(
+                    RichText::new(format!("Adds {} staged file(s) to it", staged.len()))
+                        .small()
+                        .color(colors.text_muted.0),
+                )
+                .on_hover_text(staged.join("\n"));
+            }
         }
         if commit {
             sc.commit(std::mem::take(&mut self.message), self.amend, push_after);
@@ -665,13 +731,18 @@ impl ScmPanel {
         if self.history_shown == 0 {
             self.history_shown = HISTORY_PAGE;
         }
+        let mut open_graph = false;
         section(
             ui,
             "History",
             sc.log.len(),
             false,
             colors,
-            |_| {},
+            |ui| {
+                if icons::button(ui, Icon::History, "Open the commit graph").clicked() {
+                    open_graph = true;
+                }
+            },
             |ui| {
                 for c in sc.log.iter().take(self.history_shown) {
                     let height = if c.refs.is_empty() { 36.0 } else { 50.0 };
@@ -707,6 +778,186 @@ impl ScmPanel {
                 }
             },
         );
+        if open_graph {
+            *action = Some(PanelAction::OpenHistory);
+        }
+    }
+
+    /// Shown while a rebase, merge, cherry-pick or revert is paused.
+    fn operation_banner(&mut self, ui: &mut Ui, sc: &mut SourceControl, colors: &UiColors) {
+        let Some(op) = sc.status.operation else {
+            return;
+        };
+        let conflicts = sc.status.conflicts().count();
+        egui::Frame::new()
+            .fill(colors.warning.0.gamma_multiply(0.14))
+            .corner_radius(4)
+            .inner_margin(6)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new(format!("{} in progress", op.describe()))
+                        .strong()
+                        .color(colors.warning.0),
+                );
+                ui.label(
+                    RichText::new(if conflicts > 0 {
+                        format!(
+                            "Resolve {conflicts} conflicted file(s), stage them, then continue."
+                        )
+                    } else {
+                        "Stage your changes, then continue.".to_owned()
+                    })
+                    .small(),
+                );
+                ui.horizontal(|ui| {
+                    let busy = sc.busy().is_some();
+                    if ui
+                        .add_enabled(conflicts == 0 && !busy, egui::Button::new("Continue"))
+                        .on_disabled_hover_text("Resolve conflicts first")
+                        .clicked()
+                    {
+                        sc.continue_operation(op);
+                    }
+                    if matches!(
+                        op,
+                        status::Operation::Rebase | status::Operation::CherryPick
+                    ) && ui
+                        .add_enabled(!busy, egui::Button::new("Skip"))
+                        .on_hover_text("Leave out the current commit")
+                        .clicked()
+                    {
+                        sc.skip_operation(op);
+                    }
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("Abort"))
+                        .on_hover_text("Go back to how things were before")
+                        .clicked()
+                    {
+                        sc.abort_operation(op);
+                    }
+                });
+            });
+    }
+
+    fn tags(&mut self, ui: &mut Ui, sc: &mut SourceControl, colors: &UiColors) {
+        let mut create = false;
+        let mut push_all = false;
+        let mut todo: Option<(bool, String)> = None;
+        section(
+            ui,
+            "Tags",
+            sc.tags.len(),
+            false,
+            colors,
+            |ui| {
+                if icons::button(ui, Icon::ArrowUp, "Push all tags").clicked() {
+                    push_all = true;
+                }
+                if icons::button(ui, Icon::Plus, "Create a tag at HEAD").clicked() {
+                    create = true;
+                }
+            },
+            |ui| {
+                if sc.tags.is_empty() {
+                    ui.label(RichText::new("No tags yet.").weak());
+                }
+                for t in &sc.tags {
+                    hover_row(ui, 22.0, |ui, hovered| {
+                        ui.label(RichText::new(&t.name).strong());
+                        ui.label(
+                            RichText::new(format!("{} · {}", t.target, fmt::relative_time(t.time)))
+                                .small()
+                                .color(colors.text_muted.0),
+                        )
+                        .on_hover_text(&t.subject);
+                        if hovered {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.spacing_mut().item_spacing.x = 2.0;
+                                    if icons::button(ui, Icon::Close, "Delete tag").clicked() {
+                                        todo = Some((false, t.name.clone()));
+                                    }
+                                    if icons::button(ui, Icon::ArrowUp, "Push tag").clicked() {
+                                        todo = Some((true, t.name.clone()));
+                                    }
+                                },
+                            );
+                        }
+                    });
+                }
+            },
+        );
+        if push_all {
+            sc.push_tag(None);
+        }
+        if create {
+            self.new_tag = Some((String::new(), String::new()));
+        }
+        match todo {
+            Some((true, name)) => sc.push_tag(Some(name)),
+            Some((false, name)) => {
+                self.delete_tag_remote = false;
+                self.confirm = Some(Confirm::DeleteTag(name));
+            }
+            None => {}
+        }
+        self.new_tag_dialog(ui, sc);
+    }
+
+    fn new_tag_dialog(&mut self, ui: &mut Ui, sc: &mut SourceControl) {
+        let Some((name, message)) = &mut self.new_tag else {
+            return;
+        };
+        let mut done = None;
+        egui::Modal::new(egui::Id::unique("new_tag")).show(ui.ctx(), |ui| {
+            ui.set_width(320.0);
+            ui.heading("Create Tag");
+            ui.label(RichText::new("At the current commit (HEAD)").weak());
+            let field = ui.add(
+                egui::TextEdit::singleline(name)
+                    .hint_text("v1.2.3")
+                    .desired_width(f32::INFINITY),
+            );
+            // Focus the name once, when the dialog opens.
+            if name.is_empty() && message.is_empty() && !ui.memory(|m| m.focused().is_some()) {
+                field.request_focus();
+            }
+            ui.add(
+                egui::TextEdit::multiline(message)
+                    .hint_text("Message (optional; makes an annotated tag)")
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY),
+            );
+            ui.horizontal(|ui| {
+                let ok = !name.trim().is_empty() && !name.contains(char::is_whitespace);
+                if ui.add_enabled(ok, egui::Button::new("Create")).clicked() {
+                    done = Some(1);
+                }
+                if ui
+                    .add_enabled(ok, egui::Button::new("Create & Push"))
+                    .clicked()
+                {
+                    done = Some(2);
+                }
+                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                    done = Some(0);
+                }
+            });
+        });
+        if let Some(choice) = done {
+            if let Some((name, message)) = self.new_tag.take()
+                && choice > 0
+            {
+                let name = name.trim().to_owned();
+                sc.create_tag(name.clone(), message, None);
+                if choice == 2 {
+                    sc.push_tag(Some(name));
+                }
+            }
+            self.new_tag = None;
+        }
     }
 
     fn confirm_dialog(&mut self, ui: &mut Ui, sc: &mut SourceControl) {
@@ -741,6 +992,18 @@ impl ScmPanel {
             Confirm::DropStash(name) => {
                 ("Drop Stash", format!("Permanently delete {name}?"), "Drop")
             }
+            Confirm::DeleteTag(name) => (
+                "Delete Tag",
+                format!(
+                    "Delete the tag “{name}” locally{}?",
+                    if self.delete_tag_remote {
+                        " and on the remote"
+                    } else {
+                        ""
+                    }
+                ),
+                "Delete",
+            ),
         };
         let mut decision = None;
         egui::Modal::new(egui::Id::unique("scm_confirm")).show(ui.ctx(), |ui| {
@@ -748,6 +1011,9 @@ impl ScmPanel {
             ui.heading(title);
             ui.add_space(4.0);
             ui.label(body);
+            if let Confirm::DeleteTag(_) = &confirm {
+                ui.checkbox(&mut self.delete_tag_remote, "Also delete it on the remote");
+            }
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui
@@ -768,6 +1034,12 @@ impl ScmPanel {
                     Confirm::DeleteBranch(name) => sc.delete_branch(name, false),
                     Confirm::ForcePush => sc.push(true),
                     Confirm::DropStash(name) => sc.stash_drop(name),
+                    Confirm::DeleteTag(name) => {
+                        if self.delete_tag_remote {
+                            sc.delete_remote_tag(name.clone());
+                        }
+                        sc.delete_tag(name);
+                    }
                 }
                 self.confirm = None;
             }
@@ -989,4 +1261,39 @@ fn file_row(
             ui.close();
         }
     });
+}
+
+/// Commit message length hints: the subject should fit in 50 characters
+/// (72 at most) and body lines in 72.
+fn message_guide(ui: &mut Ui, message: &str, colors: &UiColors) {
+    let mut lines = message.lines();
+    let Some(subject) = lines.next().filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let n = subject.chars().count();
+    let color = match n {
+        0..=50 => colors.text_muted.0,
+        51..=72 => colors.warning.0,
+        _ => colors.error.0,
+    };
+    let mut notes = vec![format!("Subject {n}/50")];
+    let rest: Vec<&str> = lines.collect();
+    if rest.first().is_some_and(|l| !l.trim().is_empty()) {
+        notes.push("add a blank line after the subject".to_owned());
+    }
+    let long = rest.iter().filter(|l| l.chars().count() > 72).count();
+    if long > 0 {
+        notes.push(format!("{long} body line(s) over 72"));
+    }
+    let warn = n > 50 || notes.len() > 1;
+    ui.label(
+        RichText::new(notes.join(" · "))
+            .small()
+            .color(if warn && n <= 50 {
+                colors.warning.0
+            } else {
+                color
+            }),
+    )
+    .on_hover_text("Git convention: subject ≤ 50 characters, blank line, body wrapped at 72");
 }

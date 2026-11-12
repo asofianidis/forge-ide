@@ -4,6 +4,7 @@
 
 pub mod blame;
 pub mod diff;
+pub mod graph;
 pub mod line_changes;
 mod panel;
 pub mod status;
@@ -33,6 +34,116 @@ pub struct Commit {
     pub subject: String,
     /// Decorations such as `HEAD -> main, origin/main, tag: v1`.
     pub refs: String,
+    pub parents: Vec<String>,
+}
+
+/// Filters for the history view.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogQuery {
+    pub author: String,
+    /// Text to find in commit messages.
+    pub grep: String,
+    /// Only commits touching this repository-relative path.
+    pub path: Option<String>,
+    /// Include every branch, not just HEAD.
+    pub all: bool,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tag {
+    pub name: String,
+    pub target: String,
+    pub time: i64,
+    pub subject: String,
+}
+
+/// The base an interactive rebase uses and the commits it would replay.
+pub type RebasePlan = Result<(Option<String>, Vec<RebaseCommit>), String>;
+
+/// One commit in an interactive rebase plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebaseCommit {
+    pub hash: String,
+    pub short: String,
+    pub subject: String,
+    /// Full message, for rewording.
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebaseAction {
+    Pick,
+    Reword,
+    Edit,
+    Squash,
+    Fixup,
+    Drop,
+}
+
+impl RebaseAction {
+    pub const ALL: [RebaseAction; 6] = [
+        Self::Pick,
+        Self::Reword,
+        Self::Edit,
+        Self::Squash,
+        Self::Fixup,
+        Self::Drop,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pick => "pick",
+            Self::Reword => "reword",
+            Self::Edit => "edit",
+            Self::Squash => "squash",
+            Self::Fixup => "fixup",
+            Self::Drop => "drop",
+        }
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Pick => "Keep the commit",
+            Self::Reword => "Keep the commit with a new message",
+            Self::Edit => "Stop after this commit so you can amend it",
+            Self::Squash => "Meld into the previous commit, combining messages",
+            Self::Fixup => "Meld into the previous commit, keeping its message",
+            Self::Drop => "Remove the commit",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RebaseStep {
+    pub hash: String,
+    pub action: RebaseAction,
+    /// New message for `Reword`.
+    pub message: String,
+}
+
+/// Builds the rebase todo list. Rewords become `pick` plus an `exec` that
+/// amends the message from a file, so no editor is needed.
+pub fn rebase_todo(steps: &[RebaseStep], message_file: impl Fn(usize) -> String) -> String {
+    let mut todo = String::new();
+    for (i, step) in steps.iter().enumerate() {
+        let action = match step.action {
+            RebaseAction::Reword => "pick",
+            other => other.label(),
+        };
+        todo.push_str(&format!("{action} {}\n", step.hash));
+        if step.action == RebaseAction::Reword {
+            todo.push_str(&format!(
+                "exec git commit --amend --only --no-verify --allow-empty -F {}\n",
+                shell_quote(&message_file(i))
+            ));
+        }
+    }
+    todo
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +234,8 @@ pub struct SourceControl {
     stash_task: Option<Pending<Result<Vec<Stash>, String>>>,
     pub remotes: Vec<String>,
     remotes_task: Option<Pending<Result<Vec<String>, String>>>,
+    pub tags: Vec<Tag>,
+    tags_task: Option<Pending<Result<Vec<Tag>, String>>>,
 
     ops: VecDeque<Op>,
     running: Option<(String, Pending<Result<String, String>>)>,
@@ -153,6 +266,8 @@ impl SourceControl {
             stash_task: None,
             remotes: Vec::new(),
             remotes_task: None,
+            tags: Vec::new(),
+            tags_task: None,
             ops: VecDeque::new(),
             running: None,
             events: Vec::new(),
@@ -172,6 +287,7 @@ impl SourceControl {
         self.branches.clear();
         self.stashes.clear();
         self.remotes.clear();
+        self.tags.clear();
         self.ops.clear();
         self.revision += 1;
         let Some(folder) = folder.map(Path::to_path_buf) else {
@@ -242,7 +358,9 @@ impl SourceControl {
                 "--untracked-files=all",
                 "--show-stash",
             ])?;
-            Ok(status::parse(&out))
+            let mut status = status::parse(&out);
+            status.operation = detect_operation(&git);
+            Ok(status)
         }));
     }
 
@@ -259,6 +377,10 @@ impl SourceControl {
         if self.stash_task.is_none() {
             let g = git.clone();
             self.stash_task = Some(Pending::spawn(&self.ctx, move || load_stashes(&g)));
+        }
+        if self.tags_task.is_none() {
+            let g = git.clone();
+            self.tags_task = Some(Pending::spawn(&self.ctx, move || load_tags(&g)));
         }
         if self.remotes_task.is_none() {
             self.remotes_task = Some(Pending::spawn(&self.ctx, move || {
@@ -327,6 +449,9 @@ impl SourceControl {
         }
         if let Some(Ok(stashes)) = task::poll(&mut self.stash_task) {
             self.stashes = stashes;
+        }
+        if let Some(Ok(tags)) = task::poll(&mut self.tags_task) {
+            self.tags = tags;
         }
         if let Some(Ok(remotes)) = task::poll(&mut self.remotes_task) {
             self.remotes = remotes;
@@ -767,7 +892,183 @@ impl SourceControl {
         });
     }
 
+    pub fn create_tag(&mut self, name: String, message: String, target: Option<String>) {
+        self.queue(format!("Create tag {name}"), move |git| {
+            let mut args = vec!["tag".to_owned()];
+            if !message.trim().is_empty() {
+                args.extend(["-a".into(), "-m".into(), message.trim().to_owned()]);
+            }
+            args.push(name);
+            args.extend(target);
+            git.run(&args)
+        });
+    }
+
+    pub fn delete_tag(&mut self, name: String) {
+        self.queue(format!("Delete tag {name}"), move |git| {
+            git.run(&["tag", "-d", &name])
+        });
+    }
+
+    /// Pushes one tag, or every tag when `name` is `None`.
+    pub fn push_tag(&mut self, name: Option<String>) {
+        let Some(remote) = self.default_remote() else {
+            self.events
+                .push(Event::Failed("No remote to push tags to".into()));
+            return;
+        };
+        let label = name
+            .as_deref()
+            .map_or("Push tags".to_owned(), |n| format!("Push tag {n}"));
+        self.queue(label, move |git| {
+            let target = name.map_or("--tags".to_owned(), |n| format!("refs/tags/{n}"));
+            let out = git.output(&["push", &remote, &target], None)?;
+            if out.success {
+                Ok(out.stderr.lines().last().unwrap_or_default().to_owned())
+            } else {
+                out.into_result()
+            }
+        });
+    }
+
+    pub fn delete_remote_tag(&mut self, name: String) {
+        let Some(remote) = self.default_remote() else {
+            return;
+        };
+        self.queue(format!("Delete remote tag {name}"), move |git| {
+            git.output(&["push", &remote, &format!(":refs/tags/{name}")], None)?
+                .into_result()
+        });
+    }
+
+    pub fn cherry_pick(&mut self, hash: String) {
+        self.queue("Cherry-pick", move |git| git.run(&["cherry-pick", &hash]));
+    }
+
+    pub fn revert_commit(&mut self, hash: String) {
+        self.queue("Revert commit", move |git| {
+            git.run(&["revert", "--no-edit", &hash])
+        });
+    }
+
+    pub fn checkout_detached(&mut self, hash: String) {
+        self.queue("Checkout commit", move |git| {
+            git.run(&["switch", "--detach", &hash])
+        });
+    }
+
+    /// Continues a paused rebase / merge / cherry-pick / revert.
+    pub fn continue_operation(&mut self, op: status::Operation) {
+        self.queue(
+            format!("Continue {}", op.describe().to_lowercase()),
+            move |git| {
+                match op {
+                    // A merge is finished by committing.
+                    status::Operation::Merge => git.run(&["commit", "--no-edit"]),
+                    _ => git.run(&[op.command(), "--continue"]),
+                }
+            },
+        );
+    }
+
+    pub fn abort_operation(&mut self, op: status::Operation) {
+        self.queue(
+            format!("Abort {}", op.describe().to_lowercase()),
+            move |git| git.run(&[op.command(), "--abort"]),
+        );
+    }
+
+    /// Skips the current commit of a paused rebase or cherry-pick.
+    pub fn skip_operation(&mut self, op: status::Operation) {
+        self.queue(
+            format!("Skip ({})", op.describe().to_lowercase()),
+            move |git| git.run(&[op.command(), "--skip"]),
+        );
+    }
+
+    /// Runs an interactive rebase of the commits after `base` (`None`: the
+    /// whole history) following `steps`, oldest first.
+    pub fn interactive_rebase(&mut self, base: Option<String>, steps: Vec<RebaseStep>) {
+        self.queue("Interactive rebase", move |git| {
+            run_interactive_rebase(git, base.as_deref(), &steps)
+        });
+    }
+
     // ---- reads (not queued) ----------------------------------------------
+
+    /// Commit history matching `query`, for the history view.
+    pub fn load_history(&self, query: LogQuery) -> Option<Pending<Result<Vec<Commit>, String>>> {
+        let git = self.git.clone()?;
+        Some(Pending::spawn(&self.ctx, move || {
+            load_history(&git, &query)
+        }))
+    }
+
+    /// The full message of HEAD, for amending.
+    pub fn load_last_message(&self) -> Option<Pending<Option<String>>> {
+        let git = self.git.clone()?;
+        Some(Pending::spawn(&self.ctx, move || {
+            git.run(&["log", "-1", "--format=%B"])
+                .ok()
+                .map(|s| s.trim_end().to_owned())
+        }))
+    }
+
+    /// The commits an interactive rebase would replay, oldest first. With
+    /// no `base`, rebases onto where the branch forked from its upstream
+    /// (or the remote's default branch). Returns the base used.
+    pub fn load_rebase_commits(&self, base: Option<String>) -> Option<Pending<RebasePlan>> {
+        let git = self.git.clone()?;
+        Some(Pending::spawn(&self.ctx, move || {
+            let base = match base {
+                Some(b) => Some(b),
+                None => {
+                    // Where the branch forked from the default branch (or
+                    // its upstream); skip bases that are HEAD itself.
+                    let head = git.run(&["rev-parse", "HEAD"]).unwrap_or_default();
+                    [
+                        "origin/HEAD",
+                        "origin/main",
+                        "origin/master",
+                        "main",
+                        "master",
+                        "@{upstream}",
+                    ]
+                    .iter()
+                    .filter_map(|r| git.run(&["merge-base", "HEAD", r]).ok())
+                    .map(|s| s.trim().to_owned())
+                    .find(|b| b != head.trim())
+                }
+            };
+            let range = match &base {
+                Some(b) => format!("{b}..HEAD"),
+                None => "HEAD".to_owned(),
+            };
+            let out = git.run(&[
+                "log",
+                "--reverse",
+                "--format=%H%x1f%h%x1f%s%x1f%B%x1e",
+                &range,
+            ])?;
+            let commits = out
+                .split('\x1e')
+                .filter_map(|rec| {
+                    let rec = rec.trim_start_matches('\n');
+                    let f: Vec<&str> = rec.splitn(4, '\x1f').collect();
+                    Some(RebaseCommit {
+                        hash: f.first().filter(|h| !h.is_empty())?.to_string(),
+                        short: f.get(1)?.to_string(),
+                        subject: f.get(2)?.to_string(),
+                        message: f
+                            .get(3)
+                            .map(|m| m.trim_end().to_owned())
+                            .unwrap_or_default(),
+                    })
+                })
+                .collect();
+            Ok((base, commits))
+        }))
+    }
 
     /// Loads the diff of one changed file. `staged` picks index vs work tree.
     pub fn load_file_diff(
@@ -904,6 +1205,56 @@ fn change_lines(hunk: &diff::Hunk, start: usize, len: usize) -> Vec<usize> {
     picked
 }
 
+/// Runs `git rebase -i` with `steps` as the todo list, without an editor.
+fn run_interactive_rebase(
+    git: &Cli,
+    base: Option<&str>,
+    steps: &[RebaseStep],
+) -> Result<String, String> {
+    let dir = std::env::temp_dir().join(format!(
+        "forge-rebase-{}-{}",
+        std::process::id(),
+        fmt_now_nanos()
+    ));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let msg_path = |i: usize| dir.join(format!("msg-{i}.txt")).display().to_string();
+    for (i, step) in steps.iter().enumerate() {
+        if step.action == RebaseAction::Reword {
+            std::fs::write(msg_path(i), &step.message).map_err(|e| e.to_string())?;
+        }
+    }
+    let todo_path = dir.join("todo");
+    std::fs::write(&todo_path, rebase_todo(steps, msg_path)).map_err(|e| e.to_string())?;
+    // git calls the sequence editor with the todo file; we overwrite it
+    // with our plan.
+    let editor = format!(
+        "sequence.editor=cp {}",
+        shell_quote(&todo_path.display().to_string())
+    );
+    let mut args = vec!["-c", editor.as_str(), "rebase", "-i", "--autostash"];
+    args.push(base.unwrap_or("--root"));
+    let out = git.output(&args, None)?;
+    // Reword messages are read by `exec` lines, so keep them while the
+    // rebase is paused (at an `edit` or a conflict).
+    if detect_operation(git).is_none() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    if out.success {
+        let text = format!("{}{}", out.stdout, out.stderr);
+        // git redraws progress with carriage returns; keep the final state.
+        let last = text.lines().last().unwrap_or("done");
+        Ok(last.rsplit('\r').next().unwrap_or(last).trim().to_owned())
+    } else {
+        out.into_result()
+    }
+}
+
+fn fmt_now_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos())
+}
+
 fn count_label(verb: &str, paths: &[String]) -> String {
     match paths {
         [one] => format!("{verb} {}", one.rsplit('/').next().unwrap_or(one)),
@@ -943,12 +1294,84 @@ fn decorations(status: &Status) -> HashMap<String, Change> {
     map
 }
 
+/// Which multi-step operation (if any) is paused in the repository.
+fn detect_operation(git: &Cli) -> Option<status::Operation> {
+    use status::Operation;
+    let names = [
+        ("rebase-merge", Operation::Rebase),
+        ("rebase-apply", Operation::Rebase),
+        ("MERGE_HEAD", Operation::Merge),
+        ("CHERRY_PICK_HEAD", Operation::CherryPick),
+        ("REVERT_HEAD", Operation::Revert),
+    ];
+    let mut args = vec!["rev-parse"];
+    for (n, _) in &names {
+        args.extend(["--git-path", n]);
+    }
+    let out = git.run(&args).ok()?;
+    out.lines()
+        .zip(names)
+        .find(|(p, _)| git.cwd().join(p).exists())
+        .map(|(_, (_, op))| op)
+}
+
+fn load_history(git: &Cli, q: &LogQuery) -> Result<Vec<Commit>, String> {
+    let limit = format!("-n{}", q.limit.max(1));
+    let mut args: Vec<String> = vec![
+        "log".into(),
+        limit,
+        "--topo-order".into(),
+        "--format=%H%x1f%h%x1f%an%x1f%ae%x1f%at%x1f%s%x1f%D%x1f%P%x1e".into(),
+    ];
+    if q.all {
+        args.push("--all".into());
+    }
+    if !q.author.trim().is_empty() {
+        args.push(format!("--author={}", q.author.trim()));
+    }
+    if !q.grep.trim().is_empty() {
+        args.extend(["-i".into(), format!("--grep={}", q.grep.trim())]);
+    }
+    if let Some(p) = &q.path {
+        // Rewrite parents to the commits touching the file so the graph stays connected.
+        args.extend(["--parents".into(), "--".into(), p.clone()]);
+    }
+    let out = git.output(&args, None)?;
+    if !out.success {
+        return Ok(Vec::new());
+    }
+    Ok(parse_log(&out.stdout))
+}
+
+fn load_tags(git: &Cli) -> Result<Vec<Tag>, String> {
+    let out = git.run(&[
+        "for-each-ref",
+        "--sort=-creatordate",
+        "--format=%(refname:short)%1f%(objectname:short)%1f%(creatordate:unix)%1f%(contents:subject)%1e",
+        "refs/tags",
+    ])?;
+    Ok(out
+        .split('\x1e')
+        .filter_map(|rec| {
+            let rec = rec.trim_start_matches('\n');
+            let f: Vec<&str> = rec.split('\x1f').collect();
+            let name = f.first().filter(|n| !n.is_empty())?;
+            Some(Tag {
+                name: name.to_string(),
+                target: f.get(1).map(|s| s.to_string()).unwrap_or_default(),
+                time: f.get(2).and_then(|s| s.parse().ok()).unwrap_or(0),
+                subject: f.get(3).map(|s| s.to_string()).unwrap_or_default(),
+            })
+        })
+        .collect())
+}
+
 fn load_log(git: &Cli, path: Option<&str>) -> Result<Vec<Commit>, String> {
     let limit = format!("-n{LOG_LIMIT}");
     let mut args = vec![
         "log",
         &limit,
-        "--format=%H%x1f%h%x1f%an%x1f%ae%x1f%at%x1f%s%x1f%D%x1e",
+        "--format=%H%x1f%h%x1f%an%x1f%ae%x1f%at%x1f%s%x1f%D%x1f%P%x1e",
     ];
     if let Some(p) = path {
         args.extend(["--follow", "--", p]);
@@ -977,6 +1400,10 @@ fn parse_log(out: &str) -> Vec<Commit> {
                 time: f.get(4)?.parse().unwrap_or(0),
                 subject: f.get(5)?.to_string(),
                 refs: f.get(6).map(|s| s.trim().to_owned()).unwrap_or_default(),
+                parents: f
+                    .get(7)
+                    .map(|s| s.split_whitespace().map(str::to_owned).collect())
+                    .unwrap_or_default(),
             })
         })
         .collect()
@@ -1037,11 +1464,13 @@ mod tests {
 
     #[test]
     fn parses_log_records() {
-        let out = "abc\x1fa\x1fAda\x1fada@x\x1f100\x1fFirst\x1fHEAD -> main\x1e\n\
+        let out = "abc\x1fa\x1fAda\x1fada@x\x1f100\x1fFirst\x1fHEAD -> main\x1fp1 p2\x1e\n\
                    def\x1fd\x1fBob\x1fbob@x\x1f50\x1fSecond: with \x1f\x1e\n";
         let log = parse_log(out);
         assert_eq!(log.len(), 2);
         assert_eq!(log[0].refs, "HEAD -> main");
+        assert_eq!(log[0].parents, ["p1", "p2"]);
+        assert!(log[1].parents.is_empty());
         assert_eq!(log[1].subject, "Second: with ");
         assert_eq!(log[1].time, 50);
     }
@@ -1056,6 +1485,72 @@ mod tests {
         assert!(b[0].current && !b[0].remote);
         assert_eq!(b[0].upstream.as_deref(), Some("origin/main"));
         assert!(b[1].remote && !b[1].current);
+    }
+
+    #[test]
+    fn interactive_rebase_rewords_squashes_and_drops() {
+        let Some(git_path) = Cli::locate("git") else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("forge-rebase-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = Cli::new(git_path, dir.clone())
+            .with_prefix(&[
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .with_env("GIT_EDITOR", "true");
+        git.run(&["init", "-q", "-b", "main"]).unwrap();
+        for (i, name) in ["base", "one", "two", "three", "four"].iter().enumerate() {
+            std::fs::write(dir.join(format!("f{i}.txt")), name).unwrap();
+            git.run(&["add", "-A"]).unwrap();
+            git.run(&["commit", "-q", "-m", name]).unwrap();
+        }
+        let hashes = git.run(&["log", "--reverse", "--format=%H"]).unwrap();
+        let h: Vec<&str> = hashes.lines().collect();
+        let step = |i: usize, action, message: &str| RebaseStep {
+            hash: h[i].to_owned(),
+            action,
+            message: message.to_owned(),
+        };
+        // Reorder (three before two), reword one, fix four into three, drop two.
+        let steps = vec![
+            step(1, RebaseAction::Reword, "one, reworded\n\nwith a body"),
+            step(3, RebaseAction::Pick, ""),
+            step(4, RebaseAction::Fixup, ""),
+            step(2, RebaseAction::Drop, ""),
+        ];
+        run_interactive_rebase(&git, Some(h[0]), &steps).unwrap();
+        let subjects = git.run(&["log", "--reverse", "--format=%s"]).unwrap();
+        assert_eq!(
+            subjects.lines().collect::<Vec<_>>(),
+            ["base", "one, reworded", "three"]
+        );
+        assert!(
+            !dir.join("f2.txt").exists(),
+            "dropped commit's file is gone"
+        );
+        assert!(dir.join("f4.txt").exists(), "fixup kept its changes");
+        assert_eq!(detect_operation(&git), None);
+
+        // A conflicting cherry-pick pauses and is detected.
+        git.run(&["switch", "-q", "-c", "side", h[0]]).unwrap();
+        std::fs::write(dir.join("f1.txt"), "conflict").unwrap();
+        git.run(&["add", "-A"]).unwrap();
+        git.run(&["commit", "-q", "-m", "side"]).unwrap();
+        let main_one = git
+            .run(&["log", "main", "--format=%H", "-n1", "--grep=reworded"])
+            .unwrap();
+        assert!(git.run(&["cherry-pick", main_one.trim()]).is_err());
+        assert_eq!(detect_operation(&git), Some(status::Operation::CherryPick));
+        git.run(&["cherry-pick", "--abort"]).unwrap();
+        assert_eq!(detect_operation(&git), None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

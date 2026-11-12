@@ -175,6 +175,10 @@ impl PrListPanel {
             ui.separator();
         }
 
+        if let Some(n) = self.inbox(ui, gh, colors) {
+            action = Some(ListAction::Open(n));
+        }
+
         let mut changed = false;
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_salt("pr_state")
@@ -236,6 +240,74 @@ impl PrListPanel {
                 }
             });
         action
+    }
+
+    /// Unread pull request notifications: review requests, new comments,
+    /// mentions. Opening one marks it read.
+    fn inbox(&mut self, ui: &mut Ui, gh: &mut GitHub, colors: &UiColors) -> Option<u64> {
+        let items: Vec<_> = gh
+            .notifications
+            .iter()
+            .filter(|n| n.is_pull_request())
+            .cloned()
+            .collect();
+        if items.is_empty() {
+            return None;
+        }
+        let mut open = None;
+        let mut read_all = false;
+        let id = ui.make_persistent_id("pr_inbox");
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
+            .show_header(ui, |ui| {
+                ui.label(RichText::new("Inbox").strong().small());
+                ui.label(
+                    RichText::new(items.len().to_string())
+                        .small()
+                        .color(colors.accent.0),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Mark all read").clicked() {
+                        read_all = true;
+                    }
+                });
+            })
+            .body(|ui| {
+                for n in &items {
+                    let r = ui
+                        .vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            let title = ui.add(
+                                egui::Label::new(RichText::new(&n.subject.title).strong())
+                                    .truncate()
+                                    .sense(Sense::click()),
+                            );
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} · {}",
+                                    n.reason_label(),
+                                    fmt::relative_iso(&n.updated_at)
+                                ))
+                                .small()
+                                .color(colors.text_muted.0),
+                            );
+                            title
+                        })
+                        .inner;
+                    if r.clicked()
+                        && let Some(num) = n.pr_number()
+                    {
+                        open = Some((num, n.id.clone()));
+                    }
+                    ui.add_space(4.0);
+                }
+            });
+        ui.separator();
+        if read_all {
+            gh.mark_all_read();
+        }
+        let (num, id) = open?;
+        gh.mark_read(&id);
+        Some(num)
     }
 
     fn create_form(

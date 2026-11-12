@@ -163,6 +163,38 @@ pub struct Status {
     pub branch: BranchInfo,
     pub entries: Vec<Entry>,
     pub stash_count: u32,
+    /// A rebase, merge, cherry-pick or revert waiting to be finished.
+    pub operation: Option<Operation>,
+}
+
+/// A multi-step git operation that is paused (usually on conflicts).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Operation {
+    Rebase,
+    Merge,
+    CherryPick,
+    Revert,
+}
+
+impl Operation {
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Rebase => "Rebase",
+            Self::Merge => "Merge",
+            Self::CherryPick => "Cherry-pick",
+            Self::Revert => "Revert",
+        }
+    }
+
+    /// The `git` subcommand that continues or aborts it.
+    pub fn command(self) -> &'static str {
+        match self {
+            Self::Rebase => "rebase",
+            Self::Merge => "merge",
+            Self::CherryPick => "cherry-pick",
+            Self::Revert => "revert",
+        }
+    }
 }
 
 impl Status {

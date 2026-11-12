@@ -25,6 +25,7 @@ pub enum Icon {
     Stash,
     External,
     Merge,
+    History,
 }
 
 /// Paints `icon` inside `rect` using `color`.
@@ -200,6 +201,12 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             line(p(0.62, 0.48), p(0.84, 0.48));
             line(p(0.5, 0.14), p(0.5, 0.60));
             poly(vec![p(0.36, 0.46), p(0.5, 0.60), p(0.64, 0.46)]);
+        }
+        Icon::History => {
+            let c = p(0.5, 0.52);
+            poly(arc(c, 0.32, -2.6, 3.0));
+            poly(vec![p(0.5, 0.32), p(0.5, 0.54), p(0.64, 0.62)]);
+            poly(vec![p(0.10, 0.30), p(0.22, 0.38), p(0.30, 0.24)]);
         }
         Icon::External => {
             poly(vec![

@@ -10,9 +10,11 @@ use crate::editor::scm::{self, EditorAction, EditorGit, Peek};
 use crate::editor::{Document, Highlighter, gutter};
 use crate::git::status::Change;
 use crate::git::{self, PanelAction, ScmPanel, SourceControl};
+use crate::github::model::{CheckOutcome, WorkflowRun};
 use crate::github::{BranchContext, GhEvent, GitHub, ListAction, PrListPanel};
+use crate::history::{HistoryPane, RebasePane};
 use crate::lsp::{ServerBrowser, ServerManager};
-use crate::panes::{ChangesPane, CommitPane, Pane, PaneAction};
+use crate::panes::{ChangesPane, CommitPane, LogPane, Pane, PaneAction};
 use crate::settings::Settings;
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::activity::{self, SidebarView};
@@ -353,6 +355,9 @@ impl ForgeApp {
             (Pane::Changes(a), Pane::Changes(b)) => a.is_for(&b.entry.path, b.staged),
             (Pane::Commit(a), Pane::Commit(b)) => a.hash == b.hash,
             (Pane::PullRequest(a), Pane::PullRequest(b)) => a.number == b.number,
+            (Pane::History(a), Pane::History(b)) => a.path == b.path,
+            (Pane::Log(a), Pane::Log(b)) => a.key == b.key,
+            (Pane::Rebase(_), Pane::Rebase(_)) => true,
             _ => false,
         });
         match existing {
@@ -367,6 +372,30 @@ impl ForgeApp {
                 self.active_pane = Some(self.panes.len() - 1);
             }
         }
+    }
+
+    /// Opens the history tab for the repository, or one path in it.
+    fn open_history(&mut self, path: Option<String>) {
+        if !self.source_control.is_ready() {
+            self.status = "Not a git repository".to_owned();
+            return;
+        }
+        // The repository root has an empty relative path.
+        let path = path.filter(|p| !p.is_empty());
+        self.open_pane(Pane::History(Box::new(HistoryPane::new(path))));
+    }
+
+    fn open_rebase(&mut self, base: Option<String>) {
+        if self.source_control.status.operation.is_some() {
+            self.status = "Finish or abort the operation in progress first".to_owned();
+            return;
+        }
+        // A fresh plan each time: close any existing rebase tab.
+        if let Some(i) = self.panes.iter().position(|p| matches!(p, Pane::Rebase(_))) {
+            self.close_pane(i);
+        }
+        let pane = RebasePane::new(base, &self.source_control);
+        self.open_pane(Pane::Rebase(Box::new(pane)));
     }
 
     fn open_pull_request(&mut self, number: u64) {
@@ -428,6 +457,12 @@ impl ForgeApp {
                 GhEvent::OpenPr(n) => self.open_pull_request(n),
                 GhEvent::GitChanged => self.source_control.refresh(),
                 GhEvent::PrsChanged => self.github.refresh(),
+                GhEvent::OpenLog {
+                    title,
+                    run,
+                    job,
+                    failed_only,
+                } => self.open_log(title, run, job, failed_only),
             }
         }
     }
@@ -644,6 +679,19 @@ impl ForgeApp {
                     self.change_nav = Some(-1);
                     ui.close();
                 }
+                let active_path = self.documents.get(self.active).and_then(|d| d.path.clone());
+                if ui
+                    .add_enabled(active_path.is_some(), egui::Button::new("File History"))
+                    .clicked()
+                {
+                    let rel = active_path.and_then(|p| self.source_control.rel_path(&p));
+                    self.open_history(rel);
+                    ui.close();
+                }
+                if ui.button("Repository History").clicked() {
+                    self.open_history(None);
+                    ui.close();
+                }
                 ui.separator();
                 ui.menu_button("Theme", |ui| {
                     let mut chosen = None;
@@ -714,16 +762,29 @@ impl ForgeApp {
             return;
         };
         let mut clicked = None;
+        let mut history = None;
         let sc = &self.source_control;
         let colors = &self.themes[self.theme].ui;
         let decorate = |p: &Path| sc.decoration(p);
         egui::ScrollArea::vertical()
             .auto_shrink(false)
             .show(ui, |ui| {
-                file_tree(ui, &mut ws.root, true, &mut clicked, &decorate, colors)
+                file_tree(
+                    ui,
+                    &mut ws.root,
+                    true,
+                    &mut clicked,
+                    &mut history,
+                    &decorate,
+                    colors,
+                )
             });
         if let Some(path) = clicked {
             self.open_file(&path);
+        }
+        if let Some(path) = history {
+            let rel = self.source_control.rel_path(&path);
+            self.open_history(rel);
         }
     }
 
@@ -756,6 +817,8 @@ impl ForgeApp {
                         self.sidebar_view = SidebarView::PullRequests;
                         self.pr_panel.start_create();
                     }
+                    Some(PanelAction::OpenHistory) => self.open_history(None),
+                    Some(PanelAction::OpenRebase) => self.open_rebase(None),
                     None => {}
                 }
             }
@@ -821,7 +884,91 @@ impl ForgeApp {
                 self.open_pull_request(n);
             }
         }
+        self.ci_indicator(ui, &colors);
         ui.separator();
+    }
+
+    /// CI status for the checked-out commit, with a menu of its runs.
+    fn ci_indicator(&mut self, ui: &mut egui::Ui, colors: &UiColors) {
+        let Some(sha) = self.source_control.status.branch.oid.clone() else {
+            return;
+        };
+        let runs: Vec<WorkflowRun> = self.github.runs_for(&sha).into_iter().cloned().collect();
+        if runs.is_empty() {
+            return;
+        }
+        let outcomes: Vec<CheckOutcome> = runs.iter().map(WorkflowRun::outcome).collect();
+        let overall = if outcomes.contains(&CheckOutcome::Fail) {
+            CheckOutcome::Fail
+        } else if outcomes.contains(&CheckOutcome::Pending) {
+            CheckOutcome::Pending
+        } else {
+            CheckOutcome::Pass
+        };
+        let (glyph, color, tip) = crate::github::check_glyph(overall, colors);
+        let response = ui
+            .add(
+                egui::Label::new(RichText::new(format!("{glyph} CI")).small().color(color))
+                    .sense(egui::Sense::click()),
+            )
+            .on_hover_text(format!("{tip} for this commit. Click for details."));
+        let mut log = None;
+        let mut rerun = None;
+        egui::Popup::menu(&response).show(|ui| {
+            ui.set_min_width(340.0);
+            for run in &runs {
+                let (g, c, _) = crate::github::check_glyph(run.outcome(), colors);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(g).color(c));
+                    ui.label(RichText::new(&run.workflow_name).strong());
+                    let state = if run.status == "completed" {
+                        run.conclusion.clone()
+                    } else {
+                        run.status.replace('_', " ")
+                    };
+                    ui.label(RichText::new(state).small().color(colors.text_muted.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Open").clicked() {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(&run.url));
+                        }
+                        let failed = run.outcome() == CheckOutcome::Fail;
+                        if failed && ui.small_button("Re-run failed").clicked() {
+                            rerun = Some(run.database_id);
+                        }
+                        if run.status == "completed"
+                            && ui
+                                .small_button(if failed { "Failed log" } else { "Log" })
+                                .clicked()
+                        {
+                            log = Some((run.workflow_name.clone(), run.database_id, failed));
+                        }
+                    });
+                });
+            }
+        });
+        if let Some((name, id, failed)) = log {
+            self.open_log(format!("Log: {name}"), id, None, failed);
+        }
+        if let Some(id) = rerun {
+            self.github.rerun(id, true);
+            self.status = "Re-running failed jobs…".to_owned();
+        }
+    }
+
+    fn open_log(&mut self, title: String, run: u64, job: Option<u64>, failed_only: bool) {
+        let Some(task) = self.github.load_log(run, job, failed_only) else {
+            self.status = "GitHub isn't connected for this folder".to_owned();
+            return;
+        };
+        let key = format!("{run}/{job:?}/{failed_only}");
+        if let Some(i) = self
+            .panes
+            .iter()
+            .position(|p| matches!(p, Pane::Log(l) if l.key == key))
+        {
+            self.close_pane(i);
+        }
+        self.open_pane(Pane::Log(LogPane::new(title, key, task)));
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
@@ -1332,6 +1479,7 @@ fn file_tree(
     node: &mut FileNode,
     is_root: bool,
     clicked: &mut Option<PathBuf>,
+    history: &mut Option<PathBuf>,
     decorate: &dyn Fn(&Path) -> Option<Change>,
     colors: &UiColors,
 ) {
@@ -1349,12 +1497,16 @@ fn file_tree(
             .default_open(is_root)
             .show(ui, |ui| {
                 for child in node.children() {
-                    file_tree(ui, child, false, clicked, decorate, colors);
+                    file_tree(ui, child, false, clicked, history, decorate, colors);
                 }
             });
         header.header_response.context_menu(|ui| {
             if ui.button("Refresh").clicked() {
                 node.refresh();
+                ui.close();
+            }
+            if ui.button("Show History").clicked() {
+                *history = Some(node.path.clone());
                 ui.close();
             }
         });
@@ -1378,6 +1530,16 @@ fn file_tree(
         if response.clicked() {
             *clicked = Some(node.path.clone());
         }
+        response.context_menu(|ui| {
+            if ui.button("Open").clicked() {
+                *clicked = Some(node.path.clone());
+                ui.close();
+            }
+            if ui.button("Show History").clicked() {
+                *history = Some(node.path.clone());
+                ui.close();
+            }
+        });
     }
 }
 
@@ -1387,6 +1549,8 @@ impl eframe::App for ForgeApp {
         self.servers.poll();
         self.poll_updater();
         self.source_control.poll();
+        self.github
+            .watch_commit(self.source_control.status.branch.oid.clone());
         self.github
             .poll(self.sidebar_open && self.sidebar_view == SidebarView::PullRequests);
         self.handle_events();
@@ -1406,7 +1570,7 @@ impl eframe::App for ForgeApp {
             .exact_size(activity::WIDTH)
             .show(ui, |ui| {
                 let changes = self.source_control.status.change_count();
-                let review_requests = 0;
+                let review_requests = self.github.badge_count();
                 activity::show(
                     ui,
                     &mut self.sidebar_view,
@@ -1437,8 +1601,15 @@ impl eframe::App for ForgeApp {
                 match self.active_pane {
                     Some(i) if i < self.panes.len() => {
                         let action = self.panes[i].show(ui, &mut self.source_control, &colors);
-                        if let Some(PaneAction::OpenFile(rel)) = action {
-                            self.open_repo_file(&rel);
+                        match action {
+                            Some(PaneAction::OpenFile(rel)) => self.open_repo_file(&rel),
+                            Some(PaneAction::OpenCommit(hash)) => {
+                                let pane = CommitPane::new(hash, &self.source_control);
+                                self.open_pane(Pane::Commit(pane));
+                            }
+                            Some(PaneAction::OpenRebase(base)) => self.open_rebase(base),
+                            Some(PaneAction::Close) => self.close_pane(i),
+                            None => {}
                         }
                     }
                     _ => self.editor(ui),
