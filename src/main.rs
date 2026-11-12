@@ -17,6 +17,7 @@ mod task;
 mod theme;
 mod ui;
 mod updater;
+mod watcher;
 mod workspace;
 
 use app::ForgeApp;

@@ -97,6 +97,7 @@ impl ForgeApp {
 
     /// Records a newly opened folder and reopens the tabs it had last time.
     pub(super) fn folder_opened(&mut self, folder: &Path) {
+        self.start_watcher(folder);
         self.update_settings(|s| s.add_recent_folder(folder));
         let Some(session) = self.settings.session(folder).cloned() else {
             self.saved_session = None;

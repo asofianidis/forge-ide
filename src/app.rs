@@ -1,6 +1,7 @@
 //! Top-level application state and UI layout.
 
 mod editing;
+mod explorer;
 mod find_bar;
 mod pickers;
 mod search_panel;
@@ -11,7 +12,6 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use egui::collapsing_header::CollapsingState;
 use egui::text::CCursor;
 use egui::{Galley, Key, Modifiers, Rect, RichText, Shape, Stroke, TextStyle, pos2};
 
@@ -21,7 +21,6 @@ use crate::editor::find::Match;
 use crate::editor::ops;
 use crate::editor::scm::{self, EditorAction, EditorGit, Peek};
 use crate::editor::{DiskEvent, DiskState, Document, Highlighter, gutter};
-use crate::git::status::Change;
 use crate::git::{self, PanelAction, ScmPanel, SourceControl};
 use crate::github::model::{CheckOutcome, WorkflowRun};
 use crate::github::{BranchContext, GhEvent, GitHub, ListAction, PrListPanel};
@@ -33,12 +32,13 @@ use crate::search::FileIndex;
 use crate::settings::{Session, Settings};
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::activity::{self, SidebarView};
-use crate::ui::file_icons;
 use crate::ui::icons::{self, Icon};
 use crate::updater::{self, UpdateState, Updater};
-use crate::workspace::{FileKinds, FileNode, Workspace};
+use crate::watcher::FsWatcher;
+use crate::workspace::{FileKinds, Workspace};
 
 use editing::editor_id;
+use explorer::ExplorerDialog;
 use find_bar::FindBar;
 use pickers::{FileMatches, PickerMode};
 use search_panel::SearchPanel;
@@ -131,6 +131,10 @@ pub struct ForgeApp {
     egui_ctx: egui::Context,
     /// The current folder's tabs as last saved to the settings file.
     saved_session: Option<Session>,
+    /// Reports changes other programs make in the workspace folder.
+    watcher: Option<FsWatcher>,
+    /// New / Rename / Delete dialog from the file tree.
+    explorer_dialog: Option<ExplorerDialog>,
 }
 
 impl ForgeApp {
@@ -206,6 +210,8 @@ impl ForgeApp {
             was_focused: true,
             egui_ctx: cc.egui_ctx.clone(),
             saved_session: None,
+            watcher: None,
+            explorer_dialog: None,
         };
         if let Some(folder) = folder {
             app.folder_opened(&folder);
@@ -713,21 +719,33 @@ impl ForgeApp {
         }
     }
 
-    /// Checks open files for changes made by other programs: periodically,
-    /// and whenever the window regains focus.
+    /// Checks open files for changes made by other programs: files outside
+    /// the watched folder periodically, and all of them when the window
+    /// regains focus.
     fn poll_disk(&mut self, ctx: &egui::Context) {
         let focused = ctx.input(|i| i.focused);
         let regained_focus = focused && !self.was_focused;
         self.was_focused = focused;
-        if !self.documents.iter().any(|d| d.path.is_some()) {
+        // The watcher reports changes inside the folder as they happen, so
+        // the timer only covers files outside it (and focus changes all).
+        let watched: Vec<Option<bool>> = self
+            .documents
+            .iter()
+            .map(|d| d.path.as_deref().map(|p| self.is_watched(p)))
+            .collect();
+        if watched.contains(&Some(false)) {
+            ctx.request_repaint_after(DISK_POLL_INTERVAL);
+        } else if !regained_focus {
             return;
         }
-        ctx.request_repaint_after(DISK_POLL_INTERVAL);
         if !regained_focus && self.last_disk_poll.elapsed() < DISK_POLL_INTERVAL {
             return;
         }
         self.last_disk_poll = Instant::now();
-        for doc in &mut self.documents {
+        for (doc, watched) in self.documents.iter_mut().zip(watched) {
+            if watched != Some(false) && !regained_focus {
+                continue;
+            }
             match doc.poll_disk() {
                 Some(DiskEvent::Reloaded) => {
                     self.status = format!("Reloaded {} (changed on disk)", doc.title());
@@ -821,6 +839,12 @@ impl ForgeApp {
                 Some(i) => self.close_pane(i),
                 None => self.close_tab(self.active),
             },
+            Command::RevealActiveFile => {
+                match self.documents.get(self.active).and_then(|d| d.path.clone()) {
+                    Some(path) => self.reveal(&path),
+                    None => self.status = "Save the file first".to_owned(),
+                }
+            }
             Command::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             Command::Find => {
                 self.active_pane = None;
@@ -913,6 +937,8 @@ impl ForgeApp {
                 self.menu_item(ui, Save);
                 self.menu_item(ui, CloseTab);
                 ui.separator();
+                self.menu_item(ui, RevealActiveFile);
+                ui.separator();
                 self.menu_item(ui, Quit);
             });
             ui.menu_button("Edit", |ui| {
@@ -995,40 +1021,6 @@ impl ForgeApp {
                 ui.label(format!("Forge IDE {}", updater::VERSION));
             });
         });
-    }
-
-    fn explorer(&mut self, ui: &mut egui::Ui) {
-        let Some(ws) = &mut self.workspace else {
-            if ui.button("Open Folder…").clicked() {
-                self.open_folder_dialog();
-            }
-            return;
-        };
-        let mut clicked = None;
-        let mut history = None;
-        let sc = &self.source_control;
-        let colors = &self.themes[self.theme].ui;
-        let decorate = |p: &Path| sc.decoration(p);
-        egui::ScrollArea::vertical()
-            .auto_shrink(false)
-            .show(ui, |ui| {
-                file_tree(
-                    ui,
-                    &mut ws.root,
-                    true,
-                    &mut clicked,
-                    &mut history,
-                    &decorate,
-                    colors,
-                )
-            });
-        if let Some(path) = clicked {
-            self.open_file(&path);
-        }
-        if let Some(path) = history {
-            let rel = self.source_control.rel_path(&path);
-            self.open_history(rel);
-        }
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
@@ -1878,105 +1870,18 @@ fn open_path(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Recursively renders a directory tree. Sets `clicked` when a file is
-/// selected. Names are colored by their git state.
-fn file_tree(
-    ui: &mut egui::Ui,
-    node: &mut FileNode,
-    is_root: bool,
-    clicked: &mut Option<PathBuf>,
-    history: &mut Option<PathBuf>,
-    decorate: &dyn Fn(&Path) -> Option<Change>,
-    colors: &UiColors,
-) {
-    let change = decorate(&node.path);
-    let mut name = RichText::new(&node.name);
-    if let Some(c) = change {
-        name = name.color(git::panel_change_color(c, colors));
-        if c == Change::Deleted {
-            name = name.strikethrough();
-        }
-    }
-    let dark = ui.visuals().dark_mode;
-    if node.is_dir {
-        let id = ui.make_persistent_id(&node.path);
-        let state = CollapsingState::load_with_default_open(ui.ctx(), id, is_root);
-        let open = state.is_open();
-        let (_, header, _) = state
-            .show_header(ui, |ui| {
-                file_icons::show(ui, file_icons::folder(&node.name, open, is_root, dark));
-                ui.spacing_mut().item_spacing.x = 4.0;
-                ui.add(egui::Button::selectable(false, name).frame_when_inactive(false))
-            })
-            .body(|ui| {
-                for child in node.children() {
-                    file_tree(ui, child, false, clicked, history, decorate, colors);
-                }
-            });
-        // Clicking the name toggles the folder, like the arrow does.
-        if header.inner.clicked() {
-            let mut state = CollapsingState::load_with_default_open(ui.ctx(), id, is_root);
-            state.toggle(ui);
-            state.store(ui.ctx());
-        }
-        header.inner.context_menu(|ui| {
-            if ui.button("Refresh").clicked() {
-                node.refresh();
-                ui.close();
-            }
-            if ui.button("Show History").clicked() {
-                *history = Some(node.path.clone());
-                ui.close();
-            }
-        });
-    } else {
-        let response = ui
-            .horizontal(|ui| {
-                // Leave room for the arrow folders have, so icons line up.
-                ui.add_space(ui.spacing().indent);
-                file_icons::show(ui, file_icons::file(&node.name, dark));
-                ui.spacing_mut().item_spacing.x = 4.0;
-                let r = ui.selectable_label(false, name);
-                if let Some(c) = change {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(c.letter())
-                                .small()
-                                .color(git::panel_change_color(c, colors)),
-                        )
-                        .on_hover_text(c.describe());
-                    });
-                }
-                r
-            })
-            .inner;
-        if response.clicked() {
-            *clicked = Some(node.path.clone());
-        }
-        response.context_menu(|ui| {
-            if ui.button("Open").clicked() {
-                *clicked = Some(node.path.clone());
-                ui.close();
-            }
-            if ui.button("Show History").clicked() {
-                *history = Some(node.path.clone());
-                ui.close();
-            }
-        });
-    }
-}
-
 impl eframe::App for ForgeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.intercept_close(&ctx);
         // The dialog is modal; keep shortcuts from acting behind it.
-        if self.pending_close.is_none() {
+        if self.pending_close.is_none() && self.explorer_dialog.is_none() {
             self.handle_shortcuts(&ctx);
         }
         self.servers.poll();
         self.poll_updater();
         self.search.search.poll();
+        self.poll_watcher(&ctx);
         self.poll_disk(&ctx);
         self.source_control.poll();
         self.github
@@ -2060,6 +1965,7 @@ impl eframe::App for ForgeApp {
         for cmd in std::mem::take(&mut self.pending_commands) {
             self.run_command(&ctx, cmd);
         }
+        self.explorer_dialog(&ctx);
         self.close_dialog(&ctx);
         self.persist_session(false);
     }

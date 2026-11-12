@@ -13,6 +13,7 @@ pub enum Command {
     OpenRecent,
     Save,
     CloseTab,
+    RevealActiveFile,
     Quit,
     Find,
     Replace,
@@ -41,6 +42,15 @@ pub enum Command {
     CheckForUpdates,
 }
 
+/// The platform's name for showing a file in its file manager.
+pub const REVEAL_LABEL: &str = if cfg!(target_os = "macos") {
+    "Reveal in Finder"
+} else if cfg!(target_os = "windows") {
+    "Reveal in File Explorer"
+} else {
+    "Open Containing Folder"
+};
+
 const fn shortcut(modifiers: Modifiers, key: Key) -> KeyboardShortcut {
     KeyboardShortcut::new(modifiers, key)
 }
@@ -59,6 +69,7 @@ impl Command {
         Command::OpenRecent,
         Command::Save,
         Command::CloseTab,
+        Command::RevealActiveFile,
         Command::Quit,
         Command::Find,
         Command::Replace,
@@ -96,6 +107,7 @@ impl Command {
             Command::OpenRecent => "Open Recent Folder…",
             Command::Save => "Save",
             Command::CloseTab => "Close Tab",
+            Command::RevealActiveFile => REVEAL_LABEL,
             Command::Quit => "Quit",
             Command::Find => "Find",
             Command::Replace => "Replace",
@@ -129,7 +141,8 @@ impl Command {
     pub fn category(self) -> &'static str {
         use Command::*;
         match self {
-            NewFile | OpenFile | OpenFolder | OpenRecent | Save | CloseTab | Quit => "File",
+            NewFile | OpenFile | OpenFolder | OpenRecent | Save | CloseTab | RevealActiveFile
+            | Quit => "File",
             Find | Replace | FindInProject | ToggleComment | Indent | Outdent | DuplicateLine
             | MoveLineUp | MoveLineDown => "Edit",
             QuickOpen | GoToLine => "Go",

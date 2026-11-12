@@ -7,7 +7,12 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
 ## Features
 
 - Activity bar with four sidebar views: **Explorer**, **Search**, **Source Control** and **Pull Requests**
-- File explorer with lazily-loaded directory tree, colored by git status
+- File explorer with lazily-loaded directory tree, colored by git status. Right-click to create
+  files and folders (`a/b/c.rs` creates the folders in between), rename, delete (to the trash),
+  reveal in Finder / File Explorer, or copy the path
+- File watching (via [notify](https://github.com/notify-rs/notify)): the explorer, open files and
+  git status follow changes made by other programs as they happen. Unmodified open files reload;
+  files with unsaved edits show a banner to reload or keep your version
 - Tabbed editing with unsaved-change indicators
 - Session restore: each folder reopens with the tabs, selected tab and cursor positions it had
   last time. Starting Forge without a folder argument opens the last folder you used
@@ -201,6 +206,7 @@ src/
 ├── app.rs               # application state and UI layout
 ├── app/
 │   ├── editing.rs       # line-editing commands, selection helpers, Go to Line
+│   ├── explorer.rs      # file tree, its new / rename / delete / reveal actions, watcher events
 │   ├── find_bar.rs      # find / replace bar
 │   ├── search_panel.rs  # "Search" sidebar
 │   └── pickers.rs       # quick open, command palette, theme picker
@@ -215,7 +221,8 @@ src/
 ├── settings.rs          # persisted preferences (settings.toml)
 ├── theme.rs             # built-in + custom themes
 ├── updater.rs           # self-update from GitHub releases
-├── workspace.rs         # file tree / project explorer, file-type scan
+├── watcher.rs           # file watching (notify), batching events for the UI
+├── workspace.rs         # file tree / project explorer, file operations, file-type scan
 ├── git/
 │   ├── mod.rs           # repository state and operations
 │   ├── status.rs        # `git status --porcelain=v2` parser
