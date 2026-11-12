@@ -47,6 +47,7 @@ use crate::ui::activity::{self, SidebarView};
 use crate::ui::icons::{self, Icon};
 use crate::updater::{self, UpdateState, Updater};
 use crate::watcher::FsWatcher;
+use crate::windows::{self, Windows};
 use crate::workspace::{FileKinds, Workspace};
 
 use editing::editor_id;
@@ -181,10 +182,15 @@ pub struct ForgeApp {
     minimap_scroll: Option<f32>,
     /// Ids of the Markdown documents showing a preview beside the editor.
     markdown_preview: HashSet<u64>,
+    /// The other Forge windows, and this one's entry among them.
+    windows: Windows,
+    /// Title last given to the OS window.
+    window_title: String,
 }
 
 impl ForgeApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, root: Option<PathBuf>) -> Self {
+    /// `new_window` starts without a folder instead of reopening the last one.
+    pub fn new(cc: &eframe::CreationContext<'_>, root: Option<PathBuf>, new_window: bool) -> Self {
         let settings = Settings::load();
         let (keymap, keymap_errors) = Keymap::new(&settings.keybindings);
         let keymap_source = settings.keybindings.clone();
@@ -223,7 +229,9 @@ impl ForgeApp {
         themes[idx].apply(&cc.egui_ctx);
         crate::ui::diff_style::set_theme(themes[idx].syntect_theme());
 
-        let root = session::startup_folder(root, &settings)
+        let root = (!new_window)
+            .then(|| session::startup_folder(root, &settings))
+            .flatten()
             .filter(|p| p.is_dir())
             .map(|p| std::path::absolute(&p).unwrap_or(p));
         let workspace = root.map(Workspace::open);
@@ -288,6 +296,8 @@ impl ForgeApp {
             minimap: Default::default(),
             minimap_scroll: None,
             markdown_preview: HashSet::new(),
+            windows: Windows::register(&cc.egui_ctx),
+            window_title: String::new(),
         };
         if let Some(folder) = folder {
             app.folder_opened(&folder);
@@ -495,6 +505,9 @@ impl ForgeApp {
 
     fn open_folder(&mut self, path: PathBuf) {
         let path = std::path::absolute(&path).unwrap_or(path);
+        if self.focus_window_with_folder(&path) {
+            return;
+        }
         // Remember the tabs (and cursors) of the folder being left.
         self.persist_session(true);
         self.status = format!("Opened folder {}", path.display());
@@ -510,15 +523,82 @@ impl ForgeApp {
         self.folder_opened(&path);
     }
 
-    /// Starts another Forge process with `path` open.
+    /// Starts another Forge window with `path` open.
     fn open_folder_in_new_window(&mut self, path: &Path) {
-        let result = std::env::current_exe()
-            .map_err(anyhow::Error::from)
-            .and_then(|exe| Ok(std::process::Command::new(exe).arg(path).spawn()?));
-        self.status = match result {
-            Ok(_) => format!("Opened {} in a new window", path.display()),
+        let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        if self.focus_window_with_folder(&path) {
+            return;
+        }
+        self.status = match windows::spawn_with_folder(&path) {
+            Ok(()) => format!("Opened {} in a new window", path.display()),
             Err(e) => format!("Error: couldn't open a new window: {e:#}"),
         };
+    }
+
+    /// Starts another, empty Forge window.
+    fn new_window(&mut self) {
+        self.status = match windows::spawn_empty() {
+            Ok(()) => "Opened a new window".to_owned(),
+            Err(e) => format!("Error: couldn't open a new window: {e:#}"),
+        };
+    }
+
+    /// If another window already has `folder` open, brings it to the front
+    /// (rather than opening the folder twice, where the windows would
+    /// overwrite each other's saved tabs) and returns true.
+    fn focus_window_with_folder(&mut self, folder: &Path) -> bool {
+        let Some(window) = self.windows.other_with_folder(folder) else {
+            return false;
+        };
+        self.focus_window(&window);
+        true
+    }
+
+    fn focus_window(&mut self, window: &windows::WindowInfo) {
+        if let Err(e) = self.windows.focus(window.pid) {
+            self.status = format!("Error: couldn't switch windows: {e:#}");
+        }
+    }
+
+    /// Names the OS window after its folder, so windows can be told apart in
+    /// the Window menu, the taskbar and the window switcher.
+    fn sync_window_title(&mut self, ctx: &egui::Context) {
+        let folder = self.workspace.as_ref().map(|w| w.root.path.clone());
+        let title = match folder.as_deref().and_then(Path::file_name) {
+            Some(name) => format!("{} — Forge IDE", name.to_string_lossy()),
+            None => "Forge IDE".to_owned(),
+        };
+        if title != self.window_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.window_title = title;
+        }
+        self.windows.set(&self.window_title, folder.as_deref());
+    }
+
+    /// Window menu: new and close, then every open Forge window.
+    fn window_menu(&mut self, ui: &mut egui::Ui) {
+        self.menu_item(ui, Command::NewWindow);
+        self.menu_item(ui, Command::CloseWindow);
+        ui.separator();
+        let me = self.windows.pid();
+        for window in self.windows.list() {
+            let current = window.pid == me;
+            let mut button = egui::Button::selectable(current, window.name());
+            if let Some(folder) = &window.folder {
+                button = button.shortcut_text(session::display_folder(folder));
+            }
+            let response = ui.add(button).on_hover_text(if current {
+                "This window".to_owned()
+            } else {
+                format!("Switch to {}", window.title)
+            });
+            if response.clicked() {
+                if !current {
+                    self.focus_window(&window);
+                }
+                ui.close();
+            }
+        }
     }
 
     /// Opens a repository-relative path from source control in the editor.
@@ -1156,6 +1236,8 @@ impl ForgeApp {
             Command::ShowProblems => self.show_problems(),
             Command::ToggleTerminal => self.toggle_terminal(ctx),
             Command::RestartTerminal => self.restart_terminal(ctx),
+            Command::NewWindow => self.new_window(),
+            Command::CloseWindow => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             Command::CheckForUpdates => self.check_for_updates(ctx),
         }
     }
@@ -1221,7 +1303,7 @@ impl ForgeApp {
         use Command::*;
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
-                for cmd in [NewFile, OpenFile, OpenFolder] {
+                for cmd in [NewFile, NewWindow, OpenFile, OpenFolder] {
                     self.menu_item(ui, cmd);
                 }
                 self.open_recent_menu(ui);
@@ -1385,6 +1467,7 @@ impl ForgeApp {
                 self.menu_item(ui, ToggleTerminal);
                 self.menu_item(ui, RestartTerminal);
             });
+            ui.menu_button("Window", |ui| self.window_menu(ui));
             ui.menu_button("Help", |ui| {
                 self.menu_item(ui, CheckForUpdates);
                 let mut auto = self
@@ -2467,6 +2550,8 @@ impl eframe::App for ForgeApp {
         let ctx = ui.ctx().clone();
         self.sync_keymap();
         self.intercept_close(&ctx);
+        self.windows.poll(&ctx);
+        self.sync_window_title(&ctx);
         // The dialog is modal; keep shortcuts from acting behind it.
         if self.pending_close.is_none()
             && self.explorer_dialog.is_none()
@@ -2600,6 +2685,7 @@ impl eframe::App for ForgeApp {
 
     fn on_exit(&mut self) {
         self.persist_session(true);
+        self.windows.unregister();
     }
 }
 

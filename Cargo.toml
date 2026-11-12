@@ -34,6 +34,13 @@ url = "2.5.8"
 vt100 = "0.18"
 zip = { version = "9.5.1", default-features = false, features = ["deflate"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Bringing another Forge window (a separate process) to the front.
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "libc", "NSRunningApplication"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
 [profile.release]
 lto = "thin"
 

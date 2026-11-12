@@ -25,6 +25,10 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
   last time. Starting Forge without a folder argument opens the last folder you used
   (`forge-ide .` opens the current directory)
 - **File → Open Recent** (or Ctrl+R) lists the last 10 folders you opened
+- Multiple windows: **Window → New Window** (Ctrl+Shift+N) opens an empty window, and the
+  **Window** menu lists every open Forge window by folder; click one to switch to it. Each window
+  is its own process, so a busy language server or terminal in one never stalls another. Opening
+  a folder that another window already has switches to that window
 - Syntax highlighting for many languages (via [syntect](https://github.com/trishume/syntect))
 - Markdown preview (Cmd/Ctrl+Shift+V, the eye button at the end of the tab bar, or
   **View → Markdown Preview**): renders the open `.md` file beside the editor and follows your
@@ -328,6 +332,8 @@ cargo run --release -- path/to/project
 | Save                   | Ctrl+S                                  |
 | Save as                | Ctrl+Shift+S                            |
 | Close tab              | Ctrl+W                                  |
+| New window             | Ctrl+Shift+N                            |
+| Close window           | Ctrl+Shift+W                            |
 | Undo                   | Ctrl+Z                                  |
 | Redo                   | Ctrl+Y / Ctrl+Shift+Z (Cmd+Shift+Z on macOS) |
 | Next / previous tab    | Ctrl+Tab / Ctrl+Shift+Tab (Ctrl on macOS too) |
