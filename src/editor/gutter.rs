@@ -1,7 +1,16 @@
 //! Line-number gutter painted into the left margin of the editor `TextEdit`.
 
 use egui::text_edit::TextEditOutput;
-use egui::{Align2, Color32, FontId, Stroke, pos2};
+use egui::{Align2, Color32, FontId, Rect, Shape, Stroke, pos2, vec2};
+
+use crate::git::line_changes::{LineChanges, Mark};
+
+/// Colors for the source control change markers.
+pub struct MarkColors {
+    pub added: Color32,
+    pub modified: Color32,
+    pub deleted: Color32,
+}
 
 /// Horizontal padding on each side of the line numbers, in points.
 const PADDING: f32 = 8.0;
@@ -18,7 +27,15 @@ pub fn width(line_count: usize, digit_width: f32) -> f32 {
 /// Paints line numbers next to each logical line of the laid-out text.
 ///
 /// Wrapped continuation rows get no number. Only rows inside the clip rect are painted.
-pub fn paint(ui: &egui::Ui, output: &TextEditOutput, current_line: usize, font: &FontId) {
+/// When `changes` is given, lines that differ from the committed version get
+/// a colored bar (added/modified) or a small wedge (deleted lines above).
+pub fn paint(
+    ui: &egui::Ui,
+    output: &TextEditOutput,
+    current_line: usize,
+    font: &FontId,
+    changes: Option<(&LineChanges, &MarkColors)>,
+) {
     let painter = ui.painter();
     let clip = ui.clip_rect();
     let visuals = ui.visuals();
@@ -40,7 +57,18 @@ pub fn paint(ui: &egui::Ui, output: &TextEditOutput, current_line: usize, font: 
     let mut starts_line = true;
     for row in &output.galley.rows {
         let rect = row.rect().translate(output.galley_pos.to_vec2());
-        if starts_line && rect.bottom() >= clip.top() && rect.top() <= clip.bottom() {
+        let visible = rect.bottom() >= clip.top() && rect.top() <= clip.bottom();
+        if visible && let Some((changes, colors)) = changes {
+            paint_mark(
+                painter,
+                changes.get(line),
+                starts_line,
+                rect,
+                separator_x,
+                colors,
+            );
+        }
+        if starts_line && visible {
             let color: Color32 = if line == current_line { strong } else { dim };
             painter.text(
                 pos2(right, rect.top()),
@@ -57,6 +85,33 @@ pub fn paint(ui: &egui::Ui, output: &TextEditOutput, current_line: usize, font: 
         if starts_line {
             line += 1;
         }
+    }
+}
+
+fn paint_mark(
+    painter: &egui::Painter,
+    mark: Option<Mark>,
+    starts_line: bool,
+    row: Rect,
+    separator_x: f32,
+    colors: &MarkColors,
+) {
+    let bar = |color: Color32| {
+        let r = Rect::from_x_y_ranges(separator_x - 4.0..=separator_x - 1.0, row.y_range());
+        painter.rect_filled(r, 0, color);
+    };
+    match mark {
+        Some(Mark::Added) => bar(colors.added),
+        Some(Mark::Modified) => bar(colors.modified),
+        Some(Mark::DeletedAbove) if starts_line => {
+            let tip = pos2(separator_x - 1.0, row.top());
+            painter.add(Shape::convex_polygon(
+                vec![tip - vec2(5.0, 4.0), tip, tip - vec2(5.0, -4.0)],
+                colors.deleted,
+                Stroke::NONE,
+            ));
+        }
+        _ => {}
     }
 }
 

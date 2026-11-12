@@ -52,7 +52,8 @@ fn read_dir_sorted(dir: &Path) -> Vec<FileNode> {
     let mut nodes: Vec<FileNode> = entries
         .filter_map(Result::ok)
         .map(|e| FileNode::new(e.path()))
-        .filter(|n| !(n.is_dir && IGNORED_DIRS.contains(&n.name.as_str())))
+        // `.git` is a file in worktrees and submodules, so hide it either way.
+        .filter(|n| !((n.is_dir || n.name == ".git") && IGNORED_DIRS.contains(&n.name.as_str())))
         .collect();
     // Directories first, then case-insensitive alphabetical.
     nodes.sort_by(|a, b| {

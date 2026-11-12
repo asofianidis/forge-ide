@@ -1,14 +1,23 @@
 //! Top-level application state and UI layout.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash as _, Hasher as _};
 use std::path::{Path, PathBuf};
 
-use egui::{Key, KeyboardShortcut, Modifiers, TextStyle};
+use egui::{Key, KeyboardShortcut, Modifiers, RichText, TextStyle};
 
 use crate::editor::{Document, Highlighter, gutter};
+use crate::git::line_changes::{self, LineChanges};
+use crate::git::status::Change;
+use crate::git::{self, PanelAction, ScmPanel, SourceControl};
+use crate::github::{BranchContext, GhEvent, GitHub, ListAction, PrListPanel};
 use crate::lsp::{ServerBrowser, ServerManager};
+use crate::panes::{ChangesPane, CommitPane, Pane, PaneAction};
 use crate::settings::Settings;
-use crate::theme::{self, Theme};
+use crate::task::{self, Pending};
+use crate::theme::{self, Theme, UiColors};
+use crate::ui::activity::{self, SidebarView};
+use crate::ui::icons::{self, Icon};
 use crate::updater::{self, UpdateState, Updater};
 use crate::workspace::{FileKinds, FileNode, Workspace};
 
@@ -16,6 +25,22 @@ const SHORTCUT_NEW: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND,
 const SHORTCUT_OPEN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::O);
 const SHORTCUT_SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
 const SHORTCUT_CLOSE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::W);
+const SHORTCUT_EXPLORER: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::E);
+const SHORTCUT_SCM: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::G);
+const SHORTCUT_PRS: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::P);
+
+/// Committed content of an open file, for the gutter change markers.
+struct GutterBase {
+    /// Source control revision the content was loaded at.
+    revision: u64,
+    task: Option<Pending<Option<String>>>,
+    content: Option<String>,
+    /// Markers computed for the buffer text with this hash.
+    cache: Option<(u64, LineChanges)>,
+}
 
 pub struct ForgeApp {
     workspace: Option<Workspace>,
@@ -39,6 +64,17 @@ pub struct ForgeApp {
     /// The current check was started from the menu, so "up to date" and
     /// errors are worth reporting.
     manual_update_check: bool,
+    source_control: SourceControl,
+    scm_panel: ScmPanel,
+    github: GitHub,
+    pr_panel: PrListPanel,
+    sidebar_view: SidebarView,
+    sidebar_open: bool,
+    /// Diff, commit and pull request tabs, shown after the documents.
+    panes: Vec<Pane>,
+    /// When set, the central area shows this pane instead of a document.
+    active_pane: Option<usize>,
+    gutter_bases: HashMap<PathBuf, GutterBase>,
 }
 
 impl ForgeApp {
@@ -63,8 +99,19 @@ impl ForgeApp {
         });
         themes[idx].apply(&cc.egui_ctx);
 
+        let workspace = root.filter(|p| p.is_dir()).map(Workspace::open);
+        let folder = workspace.as_ref().map(|w| w.root.path.clone());
         Self {
-            workspace: root.filter(|p| p.is_dir()).map(Workspace::open),
+            source_control: SourceControl::new(cc.egui_ctx.clone(), folder.as_deref()),
+            scm_panel: ScmPanel::default(),
+            github: GitHub::new(cc.egui_ctx.clone(), folder.as_deref()),
+            pr_panel: PrListPanel::default(),
+            sidebar_view: SidebarView::Explorer,
+            sidebar_open: true,
+            panes: Vec::new(),
+            active_pane: None,
+            gutter_bases: HashMap::new(),
+            workspace,
             documents: vec![Document::untitled()],
             active: 0,
             highlighter: Highlighter::new(themes[idx].syntect_theme()),
@@ -237,6 +284,7 @@ impl ForgeApp {
     }
 
     fn open_file(&mut self, path: &Path) {
+        self.active_pane = None;
         if let Some(idx) = self
             .documents
             .iter()
@@ -247,6 +295,13 @@ impl ForgeApp {
         }
         match Document::open(path) {
             Ok(doc) => {
+                // Replace a pristine untitled tab instead of piling up tabs.
+                if let [only] = self.documents.as_slice()
+                    && only.path.is_none()
+                    && only.text.is_empty()
+                {
+                    self.documents.clear();
+                }
                 self.documents.push(doc);
                 self.active = self.documents.len() - 1;
                 self.status = format!("Opened {}", path.display());
@@ -264,8 +319,155 @@ impl ForgeApp {
     fn open_folder_dialog(&mut self) {
         if let Some(path) = rfd::FileDialog::new().pick_folder() {
             self.status = format!("Opened folder {}", path.display());
+            self.source_control.open(Some(&path));
+            self.github.open(Some(&path));
+            self.panes.clear();
+            self.active_pane = None;
+            self.gutter_bases.clear();
             self.workspace = Some(Workspace::open(path));
         }
+    }
+
+    /// Opens a repository-relative path from source control in the editor.
+    fn open_repo_file(&mut self, rel: &str) {
+        if let Some(path) = self.source_control.abs_path(rel) {
+            self.open_file(&path);
+        }
+    }
+
+    /// Shows `pane`, reusing an existing tab for the same content.
+    fn open_pane(&mut self, pane: Pane) {
+        let existing = self.panes.iter().position(|p| match (p, &pane) {
+            (Pane::Changes(a), Pane::Changes(b)) => a.is_for(&b.entry.path, b.staged),
+            (Pane::Commit(a), Pane::Commit(b)) => a.hash == b.hash,
+            (Pane::PullRequest(a), Pane::PullRequest(b)) => a.number == b.number,
+            _ => false,
+        });
+        match existing {
+            Some(i) => {
+                if let Pane::PullRequest(p) = &mut self.panes[i] {
+                    p.reload();
+                }
+                self.active_pane = Some(i);
+            }
+            None => {
+                self.panes.push(pane);
+                self.active_pane = Some(self.panes.len() - 1);
+            }
+        }
+    }
+
+    fn open_pull_request(&mut self, number: u64) {
+        match self.github.open_pr(number) {
+            Some(pane) => self.open_pane(Pane::PullRequest(Box::new(pane))),
+            None => self.status = "GitHub isn't connected for this folder".to_owned(),
+        }
+    }
+
+    fn close_pane(&mut self, idx: usize) {
+        if idx >= self.panes.len() {
+            return;
+        }
+        self.panes.remove(idx);
+        self.active_pane = match self.active_pane {
+            Some(a) if a == idx => {
+                if self.panes.is_empty() {
+                    None
+                } else {
+                    Some(idx.min(self.panes.len() - 1))
+                }
+            }
+            Some(a) if a > idx => Some(a - 1),
+            other => other,
+        };
+    }
+
+    fn show_sidebar(&mut self, view: SidebarView) {
+        if self.sidebar_view == view && self.sidebar_open {
+            self.sidebar_open = false;
+        } else {
+            self.sidebar_view = view;
+            self.sidebar_open = true;
+        }
+        if view == SidebarView::PullRequests && self.github.is_ready() {
+            self.github.refresh();
+        }
+    }
+
+    /// Moves source control and GitHub messages into the status bar and
+    /// reacts to cross-cutting events.
+    fn handle_events(&mut self) {
+        for event in self.source_control.take_events() {
+            self.status = match event {
+                git::Event::Done(msg) => msg,
+                git::Event::Failed(msg) => format!("Error: {msg}"),
+            };
+        }
+        let mut gh_events = self.github.take_events();
+        for pane in &mut self.panes {
+            if let Pane::PullRequest(p) = pane {
+                gh_events.extend(p.take_events());
+            }
+        }
+        for event in gh_events {
+            match event {
+                GhEvent::Done(msg) => self.status = msg,
+                GhEvent::Failed(msg) => self.status = format!("Error: {msg}"),
+                GhEvent::OpenPr(n) => self.open_pull_request(n),
+                GhEvent::GitChanged => self.source_control.refresh(),
+                GhEvent::PrsChanged => self.github.refresh(),
+            }
+        }
+    }
+
+    fn branch_context(&self) -> BranchContext {
+        let sc = &self.source_control;
+        let b = &sc.status.branch;
+        BranchContext {
+            branch: b.head.clone(),
+            has_upstream: b.upstream.is_some(),
+            remote: sc.default_remote(),
+            last_subject: sc.log.first().map(|c| c.subject.clone()),
+            ahead: b.ahead,
+        }
+    }
+
+    /// Gutter markers for the active document, loading the committed
+    /// version in the background as needed.
+    fn active_line_changes(&mut self) -> Option<LineChanges> {
+        let sc = &self.source_control;
+        if !sc.is_ready() {
+            return None;
+        }
+        let doc = self.documents.get(self.active)?;
+        let path = doc.path.clone()?;
+        let rel = sc.rel_path(&path)?;
+        if sc.status.find(&rel).is_some_and(|e| e.is_untracked()) {
+            return None;
+        }
+        let revision = sc.revision;
+        let base = self.gutter_bases.entry(path).or_insert_with(|| GutterBase {
+            revision: u64::MAX,
+            task: None,
+            content: None,
+            cache: None,
+        });
+        if base.task.is_none() && base.revision != revision {
+            base.revision = revision;
+            base.task = sc.load_head_content(&rel);
+        }
+        if let Some(content) = task::poll(&mut base.task) {
+            base.content = content;
+            base.cache = None;
+        }
+        let content = base.content.as_deref()?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        doc.text.hash(&mut hasher);
+        let hash = hasher.finish();
+        if base.cache.as_ref().is_none_or(|(h, _)| *h != hash) {
+            base.cache = Some((hash, line_changes::compute(content, &doc.text)));
+        }
+        base.cache.as_ref().map(|(_, c)| c.clone())
     }
 
     fn save_active(&mut self) {
@@ -283,6 +485,7 @@ impl ForgeApp {
             Ok(()) => format!("Saved {}", doc.title()),
             Err(e) => format!("Error: {e:#}"),
         };
+        self.source_control.refresh();
     }
 
     fn close_tab(&mut self, idx: usize) {
@@ -307,6 +510,22 @@ impl ForgeApp {
                 i.consume_shortcut(&SHORTCUT_CLOSE),
             )
         });
+        let (explorer, scm, prs) = ctx.input_mut(|i| {
+            (
+                i.consume_shortcut(&SHORTCUT_EXPLORER),
+                i.consume_shortcut(&SHORTCUT_SCM),
+                i.consume_shortcut(&SHORTCUT_PRS),
+            )
+        });
+        if explorer {
+            self.show_sidebar(SidebarView::Explorer);
+        }
+        if scm {
+            self.show_sidebar(SidebarView::SourceControl);
+        }
+        if prs {
+            self.show_sidebar(SidebarView::PullRequests);
+        }
         if new {
             self.new_file();
         }
@@ -317,7 +536,10 @@ impl ForgeApp {
             self.save_active();
         }
         if close {
-            self.close_tab(self.active);
+            match self.active_pane {
+                Some(i) => self.close_pane(i),
+                None => self.close_tab(self.active),
+            }
         }
     }
 
@@ -386,6 +608,24 @@ impl ForgeApp {
                 }
             });
             ui.menu_button("View", |ui| {
+                let ctx = ui.ctx().clone();
+                for (view, shortcut) in [
+                    (SidebarView::Explorer, SHORTCUT_EXPLORER),
+                    (SidebarView::SourceControl, SHORTCUT_SCM),
+                    (SidebarView::PullRequests, SHORTCUT_PRS),
+                ] {
+                    if ui
+                        .add(
+                            egui::Button::new(view.title())
+                                .shortcut_text(ctx.format_shortcut(&shortcut)),
+                        )
+                        .clicked()
+                    {
+                        self.show_sidebar(view);
+                        ui.close();
+                    }
+                }
+                ui.separator();
                 ui.menu_button("Theme", |ui| {
                     let mut chosen = None;
                     for (idx, theme) in self.themes.iter().enumerate() {
@@ -455,17 +695,120 @@ impl ForgeApp {
             return;
         };
         let mut clicked = None;
+        let sc = &self.source_control;
+        let colors = &self.themes[self.theme].ui;
+        let decorate = |p: &Path| sc.decoration(p);
         egui::ScrollArea::vertical()
             .auto_shrink(false)
-            .show(ui, |ui| file_tree(ui, &mut ws.root, true, &mut clicked));
+            .show(ui, |ui| {
+                file_tree(ui, &mut ws.root, true, &mut clicked, &decorate, colors)
+            });
         if let Some(path) = clicked {
             self.open_file(&path);
         }
     }
 
+    fn sidebar(&mut self, ui: &mut egui::Ui) {
+        // Draw into a child sized to the panel and allocate exactly that
+        // space, so wide content can never push the resizable panel wider.
+        let rect = ui.available_rect_before_wrap();
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+        child.set_clip_rect(rect.intersect(ui.clip_rect()));
+        self.sidebar_contents(&mut child);
+        ui.allocate_rect(rect, egui::Sense::hover());
+    }
+
+    fn sidebar_contents(&mut self, ui: &mut egui::Ui) {
+        let colors = self.current_theme().ui.clone();
+        match self.sidebar_view {
+            SidebarView::Explorer => self.explorer(ui),
+            SidebarView::SourceControl => {
+                ui.add_space(4.0);
+                match self.scm_panel.show(ui, &mut self.source_control, &colors) {
+                    Some(PanelAction::OpenDiff { entry, staged }) => {
+                        self.open_pane(Pane::Changes(ChangesPane::new(entry, staged)));
+                    }
+                    Some(PanelAction::OpenFile(rel)) => self.open_repo_file(&rel),
+                    Some(PanelAction::OpenCommit(hash)) => {
+                        let pane = CommitPane::new(hash, &self.source_control);
+                        self.open_pane(Pane::Commit(pane));
+                    }
+                    Some(PanelAction::CreatePullRequest) => {
+                        self.sidebar_view = SidebarView::PullRequests;
+                        self.pr_panel.start_create();
+                    }
+                    None => {}
+                }
+            }
+            SidebarView::PullRequests => {
+                ui.add_space(4.0);
+                let branch = self.branch_context();
+                if let Some(ListAction::Open(n)) =
+                    self.pr_panel.show(ui, &mut self.github, &branch, &colors)
+                {
+                    self.open_pull_request(n);
+                }
+            }
+        }
+    }
+
+    /// Branch, sync state and current PR at the left of the status bar.
+    fn branch_indicator(&mut self, ui: &mut egui::Ui) {
+        let Some(name) = self.source_control.branch_name() else {
+            return;
+        };
+        let colors = self.current_theme().ui.clone();
+        let b = self.source_control.status.branch.clone();
+        let mut text = name;
+        if b.behind > 0 {
+            text.push_str(&format!(" {}↓", b.behind));
+        }
+        if b.ahead > 0 {
+            text.push_str(&format!(" {}↑", b.ahead));
+        }
+        if let Some(op) = self.source_control.busy() {
+            ui.spinner().on_hover_text(op);
+        }
+        let response = ui
+            .horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                icons::label(ui, Icon::Branch, colors.text_muted.0, 14.0);
+                ui.add(egui::Label::new(RichText::new(text).small()).sense(egui::Sense::click()))
+            })
+            .inner
+            .on_hover_text(match &b.upstream {
+                Some(u) => format!(
+                    "Branch {} tracking {u}. Click for Source Control.",
+                    b.display()
+                ),
+                None => format!(
+                    "Branch {} (not published). Click for Source Control.",
+                    b.display()
+                ),
+            });
+        if response.clicked() {
+            self.sidebar_view = SidebarView::SourceControl;
+            self.sidebar_open = true;
+        }
+        if let Some(head) = &b.head
+            && let Some(pr) = self.github.pr_for_branch(head)
+        {
+            let n = pr.number;
+            if ui
+                .link(RichText::new(format!("PR #{n}")).small())
+                .on_hover_text(&pr.title)
+                .clicked()
+            {
+                self.open_pull_request(n);
+            }
+        }
+        ui.separator();
+    }
+
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(&self.status);
+            self.branch_indicator(ui);
+            ui.add(egui::Label::new(&self.status).truncate());
             self.language_server_hint(ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 self.update_indicator(ui);
@@ -514,13 +857,15 @@ impl ForgeApp {
 
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
         let mut to_close = None;
+        let mut pane_clicked = None;
+        let mut pane_to_close = None;
         let colors = self.current_theme().ui.clone();
         egui::ScrollArea::horizontal()
             .id_salt("tab_bar")
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     for (idx, doc) in self.documents.iter().enumerate() {
-                        let selected = idx == self.active;
+                        let selected = idx == self.active && self.active_pane.is_none();
                         let label = if doc.is_dirty() {
                             format!("● {}", doc.title())
                         } else {
@@ -552,6 +897,7 @@ impl ForgeApp {
                         }
                         if response.clicked() {
                             self.active = idx;
+                            self.active_pane = None;
                         }
                         if ui
                             .add(egui::Button::new("×").small().frame(false))
@@ -562,14 +908,78 @@ impl ForgeApp {
                         }
                         ui.add_space(4.0);
                     }
+                    for (idx, pane) in self.panes.iter().enumerate() {
+                        let selected = self.active_pane == Some(idx);
+                        icons::label(
+                            ui,
+                            pane.icon(),
+                            if selected {
+                                colors.accent.0
+                            } else {
+                                colors.text_muted.0
+                            },
+                            14.0,
+                        );
+                        let mut title = pane.title();
+                        if title.chars().count() > 40 {
+                            title = title.chars().take(38).collect::<String>() + "…";
+                        }
+                        let text = RichText::new(title).italics().color(if selected {
+                            colors.text.0
+                        } else {
+                            colors.text_muted.0
+                        });
+                        let fill = if selected {
+                            colors.widget.0
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        };
+                        let response = ui.add(
+                            egui::Button::new(text)
+                                .fill(fill)
+                                .stroke(egui::Stroke::NONE),
+                        );
+                        if selected {
+                            let r = response.rect;
+                            ui.painter().hline(
+                                r.x_range().shrink(6.0),
+                                r.bottom() + 1.0,
+                                egui::Stroke::new(2.0, colors.accent.0),
+                            );
+                        }
+                        if response.clicked() {
+                            pane_clicked = Some(idx);
+                        }
+                        if ui
+                            .add(egui::Button::new("×").small().frame(false))
+                            .on_hover_text("Close")
+                            .clicked()
+                        {
+                            pane_to_close = Some(idx);
+                        }
+                        ui.add_space(4.0);
+                    }
                 });
             });
         if let Some(idx) = to_close {
             self.close_tab(idx);
         }
+        if let Some(idx) = pane_clicked {
+            self.active_pane = Some(idx);
+        }
+        if let Some(idx) = pane_to_close {
+            self.close_pane(idx);
+        }
     }
 
     fn editor(&mut self, ui: &mut egui::Ui) {
+        let changes = self.active_line_changes();
+        let ui_colors = &self.themes[self.theme].ui;
+        let mark_colors = gutter::MarkColors {
+            added: ui_colors.added.0,
+            modified: ui_colors.modified.0,
+            deleted: ui_colors.deleted.0,
+        };
         let Some(doc) = self.documents.get_mut(self.active) else {
             return;
         };
@@ -604,7 +1014,13 @@ impl ForgeApp {
                     })
                     .layouter(&mut layouter)
                     .show(ui);
-                gutter::paint(ui, &output, current_line, &font);
+                gutter::paint(
+                    ui,
+                    &output,
+                    current_line,
+                    &font,
+                    changes.as_ref().map(|c| (c, &mark_colors)),
+                );
                 output
             })
             .inner;
@@ -636,15 +1052,31 @@ fn open_path(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Recursively renders a directory tree. Sets `clicked` when a file is selected.
-fn file_tree(ui: &mut egui::Ui, node: &mut FileNode, is_root: bool, clicked: &mut Option<PathBuf>) {
+/// Recursively renders a directory tree. Sets `clicked` when a file is
+/// selected. Names are colored by their git state.
+fn file_tree(
+    ui: &mut egui::Ui,
+    node: &mut FileNode,
+    is_root: bool,
+    clicked: &mut Option<PathBuf>,
+    decorate: &dyn Fn(&Path) -> Option<Change>,
+    colors: &UiColors,
+) {
+    let change = decorate(&node.path);
+    let mut name = RichText::new(&node.name);
+    if let Some(c) = change {
+        name = name.color(git::panel_change_color(c, colors));
+        if c == Change::Deleted {
+            name = name.strikethrough();
+        }
+    }
     if node.is_dir {
-        let header = egui::CollapsingHeader::new(&node.name)
+        let header = egui::CollapsingHeader::new(name)
             .id_salt(&node.path)
             .default_open(is_root)
             .show(ui, |ui| {
                 for child in node.children() {
-                    file_tree(ui, child, false, clicked);
+                    file_tree(ui, child, false, clicked, decorate, colors);
                 }
             });
         header.header_response.context_menu(|ui| {
@@ -653,8 +1085,26 @@ fn file_tree(ui: &mut egui::Ui, node: &mut FileNode, is_root: bool, clicked: &mu
                 ui.close();
             }
         });
-    } else if ui.selectable_label(false, &node.name).clicked() {
-        *clicked = Some(node.path.clone());
+    } else {
+        let response = ui
+            .horizontal(|ui| {
+                let r = ui.selectable_label(false, name);
+                if let Some(c) = change {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(c.letter())
+                                .small()
+                                .color(git::panel_change_color(c, colors)),
+                        )
+                        .on_hover_text(c.describe());
+                    });
+                }
+                r
+            })
+            .inner;
+        if response.clicked() {
+            *clicked = Some(node.path.clone());
+        }
     }
 }
 
@@ -663,6 +1113,10 @@ impl eframe::App for ForgeApp {
         self.handle_shortcuts(&ui.ctx().clone());
         self.servers.poll();
         self.poll_updater();
+        self.source_control.poll();
+        self.github
+            .poll(self.sidebar_open && self.sidebar_view == SidebarView::PullRequests);
+        self.handle_events();
 
         let panel_frame =
             egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin::symmetric(10, 6));
@@ -672,11 +1126,34 @@ impl eframe::App for ForgeApp {
         egui::Panel::bottom("status_bar")
             .frame(panel_frame)
             .show(ui, |ui| self.status_bar(ui));
-        egui::Panel::left("explorer")
-            .frame(panel_frame.inner_margin(egui::Margin::same(10)))
-            .resizable(true)
-            .default_size(240.0)
-            .show(ui, |ui| self.explorer(ui));
+        let colors = self.current_theme().ui.clone();
+        egui::Panel::left("activity_bar")
+            .frame(panel_frame.inner_margin(egui::Margin::ZERO))
+            .resizable(false)
+            .exact_size(activity::WIDTH)
+            .show(ui, |ui| {
+                let changes = self.source_control.status.change_count();
+                let review_requests = 0;
+                activity::show(
+                    ui,
+                    &mut self.sidebar_view,
+                    &mut self.sidebar_open,
+                    |v| match v {
+                        SidebarView::SourceControl => changes,
+                        SidebarView::PullRequests => review_requests,
+                        SidebarView::Explorer => 0,
+                    },
+                    &colors,
+                );
+            });
+        if self.sidebar_open {
+            egui::Panel::left("sidebar")
+                .frame(panel_frame.inner_margin(egui::Margin::same(10)))
+                .resizable(true)
+                .default_size(300.0)
+                .size_range(200.0..=640.0)
+                .show(ui, |ui| self.sidebar(ui));
+        }
 
         let bg = self.highlighter.background();
         egui::CentralPanel::default()
@@ -684,7 +1161,15 @@ impl eframe::App for ForgeApp {
             .show(ui, |ui| {
                 self.tab_bar(ui);
                 ui.separator();
-                self.editor(ui);
+                match self.active_pane {
+                    Some(i) if i < self.panes.len() => {
+                        let action = self.panes[i].show(ui, &mut self.source_control, &colors);
+                        if let Some(PaneAction::OpenFile(rel)) = action {
+                            self.open_repo_file(&rel);
+                        }
+                    }
+                    _ => self.editor(ui),
+                }
             });
 
         if self.server_browser.open {

@@ -115,6 +115,12 @@ pub struct UiColors {
     pub link: Color,
     pub warning: Color,
     pub error: Color,
+    /// Added lines and files (source control, diffs, gutter markers).
+    pub added: Color,
+    /// Modified lines and files.
+    pub modified: Color,
+    /// Deleted lines and files.
+    pub deleted: Color,
 }
 
 /// Colors for syntax highlighting.
@@ -172,6 +178,9 @@ impl Theme {
                 link: Color::hex(0xf9a8d4),
                 warning: Color::hex(0xf5c46b),
                 error: Color::hex(0xf87171),
+                added: Color::hex(0x7fd1a0),
+                modified: Color::hex(0x8fb4f0),
+                deleted: Color::hex(0xf87171),
             },
             syntax: SyntaxColors {
                 text: Color::hex(0xe9dde6),
@@ -215,6 +224,9 @@ impl Theme {
                 link: Color::hex(0xaa3067),
                 warning: Color::hex(0xb7791f),
                 error: Color::hex(0xc53030),
+                added: Color::hex(0x2f7d4a),
+                modified: Color::hex(0x2b62b8),
+                deleted: Color::hex(0xc53030),
             },
             syntax: SyntaxColors {
                 text: Color::hex(0x3d2236),

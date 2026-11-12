@@ -102,7 +102,14 @@ fn extra_search_dirs() -> Vec<PathBuf> {
             dirs.push(PathBuf::from(appdata).join("npm"));
         }
         dirs.push(PathBuf::from(r"C:\Program Files\LLVM\bin"));
+        dirs.push(PathBuf::from(r"C:\Program Files\Git\cmd"));
+        dirs.push(PathBuf::from(r"C:\Program Files\GitHub CLI"));
     } else {
+        // Apps started from the macOS Finder or a desktop launcher often get a
+        // minimal PATH without the package manager's bin directories.
+        dirs.push(PathBuf::from("/opt/homebrew/bin"));
+        dirs.push(PathBuf::from("/usr/local/bin"));
+        dirs.push(PathBuf::from("/home/linuxbrew/.linuxbrew/bin"));
         // Homebrew's LLVM is keg-only, so its clangd is not linked onto PATH.
         dirs.push(PathBuf::from("/opt/homebrew/opt/llvm/bin"));
         dirs.push(PathBuf::from("/usr/local/opt/llvm/bin"));
