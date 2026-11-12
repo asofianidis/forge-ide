@@ -2,10 +2,11 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use egui::{Key, KeyboardShortcut, Modifiers, TextStyle};
 
-use crate::editor::{Document, Highlighter, gutter};
+use crate::editor::{DiskEvent, DiskState, Document, Highlighter, gutter};
 use crate::lsp::{ServerBrowser, ServerManager};
 use crate::settings::Settings;
 use crate::theme::{self, Theme};
@@ -16,6 +17,23 @@ const SHORTCUT_NEW: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND,
 const SHORTCUT_OPEN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::O);
 const SHORTCUT_SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
 const SHORTCUT_CLOSE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::W);
+
+/// How often open files are checked for changes made by other programs.
+const DISK_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Something waiting on the user to save or discard unsaved changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingClose {
+    Tab(usize),
+    Window,
+}
+
+/// The user's answer in the unsaved-changes dialog.
+enum CloseChoice {
+    Save,
+    Discard,
+    Cancel,
+}
 
 pub struct ForgeApp {
     workspace: Option<Workspace>,
@@ -39,6 +57,13 @@ pub struct ForgeApp {
     /// The current check was started from the menu, so "up to date" and
     /// errors are worth reporting.
     manual_update_check: bool,
+    /// Unsaved-changes dialog being shown, if any.
+    pending_close: Option<PendingClose>,
+    /// Unsaved changes were saved or discarded, so the window may close.
+    allow_close: bool,
+    last_disk_poll: Instant,
+    /// Window focus last frame, to re-check files when the user comes back.
+    was_focused: bool,
 }
 
 impl ForgeApp {
@@ -79,6 +104,10 @@ impl ForgeApp {
             updater,
             last_update_state: UpdateState::Idle,
             manual_update_check: false,
+            pending_close: None,
+            allow_close: false,
+            last_disk_poll: Instant::now(),
+            was_focused: true,
         }
     }
 
@@ -269,24 +298,44 @@ impl ForgeApp {
     }
 
     fn save_active(&mut self) {
-        let Some(doc) = self.documents.get_mut(self.active) else {
-            return;
+        self.save(self.active);
+    }
+
+    /// Saves a document, asking for a path if it has none. Returns whether it
+    /// was saved (not cancelled and no error).
+    fn save(&mut self, idx: usize) -> bool {
+        let Some(doc) = self.documents.get_mut(idx) else {
+            return false;
         };
         let result = if doc.path.is_some() {
             doc.save()
         } else if let Some(path) = rfd::FileDialog::new().save_file() {
             doc.save_as(path)
         } else {
-            return;
+            return false;
         };
-        self.status = match result {
-            Ok(()) => format!("Saved {}", doc.title()),
-            Err(e) => format!("Error: {e:#}"),
-        };
+        match result {
+            Ok(()) => {
+                self.status = format!("Saved {}", doc.title());
+                true
+            }
+            Err(e) => {
+                self.status = format!("Error: {e:#}");
+                false
+            }
+        }
     }
 
+    /// Closes a tab, first asking what to do with unsaved changes.
     fn close_tab(&mut self, idx: usize) {
-        // TODO: prompt before discarding unsaved changes.
+        match self.documents.get(idx) {
+            Some(doc) if doc.is_dirty() => self.pending_close = Some(PendingClose::Tab(idx)),
+            Some(_) => self.remove_tab(idx),
+            None => {}
+        }
+    }
+
+    fn remove_tab(&mut self, idx: usize) {
         if idx < self.documents.len() {
             self.documents.remove(idx);
         }
@@ -296,6 +345,172 @@ impl ForgeApp {
         if self.active >= self.documents.len() || self.active > idx {
             self.active = self.active.saturating_sub(1);
         }
+    }
+
+    /// Stops the window from closing while there are unsaved changes, and
+    /// asks the user about them instead.
+    fn intercept_close(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().close_requested())
+            && !self.allow_close
+            && self.has_unsaved_changes()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.pending_close = Some(PendingClose::Window);
+        }
+    }
+
+    /// Shows the unsaved-changes dialog and carries out the user's choice.
+    fn close_dialog(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_close else {
+            return;
+        };
+        let dirty: Vec<usize> = match pending {
+            PendingClose::Tab(idx) => vec![idx],
+            PendingClose::Window => (0..self.documents.len())
+                .filter(|&i| self.documents[i].is_dirty())
+                .collect(),
+        };
+        if dirty.is_empty() {
+            // Everything got saved some other way in the meantime.
+            self.pending_close = None;
+            if pending == PendingClose::Window {
+                self.allow_close = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            return;
+        }
+        let (title, save_label) = match (pending, dirty.as_slice()) {
+            (PendingClose::Tab(_), [idx]) | (PendingClose::Window, [idx]) => (
+                format!(
+                    "Save changes to {} before closing?",
+                    self.documents[*idx].title()
+                ),
+                "Save",
+            ),
+            _ => (
+                format!("{} files have unsaved changes.", dirty.len()),
+                "Save All",
+            ),
+        };
+
+        let mut choice = None;
+        let modal = egui::Modal::new(egui::Id::unique("unsaved_changes")).show(ctx, |ui| {
+            ui.set_max_width(360.0);
+            ui.heading(&title);
+            if dirty.len() > 1 {
+                for &idx in &dirty {
+                    ui.label(format!("• {}", self.documents[idx].title()));
+                }
+            }
+            ui.label("Your changes will be lost if you don't save them.");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button(save_label).clicked() {
+                    choice = Some(CloseChoice::Save);
+                }
+                if ui.button("Don't Save").clicked() {
+                    choice = Some(CloseChoice::Discard);
+                }
+                if ui.button("Cancel").clicked() {
+                    choice = Some(CloseChoice::Cancel);
+                }
+            });
+        });
+        if modal.should_close() && choice.is_none() {
+            choice = Some(CloseChoice::Cancel);
+        }
+        let Some(choice) = choice else {
+            return;
+        };
+
+        self.pending_close = None;
+        let proceed = match choice {
+            CloseChoice::Cancel => false,
+            CloseChoice::Discard => true,
+            // Stop at the first file that isn't saved (cancelled or failed);
+            // the status bar says why.
+            CloseChoice::Save => dirty.iter().all(|&idx| self.save(idx)),
+        };
+        if !proceed {
+            return;
+        }
+        match pending {
+            PendingClose::Tab(idx) => self.remove_tab(idx),
+            PendingClose::Window => {
+                self.allow_close = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+
+    /// Checks open files for changes made by other programs: periodically,
+    /// and whenever the window regains focus.
+    fn poll_disk(&mut self, ctx: &egui::Context) {
+        let focused = ctx.input(|i| i.focused);
+        let regained_focus = focused && !self.was_focused;
+        self.was_focused = focused;
+        if !self.documents.iter().any(|d| d.path.is_some()) {
+            return;
+        }
+        ctx.request_repaint_after(DISK_POLL_INTERVAL);
+        if !regained_focus && self.last_disk_poll.elapsed() < DISK_POLL_INTERVAL {
+            return;
+        }
+        self.last_disk_poll = Instant::now();
+        for doc in &mut self.documents {
+            match doc.poll_disk() {
+                Some(DiskEvent::Reloaded) => {
+                    self.status = format!("Reloaded {} (changed on disk)", doc.title());
+                }
+                Some(DiskEvent::Conflict) => {
+                    self.status = format!("{} changed on disk", doc.title());
+                }
+                Some(DiskEvent::Deleted) => {
+                    self.status = format!("{} was deleted on disk", doc.title());
+                }
+                None => {}
+            }
+        }
+    }
+
+    /// Banner above the editor when the active file changed or vanished on disk.
+    fn disk_banner(&mut self, ui: &mut egui::Ui) {
+        let Some(doc) = self.documents.get_mut(self.active) else {
+            return;
+        };
+        let warning = ui.visuals().warn_fg_color;
+        match doc.disk {
+            DiskState::InSync => return,
+            DiskState::Changed(_) => {
+                ui.horizontal(|ui| {
+                    ui.colored_label(
+                        warning,
+                        "⚠ This file changed on disk, and you have unsaved changes here.",
+                    );
+                    if ui
+                        .button("Reload")
+                        .on_hover_text("Discard your changes and load the file from disk")
+                        .clicked()
+                    {
+                        doc.reload_from_disk();
+                    }
+                    if ui
+                        .button("Keep Mine")
+                        .on_hover_text("Keep your version; saving overwrites the file")
+                        .clicked()
+                    {
+                        doc.keep_local();
+                    }
+                });
+            }
+            DiskState::Deleted => {
+                ui.colored_label(
+                    warning,
+                    "⚠ This file was deleted on disk. Save to create it again.",
+                );
+            }
+        }
+        ui.separator();
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
@@ -667,9 +882,15 @@ fn file_tree(ui: &mut egui::Ui, node: &mut FileNode, is_root: bool, clicked: &mu
 
 impl eframe::App for ForgeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.handle_shortcuts(&ui.ctx().clone());
+        let ctx = ui.ctx().clone();
+        self.intercept_close(&ctx);
+        // The dialog is modal; keep shortcuts from acting behind it.
+        if self.pending_close.is_none() {
+            self.handle_shortcuts(&ctx);
+        }
         self.servers.poll();
         self.poll_updater();
+        self.poll_disk(&ctx);
 
         let panel_frame =
             egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin::symmetric(10, 6));
@@ -691,13 +912,14 @@ impl eframe::App for ForgeApp {
             .show(ui, |ui| {
                 self.tab_bar(ui);
                 ui.separator();
+                self.disk_banner(ui);
                 self.editor(ui);
             });
 
         if self.server_browser.open {
             let kinds = self.project_file_kinds();
-            self.server_browser
-                .show(&ui.ctx().clone(), &mut self.servers, &kinds);
+            self.server_browser.show(&ctx, &mut self.servers, &kinds);
         }
+        self.close_dialog(&ctx);
     }
 }

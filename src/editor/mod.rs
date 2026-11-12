@@ -4,5 +4,5 @@ mod document;
 pub mod gutter;
 mod highlight;
 
-pub use document::Document;
+pub use document::{DiskEvent, DiskState, Document};
 pub use highlight::Highlighter;
