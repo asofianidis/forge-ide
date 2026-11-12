@@ -25,8 +25,8 @@ pub use browser::ServerBrowser;
 use catalog::{InstallMethod, ServerSpec};
 use install::{InstallJob, JobState};
 pub use session::{
-    Feature, Location, LocationKind, Lsp, LspEvent, Problem, ServerActivity, Severity,
-    workspace_edit_files,
+    Feature, FormatOptions, Location, LocationKind, Lsp, LspEvent, Problem, ServerActivity,
+    Severity, workspace_edit_files,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

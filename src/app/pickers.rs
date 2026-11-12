@@ -123,9 +123,9 @@ impl ForgeApp {
             .into_iter()
             .map(|(i, m)| {
                 let (cmd, label) = &candidates[i];
-                let detail = cmd
-                    .shortcuts()
-                    .first()
+                let detail = self
+                    .keymap
+                    .shortcut(*cmd)
                     .map(|s| ctx.format_shortcut(s))
                     .unwrap_or_default();
                 (

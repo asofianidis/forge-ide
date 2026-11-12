@@ -60,7 +60,7 @@ impl ForgeApp {
             "Open Preview to the Side"
         }
         .to_owned();
-        if let Some(s) = Command::ToggleMarkdownPreview.shortcuts().first() {
+        if let Some(s) = self.keymap.shortcut(Command::ToggleMarkdownPreview) {
             tip = format!("{tip} ({})", ui.ctx().format_shortcut(s));
         }
         if icons::button_tinted(ui, Icon::Preview, &tip, open.then_some(accent)).clicked() {

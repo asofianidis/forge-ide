@@ -29,6 +29,7 @@ use crate::git::{self, PanelAction, ScmPanel, SourceControl};
 use crate::github::model::{CheckOutcome, WorkflowRun};
 use crate::github::{BranchContext, GhEvent, GitHub, ListAction, PrListPanel};
 use crate::history::{HistoryPane, RebasePane};
+use crate::keymap::Keymap;
 use crate::lsp::{Feature, Lsp, ServerBrowser, ServerManager};
 use crate::palette::Picker;
 use crate::panes::{ChangesPane, CommitPane, LogPane, Pane, PaneAction};
@@ -149,6 +150,16 @@ pub struct ForgeApp {
     explorer_dialog: Option<ExplorerDialog>,
     /// Integrated terminal panel below the editor.
     terminal: TerminalPanel,
+    /// Keyboard shortcuts: the defaults plus the user's `[keybindings]`.
+    keymap: Keymap,
+    /// The keybindings the keymap was built from, to rebuild it when they change.
+    keymap_source: std::collections::BTreeMap<String, crate::keymap::Keys>,
+    /// The Keyboard Shortcuts window is showing, with this filter text.
+    keybindings_filter: Option<String>,
+    /// Minimap of the active document.
+    minimap: crate::editor::minimap::Minimap,
+    /// Vertical editor scroll offset requested by the minimap, for next frame.
+    minimap_scroll: Option<f32>,
     /// Ids of the Markdown documents showing a preview beside the editor.
     markdown_preview: HashSet<u64>,
 }
@@ -162,6 +173,8 @@ impl ForgeApp {
             .clone()
             .unwrap_or_else(|| theme::DEFAULT_THEME.to_owned());
         let idx = themes.iter().position(|t| t.name == wanted).unwrap_or(0);
+        let (keymap, keymap_errors) = Keymap::new(&settings.keybindings);
+        let keymap_source = settings.keybindings.clone();
 
         let updater = Updater::default();
         if settings.auto_update.unwrap_or(updater::IS_RELEASE_BUILD) {
@@ -204,7 +217,9 @@ impl ForgeApp {
             highlighter: Highlighter::new(themes[idx].syntect_theme()),
             theme: idx,
             themes,
-            status: theme_errors_status(&errors).unwrap_or_else(|| "Ready".to_owned()),
+            status: theme_errors_status(&errors)
+                .or_else(|| keymap_errors_status(&keymap_errors))
+                .unwrap_or_else(|| "Ready".to_owned()),
             cursor: (1, 1),
             servers: ServerManager::new(cc.egui_ctx.clone()),
             server_browser: ServerBrowser::default(),
@@ -236,6 +251,11 @@ impl ForgeApp {
             watcher: None,
             explorer_dialog: None,
             terminal: TerminalPanel::default(),
+            keymap_source,
+            keymap,
+            keybindings_filter: None,
+            minimap: Default::default(),
+            minimap_scroll: None,
             markdown_preview: HashSet::new(),
         };
         if let Some(folder) = folder {
@@ -613,8 +633,27 @@ impl ForgeApp {
         if doc.path.is_none() {
             return self.save_as(idx);
         }
-        let result = doc.save();
+        self.apply_editorconfig(idx);
+        let result = self.documents[idx].save();
         self.finish_save(idx, result)
+    }
+
+    /// Applies the document's `.editorconfig` save rules (line endings,
+    /// trailing whitespace, final newline) as one undoable edit.
+    fn apply_editorconfig(&mut self, idx: usize) {
+        let Some(doc) = self.documents.get(idx) else {
+            return;
+        };
+        let edits: Vec<_> = doc
+            .editorconfig
+            .save_edits(doc.text())
+            .into_iter()
+            .map(|(range, text)| crate::lsp::text::CharEdit { range, text })
+            .collect();
+        if !edits.is_empty() {
+            let ctx = self.egui_ctx.clone();
+            self.edit_document(&ctx, idx, &edits);
+        }
     }
 
     /// Saves a document under a path picked in the save dialog. The tab then
@@ -638,10 +677,13 @@ impl ForgeApp {
         let path = std::path::absolute(&path).unwrap_or(path);
         let doc = &mut self.documents[idx];
         let old = doc.path.clone();
-        let result = doc.save_as(path.clone());
+        doc.set_path(Some(path.clone()));
+        self.apply_editorconfig(idx);
+        let doc = &mut self.documents[idx];
+        let result = doc.save();
         if result.is_err() {
             // Keep pointing at the old file rather than one never written.
-            doc.path = old;
+            doc.set_path(old);
             return self.finish_save(idx, result);
         }
         if let Some(dir) = path.parent() {
@@ -923,7 +965,7 @@ impl ForgeApp {
                 || (ctx.memory(|m| m.focused().is_none())
                     && !self.picker.open
                     && self.go_to_line.is_none()));
-        for (cmd, shortcut) in Command::shortcut_table() {
+        for (cmd, shortcut) in self.keymap.table().to_vec() {
             if cmd.edits_text() && !editor_focused {
                 continue;
             }
@@ -964,6 +1006,7 @@ impl ForgeApp {
             }
             Command::OpenSettings => self.settings_open = true,
             Command::OpenSettingsFile => self.open_settings_file(),
+            Command::ShowKeybindings => self.keybindings_filter = Some(String::new()),
             Command::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             Command::Undo => self.undo(ctx, false),
             Command::Redo => self.undo(ctx, true),
@@ -1007,6 +1050,7 @@ impl ForgeApp {
             Command::RepositoryHistory => self.open_history(None),
             Command::ToggleWordWrap => self.toggle_word_wrap(),
             Command::ToggleLineNumbers => self.toggle_line_numbers(),
+            Command::ToggleMinimap => self.toggle_minimap(),
             Command::ToggleMarkdownPreview => self.toggle_markdown_preview(),
             Command::IncreaseFontSize => self.change_font_size(ctx, Some(1.0)),
             Command::DecreaseFontSize => self.change_font_size(ctx, Some(-1.0)),
@@ -1055,7 +1099,7 @@ impl ForgeApp {
     /// A menu entry for `cmd`, showing its shortcut. Clicking queues the command.
     fn menu_item(&mut self, ui: &mut egui::Ui, cmd: Command) {
         let mut button = egui::Button::new(cmd.label());
-        if let Some(shortcut) = cmd.shortcuts().first() {
+        if let Some(shortcut) = self.keymap.shortcut(cmd) {
             button = button.shortcut_text(ui.ctx().format_shortcut(shortcut));
         }
         let enabled = match cmd {
@@ -1086,7 +1130,7 @@ impl ForgeApp {
     /// A checkbox menu entry for a toggle command, showing its shortcut on hover.
     fn menu_checkbox(&mut self, ui: &mut egui::Ui, cmd: Command, value: &mut bool, text: &str) {
         let mut response = ui.checkbox(value, text);
-        if let Some(s) = cmd.shortcuts().first() {
+        if let Some(s) = self.keymap.shortcut(cmd) {
             response = response.on_hover_text(ui.ctx().format_shortcut(s));
         }
         if response.changed() {
@@ -1111,6 +1155,7 @@ impl ForgeApp {
                 ui.separator();
                 self.menu_item(ui, OpenSettings);
                 self.menu_item(ui, OpenSettingsFile);
+                self.menu_item(ui, ShowKeybindings);
                 ui.separator();
                 self.menu_item(ui, Quit);
             });
@@ -1154,7 +1199,7 @@ impl ForgeApp {
                 ui.separator();
                 self.menu_item(ui, ShowExplorer);
                 let mut search = egui::Button::new("Search");
-                if let Some(s) = FindInProject.shortcuts().first() {
+                if let Some(s) = self.keymap.shortcut(FindInProject) {
                     search = search.shortcut_text(ui.ctx().format_shortcut(s));
                 }
                 if ui.add(search).clicked() {
@@ -1167,7 +1212,7 @@ impl ForgeApp {
                 ui.separator();
                 let mut blame = self.editor_git.blame_on;
                 let mut checkbox = ui.add(egui::Checkbox::new(&mut blame, "Blame"));
-                if let Some(s) = ToggleBlame.shortcuts().first() {
+                if let Some(s) = self.keymap.shortcut(ToggleBlame) {
                     checkbox = checkbox.on_hover_text(ui.ctx().format_shortcut(s));
                 }
                 if checkbox.changed() {
@@ -1180,6 +1225,8 @@ impl ForgeApp {
                 self.menu_checkbox(ui, ToggleWordWrap, &mut wrap, "Word Wrap");
                 let mut numbers = self.settings.line_numbers;
                 self.menu_checkbox(ui, ToggleLineNumbers, &mut numbers, "Line Numbers");
+                let mut minimap = self.settings.minimap;
+                self.menu_checkbox(ui, ToggleMinimap, &mut minimap, "Minimap");
                 if self.active_is_markdown() {
                     let mut preview = self.markdown_preview_open();
                     self.menu_checkbox(ui, ToggleMarkdownPreview, &mut preview, "Markdown Preview");
@@ -1495,6 +1542,7 @@ impl ForgeApp {
         let mut pane_clicked = None;
         let mut pane_to_close = None;
         let colors = self.current_theme().ui.clone();
+        let close_shortcut = self.keymap.shortcut(Command::CloseTab).copied();
         egui::ScrollArea::horizontal()
             .id_salt("tab_bar")
             .show(ui, |ui| {
@@ -1532,8 +1580,14 @@ impl ForgeApp {
                         if response.middle_clicked() {
                             to_close = Some(idx);
                         }
-                        let close =
-                            tab_close_button(ui, &colors, response.rect, selected, doc.is_dirty());
+                        let close = tab_close_button(
+                            ui,
+                            &colors,
+                            response.rect,
+                            selected,
+                            doc.is_dirty(),
+                            close_shortcut.as_ref(),
+                        );
                         if close.clicked() {
                             to_close = Some(idx);
                         }
@@ -1584,7 +1638,14 @@ impl ForgeApp {
                         if response.middle_clicked() {
                             pane_to_close = Some(idx);
                         }
-                        let close = tab_close_button(ui, &colors, response.rect, selected, false);
+                        let close = tab_close_button(
+                            ui,
+                            &colors,
+                            response.rect,
+                            selected,
+                            false,
+                            close_shortcut.as_ref(),
+                        );
                         if close.clicked() {
                             pane_to_close = Some(idx);
                         }
@@ -1766,177 +1827,217 @@ impl ForgeApp {
             bottom: 2,
         });
 
-        let mut output = egui::ScrollArea::both()
+        // The minimap takes the right edge, unless the editor is too narrow.
+        let minimap_rect = (self.settings.minimap
+            && editor_rect.width() > crate::editor::minimap::WIDTH * 4.0)
+            .then(|| {
+                Rect::from_min_max(
+                    pos2(
+                        editor_rect.right() - crate::editor::minimap::WIDTH,
+                        editor_rect.top(),
+                    ),
+                    editor_rect.max,
+                )
+            });
+        let text_rect = match minimap_rect {
+            Some(m) => Rect::from_min_max(editor_rect.min, pos2(m.left(), editor_rect.bottom())),
+            None => editor_rect,
+        };
+        let mut area = egui::ScrollArea::both()
             .id_salt("editor_scroll")
-            .auto_shrink(false)
-            .show(ui, |ui| {
-                ui.horizontal_top(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    let blame_x = blame.as_ref().map(|_| {
-                        let (r, _) = ui.allocate_exact_size(
-                            egui::vec2(scm::BLAME_WIDTH, 1.0),
-                            egui::Sense::hover(),
-                        );
-                        r.x_range()
-                    });
-                    let underlay = ui.painter().add(Shape::Noop);
-                    // Wrapping lays the text out to the visible width; otherwise
-                    // long lines extend and the area scrolls sideways.
-                    let desired_width = if word_wrap {
-                        ui.available_width()
-                    } else {
-                        f32::INFINITY
-                    };
-                    let output = egui::TextEdit::multiline(&mut doc.buffer)
-                        .id(id)
-                        .code_editor()
-                        .lock_focus(true)
-                        .desired_width(desired_width)
-                        .desired_rows(40)
-                        .frame(frame)
-                        .layouter(&mut layouter)
-                        .show(ui);
-
-                    let galley = &output.galley;
-                    let offset = output.galley_pos.to_vec2();
-                    let mut shapes = vec![Shape::rect_filled(
-                        output.response.response.rect,
-                        0.0,
-                        background,
-                    )];
-
-                    // Find matches, only those on screen.
-                    let visible = visible_chars(galley, ui.clip_rect().translate(-offset));
-                    let first = matches.partition_point(|m| m.chars.end < visible.start);
-                    for (i, m) in matches.iter().enumerate().skip(first) {
-                        if m.chars.start > visible.end {
-                            break;
-                        }
-                        let fill = if Some(i) == current_match {
-                            hl.find_current
-                        } else {
-                            hl.find
-                        };
-                        for r in range_rects(galley, m.chars.clone()) {
-                            shapes.push(Shape::rect_filled(r.translate(offset), 2.0, fill));
-                        }
-                    }
-
-                    // Matching bracket pair around the caret.
-                    if let Some(range) = output.cursor_range
-                        && range.is_empty()
-                        && output.response.response.has_focus()
-                        && let Some((a, b)) =
-                            ops::matching_bracket(doc.text(), range.primary.index.into())
-                    {
-                        for c in [a, b] {
-                            let r = range_rects(galley, c..c + 1)[0].translate(offset);
-                            shapes.push(Shape::rect_filled(r, 2.0, hl.bracket_fill));
-                            shapes.push(Shape::rect_stroke(
-                                r,
-                                2.0,
-                                hl.bracket_stroke,
-                                egui::StrokeKind::Inside,
-                            ));
-                        }
-                    }
-                    ui.painter().set(underlay, Shape::Vec(shapes));
-                    language::paint_problems(ui, &output, &problems, &visible, &colors);
-                    let response = &output.response.response;
-
-                    // What the language features need: the symbol under the
-                    // pointer, the caret, and what was typed.
-                    let pointer = ui
-                        .input(|i| i.pointer.hover_pos())
-                        .filter(|_| response.contains_pointer())
-                        .and_then(|p| language::char_at(&output, p));
-                    if let Some((at, _)) = pointer
-                        && can_define
-                        && ui.input(|i| i.modifiers.command)
-                        && doc
-                            .text()
-                            .chars()
-                            .nth(at)
-                            .is_some_and(crate::lsp::text::is_word_char)
-                        && let Some(word) = crate::lsp::text::word_at(doc.text(), at)
-                    {
-                        language::underline(ui, &output, word, colors.link.0);
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                        if ui.input(|i| i.pointer.primary_clicked()) {
-                            lsp_frame.definition_at = Some(at);
-                        }
-                    }
-                    lsp_frame.pointer = pointer;
-                    if let Some(range) = output.cursor_range
-                        && response.has_focus()
-                    {
-                        let c: usize = range.primary.index.into();
-                        let r = galley.pos_from_cursor(CCursor::new(c)).translate(offset);
-                        lsp_frame.caret = Some((c, r));
-                    }
-                    if response.changed() {
-                        lsp_frame.typed = ui.input(|i| {
-                            i.events.iter().rev().find_map(|e| match e {
-                                egui::Event::Text(t) => t.chars().last(),
-                                _ => None,
-                            })
+            .auto_shrink(false);
+        if let Some(y) = self.minimap_scroll.take() {
+            area = area.vertical_scroll_offset(y);
+        }
+        let scroll = ui
+            .scope_builder(egui::UiBuilder::new().max_rect(text_rect), |ui| {
+                area.show(ui, |ui| {
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        let blame_x = blame.as_ref().map(|_| {
+                            let (r, _) = ui.allocate_exact_size(
+                                egui::vec2(scm::BLAME_WIDTH, 1.0),
+                                egui::Sense::hover(),
+                            );
+                            r.x_range()
                         });
-                    }
+                        let underlay = ui.painter().add(Shape::Noop);
+                        // Wrapping lays the text out to the visible width; otherwise
+                        // long lines extend and the area scrolls sideways.
+                        let desired_width = if word_wrap {
+                            ui.available_width()
+                        } else {
+                            f32::INFINITY
+                        };
+                        let output = egui::TextEdit::multiline(&mut doc.buffer)
+                            .id(id)
+                            .code_editor()
+                            .lock_focus(true)
+                            .desired_width(desired_width)
+                            .desired_rows(40)
+                            .frame(frame)
+                            .layouter(&mut layouter)
+                            .show(ui);
 
-                    gutter::paint(
-                        ui,
-                        &output,
-                        current_line,
-                        &font,
-                        line_numbers,
-                        changes.as_ref().map(|c| (c, &mark_colors)),
-                    );
-                    if !found_conflicts.is_empty()
-                        && let Some((c, how)) =
-                            scm::paint_conflicts(ui, &output, &found_conflicts, &colors)
-                    {
-                        action = Some(EditorAction::Resolve(c, how));
-                    }
-                    if let (Some(x), Some(b)) = (blame_x, &blame)
-                        && let Some(hash) = scm::paint_blame(ui, x, &output, b, &colors)
-                    {
-                        action = Some(EditorAction::OpenCommit(hash));
-                    }
-                    // Clicking a change marker opens the peek.
-                    if let Some(c) = &changes {
-                        let hover = ui
-                            .input(|i| i.pointer.hover_pos())
-                            .and_then(|p| gutter::marker_hit(&output, p))
-                            .and_then(|l| c.hunk_at(l));
-                        if hover.is_some() {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                        }
-                        if let Some(i) = hover
-                            && ui.input(|i| i.pointer.primary_clicked())
-                        {
-                            action = Some(if peek_idx == Some(i) {
-                                EditorAction::ClosePeek
+                        let galley = &output.galley;
+                        let offset = output.galley_pos.to_vec2();
+                        let mut shapes = vec![Shape::rect_filled(
+                            output.response.response.rect,
+                            0.0,
+                            background,
+                        )];
+
+                        // Find matches, only those on screen.
+                        let visible = visible_chars(galley, ui.clip_rect().translate(-offset));
+                        let first = matches.partition_point(|m| m.chars.end < visible.start);
+                        for (i, m) in matches.iter().enumerate().skip(first) {
+                            if m.chars.start > visible.end {
+                                break;
+                            }
+                            let fill = if Some(i) == current_match {
+                                hl.find_current
                             } else {
-                                EditorAction::GoToChange(i)
+                                hl.find
+                            };
+                            for r in range_rects(galley, m.chars.clone()) {
+                                shapes.push(Shape::rect_filled(r.translate(offset), 2.0, fill));
+                            }
+                        }
+
+                        // Matching bracket pair around the caret.
+                        if let Some(range) = output.cursor_range
+                            && range.is_empty()
+                            && output.response.response.has_focus()
+                            && let Some((a, b)) =
+                                ops::matching_bracket(doc.text(), range.primary.index.into())
+                        {
+                            for c in [a, b] {
+                                let r = range_rects(galley, c..c + 1)[0].translate(offset);
+                                shapes.push(Shape::rect_filled(r, 2.0, hl.bracket_fill));
+                                shapes.push(Shape::rect_stroke(
+                                    r,
+                                    2.0,
+                                    hl.bracket_stroke,
+                                    egui::StrokeKind::Inside,
+                                ));
+                            }
+                        }
+                        ui.painter().set(underlay, Shape::Vec(shapes));
+                        language::paint_problems(ui, &output, &problems, &visible, &colors);
+                        let response = &output.response.response;
+
+                        // What the language features need: the symbol under the
+                        // pointer, the caret, and what was typed.
+                        let pointer = ui
+                            .input(|i| i.pointer.hover_pos())
+                            .filter(|_| response.contains_pointer())
+                            .and_then(|p| language::char_at(&output, p));
+                        if let Some((at, _)) = pointer
+                            && can_define
+                            && ui.input(|i| i.modifiers.command)
+                            && doc
+                                .text()
+                                .chars()
+                                .nth(at)
+                                .is_some_and(crate::lsp::text::is_word_char)
+                            && let Some(word) = crate::lsp::text::word_at(doc.text(), at)
+                        {
+                            language::underline(ui, &output, word, colors.link.0);
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            if ui.input(|i| i.pointer.primary_clicked()) {
+                                lsp_frame.definition_at = Some(at);
+                            }
+                        }
+                        lsp_frame.pointer = pointer;
+                        if let Some(range) = output.cursor_range
+                            && response.has_focus()
+                        {
+                            let c: usize = range.primary.index.into();
+                            let r = galley.pos_from_cursor(CCursor::new(c)).translate(offset);
+                            lsp_frame.caret = Some((c, r));
+                        }
+                        if response.changed() {
+                            lsp_frame.typed = ui.input(|i| {
+                                i.events.iter().rev().find_map(|e| match e {
+                                    egui::Event::Text(t) => t.chars().last(),
+                                    _ => None,
+                                })
                             });
                         }
-                        if let Some(h) = peek_idx.and_then(|i| c.hunks.get(i)) {
-                            let last = h.start + h.len.max(1) - 1;
-                            peek_anchor = gutter::line_rect(&output, last);
+
+                        gutter::paint(
+                            ui,
+                            &output,
+                            current_line,
+                            &font,
+                            line_numbers,
+                            changes.as_ref().map(|c| (c, &mark_colors)),
+                        );
+                        if !found_conflicts.is_empty()
+                            && let Some((c, how)) =
+                                scm::paint_conflicts(ui, &output, &found_conflicts, &colors)
+                        {
+                            action = Some(EditorAction::Resolve(c, how));
                         }
-                    }
-                    if let Some(c) = scroll_to {
-                        let r = galley.pos_from_cursor(CCursor::new(c)).translate(offset);
-                        ui.scroll_to_rect(r.expand(digit_width * 4.0), Some(egui::Align::Center));
-                    } else if let Some(c) = reveal {
-                        let r = galley.pos_from_cursor(CCursor::new(c)).translate(offset);
-                        ui.scroll_to_rect(r.expand(digit_width * 2.0), None);
-                    }
-                    output
+                        if let (Some(x), Some(b)) = (blame_x, &blame)
+                            && let Some(hash) = scm::paint_blame(ui, x, &output, b, &colors)
+                        {
+                            action = Some(EditorAction::OpenCommit(hash));
+                        }
+                        // Clicking a change marker opens the peek.
+                        if let Some(c) = &changes {
+                            let hover = ui
+                                .input(|i| i.pointer.hover_pos())
+                                .and_then(|p| gutter::marker_hit(&output, p))
+                                .and_then(|l| c.hunk_at(l));
+                            if hover.is_some() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            if let Some(i) = hover
+                                && ui.input(|i| i.pointer.primary_clicked())
+                            {
+                                action = Some(if peek_idx == Some(i) {
+                                    EditorAction::ClosePeek
+                                } else {
+                                    EditorAction::GoToChange(i)
+                                });
+                            }
+                            if let Some(h) = peek_idx.and_then(|i| c.hunks.get(i)) {
+                                let last = h.start + h.len.max(1) - 1;
+                                peek_anchor = gutter::line_rect(&output, last);
+                            }
+                        }
+                        if let Some(c) = scroll_to {
+                            let r = galley.pos_from_cursor(CCursor::new(c)).translate(offset);
+                            ui.scroll_to_rect(
+                                r.expand(digit_width * 4.0),
+                                Some(egui::Align::Center),
+                            );
+                        } else if let Some(c) = reveal {
+                            let r = galley.pos_from_cursor(CCursor::new(c)).translate(offset);
+                            ui.scroll_to_rect(r.expand(digit_width * 2.0), None);
+                        }
+                        output
+                    })
+                    .inner
                 })
-                .inner
             })
             .inner;
+        let mut output = scroll.inner;
+        if let Some(rect) = minimap_rect {
+            let view = crate::editor::minimap::Viewport {
+                offset: scroll.state.clamped_offset().y,
+                height: scroll.inner_rect.height(),
+                content_height: scroll.content_size.y,
+            };
+            if let Some(y) = self
+                .minimap
+                .show(ui, rect, &output.galley, digit_width, &view)
+            {
+                self.minimap_scroll = Some(y);
+                ui.ctx().request_repaint();
+            }
+        }
 
         // Undo history lives in the document's `Buffer` (Ctrl+Z is handled as
         // a command before the widget sees it), so drop egui's own snapshots,
@@ -2134,6 +2235,18 @@ fn conflict_bar(ui: &mut egui::Ui, count: usize, colors: &UiColors) -> Option<Co
 }
 
 /// Formats theme loading errors for the status bar.
+/// Status bar message for keybindings in `settings.toml` that couldn't be used.
+fn keymap_errors_status(errors: &[String]) -> Option<String> {
+    match errors {
+        [] => None,
+        [one] => Some(format!("Keybinding ignored: {one}")),
+        [first, rest @ ..] => Some(format!(
+            "Keybinding ignored: {first} (and {} more; see File → Keyboard Shortcuts)",
+            rest.len()
+        )),
+    }
+}
+
 fn theme_errors_status(errors: &[String]) -> Option<String> {
     match errors {
         [] => None,
@@ -2166,6 +2279,7 @@ fn tab_close_button(
     tab_rect: Rect,
     selected: bool,
     dirty: bool,
+    close_shortcut: Option<&egui::KeyboardShortcut>,
 ) -> egui::Response {
     let size = egui::vec2(18.0, tab_rect.height().max(18.0));
     let (slot, response) = ui.allocate_exact_size(size, egui::Sense::click());
@@ -2204,11 +2318,9 @@ fn tab_close_button(
             icons::paint(painter, button.shrink(3.0), Icon::Close, color);
         }
     }
-    let tip = if selected {
-        let shortcut = Command::CloseTab.shortcuts()[0];
-        format!("Close ({})", ui.ctx().format_shortcut(&shortcut))
-    } else {
-        "Close".to_owned()
+    let tip = match close_shortcut.filter(|_| selected) {
+        Some(s) => format!("Close ({})", ui.ctx().format_shortcut(s)),
+        None => "Close".to_owned(),
     };
     response.on_hover_text(tip)
 }
@@ -2216,6 +2328,7 @@ fn tab_close_button(
 impl eframe::App for ForgeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.sync_keymap();
         self.intercept_close(&ctx);
         // The dialog is modal; keep shortcuts from acting behind it.
         if self.pending_close.is_none() && self.explorer_dialog.is_none() {
@@ -2325,6 +2438,7 @@ impl eframe::App for ForgeApp {
         }
 
         self.settings_window(&ctx);
+        self.keybindings_window(&ctx);
         self.show_picker(&ctx);
         self.go_to_line_dialog(&ctx);
         self.rename_dialog(&ctx);

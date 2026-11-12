@@ -1,7 +1,8 @@
 //! Every user-facing action, with its name and keyboard shortcut.
 //!
 //! Menus, keyboard shortcuts and the command palette are all built from this
-//! list, so an action added here is reachable all three ways.
+//! list, so an action added here is reachable all three ways. The shortcuts
+//! here are the defaults; see [`crate::keymap`] for the user's own.
 
 use egui::{Key, KeyboardShortcut, Modifiers};
 
@@ -17,6 +18,7 @@ pub enum Command {
     RevealActiveFile,
     OpenSettings,
     OpenSettingsFile,
+    ShowKeybindings,
     Quit,
     Undo,
     Redo,
@@ -52,6 +54,7 @@ pub enum Command {
     RepositoryHistory,
     ToggleWordWrap,
     ToggleLineNumbers,
+    ToggleMinimap,
     ToggleMarkdownPreview,
     IncreaseFontSize,
     DecreaseFontSize,
@@ -99,6 +102,7 @@ impl Command {
         Command::RevealActiveFile,
         Command::OpenSettings,
         Command::OpenSettingsFile,
+        Command::ShowKeybindings,
         Command::Quit,
         Command::Undo,
         Command::Redo,
@@ -134,6 +138,7 @@ impl Command {
         Command::RepositoryHistory,
         Command::ToggleWordWrap,
         Command::ToggleLineNumbers,
+        Command::ToggleMinimap,
         Command::ToggleMarkdownPreview,
         Command::IncreaseFontSize,
         Command::DecreaseFontSize,
@@ -162,6 +167,7 @@ impl Command {
             Command::RevealActiveFile => REVEAL_LABEL,
             Command::OpenSettings => "Settings…",
             Command::OpenSettingsFile => "Open Settings File (TOML)",
+            Command::ShowKeybindings => "Keyboard Shortcuts…",
             Command::Quit => "Quit",
             Command::Undo => "Undo",
             Command::Redo => "Redo",
@@ -197,6 +203,7 @@ impl Command {
             Command::RepositoryHistory => "Repository History",
             Command::ToggleWordWrap => "Toggle Word Wrap",
             Command::ToggleLineNumbers => "Toggle Line Numbers",
+            Command::ToggleMinimap => "Toggle Minimap",
             Command::ToggleMarkdownPreview => "Markdown Preview",
             Command::IncreaseFontSize => "Increase Font Size",
             Command::DecreaseFontSize => "Decrease Font Size",
@@ -218,7 +225,7 @@ impl Command {
         use Command::*;
         match self {
             NewFile | OpenFile | OpenFolder | OpenRecent | Save | SaveAs | CloseTab
-            | RevealActiveFile | OpenSettings | OpenSettingsFile | Quit => "File",
+            | RevealActiveFile | OpenSettings | OpenSettingsFile | ShowKeybindings | Quit => "File",
             Undo | Redo | Find | Replace | FindInProject | ToggleComment | Indent | Outdent
             | DuplicateLine | MoveLineUp | MoveLineDown | TriggerSuggest | RenameSymbol
             | FormatDocument => "Edit",
@@ -234,6 +241,7 @@ impl Command {
             | RepositoryHistory
             | ToggleWordWrap
             | ToggleLineNumbers
+            | ToggleMinimap
             | ToggleMarkdownPreview
             | IncreaseFontSize
             | DecreaseFontSize
@@ -256,8 +264,31 @@ impl Command {
         )
     }
 
-    /// Shortcuts that trigger this command; the first is shown in menus.
-    pub fn shortcuts(self) -> &'static [KeyboardShortcut] {
+    /// Name used for the command in `settings.toml` keybindings: the variant
+    /// name in snake_case, e.g. `toggle_terminal`.
+    pub fn id(self) -> String {
+        let mut id = String::new();
+        for (i, c) in format!("{self:?}").chars().enumerate() {
+            if c.is_ascii_uppercase() {
+                if i > 0 {
+                    id.push('_');
+                }
+                id.push(c.to_ascii_lowercase());
+            } else {
+                id.push(c);
+            }
+        }
+        id
+    }
+
+    /// The command with this [`Self::id`].
+    pub fn from_id(id: &str) -> Option<Command> {
+        Self::ALL.iter().copied().find(|c| c.id() == id)
+    }
+
+    /// Default shortcuts for this command; the first is shown in menus.
+    /// Use [`crate::keymap::Keymap`] for the ones in effect.
+    pub fn default_shortcuts(self) -> &'static [KeyboardShortcut] {
         const fn one(s: KeyboardShortcut) -> [KeyboardShortcut; 1] {
             [s]
         }
@@ -353,77 +384,12 @@ impl Command {
                 | Command::FormatDocument
         )
     }
-
-    /// Commands paired with their shortcuts, most specific first.
-    ///
-    /// egui matches shortcuts "logically" (Cmd+P also matches Cmd+Shift+P), so
-    /// shortcuts with more modifiers must be checked first.
-    pub fn shortcut_table() -> Vec<(Command, KeyboardShortcut)> {
-        let mut table: Vec<_> = Self::ALL
-            .iter()
-            .flat_map(|&c| c.shortcuts().iter().map(move |&s| (c, s)))
-            .collect();
-        table.sort_by_key(|(_, s)| {
-            let m = s.modifiers;
-            std::cmp::Reverse(
-                [m.alt, m.shift, m.ctrl || m.command || m.mac_cmd]
-                    .iter()
-                    .filter(|&&b| b)
-                    .count(),
-            )
-        });
-        table
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
-
-    #[test]
-    fn shortcuts_are_unique() {
-        let mut seen = HashSet::new();
-        for (cmd, s) in Command::shortcut_table() {
-            assert!(
-                seen.insert((s.modifiers, s.logical_key)),
-                "{cmd:?} reuses a shortcut"
-            );
-        }
-    }
-
-    #[test]
-    fn more_specific_shortcuts_come_first() {
-        let table = Command::shortcut_table();
-        let pos = |c| table.iter().position(|(x, _)| *x == c).unwrap();
-        assert!(pos(Command::ShowCommandPalette) < pos(Command::QuickOpen));
-        assert!(pos(Command::FindInProject) < pos(Command::Find));
-        assert!(pos(Command::DuplicateLine) < pos(Command::MoveLineDown));
-        assert!(pos(Command::PreviousChange) < pos(Command::NextChange));
-        assert!(pos(Command::FindReferences) < pos(Command::GoToDefinition));
-        assert!(pos(Command::PreviousProblem) < pos(Command::NextProblem));
-        // Cmd+Z would also match Cmd+Shift+Z.
-        assert!(pos(Command::Redo) < pos(Command::Undo));
-        assert!(pos(Command::SaveAs) < pos(Command::Save));
-        assert!(pos(Command::PreviousTab) < pos(Command::NextTab));
-    }
-
-    /// egui's `consume_shortcut` ignores an extra Shift, so the plain
-    /// shortcut would swallow its Shift variant if it were checked first.
-    #[test]
-    fn shift_variants_are_not_swallowed() {
-        let table = Command::shortcut_table();
-        for (i, (cmd, s)) in table.iter().enumerate() {
-            for (other, earlier) in &table[..i] {
-                assert!(
-                    !s.modifiers.matches_logically(earlier.modifiers)
-                        || s.logical_key != earlier.logical_key
-                        || s.modifiers == earlier.modifiers,
-                    "{other:?} is checked before {cmd:?} and would swallow it"
-                );
-            }
-        }
-    }
 
     #[test]
     fn every_command_is_listed() {
@@ -435,5 +401,15 @@ mod tests {
             Command::RestartTerminal.palette_label(),
             "Terminal: Restart Shell"
         );
+    }
+
+    #[test]
+    fn ids_round_trip() {
+        assert_eq!(Command::ToggleTerminal.id(), "toggle_terminal");
+        assert_eq!(Command::Quit.id(), "quit");
+        for &cmd in Command::ALL {
+            assert_eq!(Command::from_id(&cmd.id()), Some(cmd));
+        }
+        assert_eq!(Command::from_id("ToggleTerminal"), None);
     }
 }
