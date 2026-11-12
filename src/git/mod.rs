@@ -1587,6 +1587,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("forge-git-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        // Pin line endings: with autocrlf (the Windows default) `git apply`
+        // rewrites the work tree file with CRLF, breaking the content checks.
         let git = Cli::new(git_path, dir.clone()).with_prefix(&[
             "-c",
             "user.name=T",
@@ -1594,6 +1596,8 @@ mod tests {
             "user.email=t@t",
             "-c",
             "commit.gpgsign=false",
+            "-c",
+            "core.autocrlf=false",
         ]);
         git.run(&["init", "-q"]).unwrap();
         std::fs::write(dir.join("a.txt"), "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n").unwrap();
