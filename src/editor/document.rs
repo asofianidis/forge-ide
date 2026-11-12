@@ -1,7 +1,13 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use anyhow::Context as _;
+
+fn next_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
 
 /// How the file on disk relates to the buffer, as of the last [`Document::poll_disk`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +33,8 @@ pub enum DiskEvent {
 
 /// A single open file (or unsaved scratch buffer).
 pub struct Document {
+    /// Unique for the session; keys per-document widget state such as the cursor.
+    pub id: u64,
     pub path: Option<PathBuf>,
     pub text: String,
     /// Text as of the last load/save, used to compute the dirty flag.
@@ -39,6 +47,7 @@ pub struct Document {
 impl Document {
     pub fn untitled() -> Self {
         Self {
+            id: next_id(),
             path: None,
             text: String::new(),
             saved_text: String::new(),
@@ -51,6 +60,7 @@ impl Document {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
         Ok(Self {
+            id: next_id(),
             path: Some(path.to_path_buf()),
             saved_text: text.clone(),
             text,
@@ -152,6 +162,15 @@ impl Document {
             .and_then(|p| p.extension())
             .and_then(|e| e.to_str())
             .unwrap_or("txt")
+    }
+
+    /// Name used to pick a comment style: the extension, or the file name for
+    /// extension-less files such as `Makefile`.
+    pub fn language_key(&self) -> String {
+        match self.path.as_ref().and_then(|p| p.extension()) {
+            Some(ext) => ext.to_string_lossy().into_owned(),
+            None => self.title().to_lowercase(),
+        }
     }
 
     /// Number of lines in the buffer (an empty buffer has one line).

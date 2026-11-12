@@ -1,12 +1,22 @@
 //! Top-level application state and UI layout.
 
+mod editing;
+mod find_bar;
+mod pickers;
+mod search_panel;
+
 use std::collections::HashSet;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use egui::{Key, KeyboardShortcut, Modifiers, RichText, TextStyle};
+use egui::text::CCursor;
+use egui::{Galley, Key, Modifiers, Rect, RichText, Shape, Stroke, TextStyle, pos2};
 
+use crate::commands::Command;
 use crate::editor::conflicts::{self, Resolution};
+use crate::editor::find::Match;
+use crate::editor::ops;
 use crate::editor::scm::{self, EditorAction, EditorGit, Peek};
 use crate::editor::{DiskEvent, DiskState, Document, Highlighter, gutter};
 use crate::git::status::Change;
@@ -15,7 +25,9 @@ use crate::github::model::{CheckOutcome, WorkflowRun};
 use crate::github::{BranchContext, GhEvent, GitHub, ListAction, PrListPanel};
 use crate::history::{HistoryPane, RebasePane};
 use crate::lsp::{ServerBrowser, ServerManager};
+use crate::palette::Picker;
 use crate::panes::{ChangesPane, CommitPane, LogPane, Pane, PaneAction};
+use crate::search::FileIndex;
 use crate::settings::Settings;
 use crate::theme::{self, Theme, UiColors};
 use crate::ui::activity::{self, SidebarView};
@@ -23,22 +35,10 @@ use crate::ui::icons::{self, Icon};
 use crate::updater::{self, UpdateState, Updater};
 use crate::workspace::{FileKinds, FileNode, Workspace};
 
-const SHORTCUT_NEW: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::N);
-const SHORTCUT_OPEN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::O);
-const SHORTCUT_SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
-const SHORTCUT_CLOSE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::W);
-const SHORTCUT_EXPLORER: KeyboardShortcut =
-    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::E);
-const SHORTCUT_SCM: KeyboardShortcut =
-    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::G);
-const SHORTCUT_PRS: KeyboardShortcut =
-    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::P);
-
-const SHORTCUT_BLAME: KeyboardShortcut =
-    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::ALT), Key::B);
-const SHORTCUT_NEXT_CHANGE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::ALT, Key::F5);
-const SHORTCUT_PREV_CHANGE: KeyboardShortcut =
-    KeyboardShortcut::new(Modifiers::ALT.plus(Modifiers::SHIFT), Key::F5);
+use editing::editor_id;
+use find_bar::FindBar;
+use pickers::{FileMatches, PickerMode};
+use search_panel::SearchPanel;
 
 /// Actions from the merge conflict bar above the editor.
 enum ConflictBarAction {
@@ -86,6 +86,20 @@ pub struct ForgeApp {
     /// The current check was started from the menu, so "up to date" and
     /// errors are worth reporting.
     manual_update_check: bool,
+    /// Commands chosen from menus or the palette, run at the end of the frame.
+    pending_commands: Vec<Command>,
+    find: FindBar,
+    search: SearchPanel,
+    picker: Picker,
+    picker_mode: PickerMode,
+    file_index: FileIndex,
+    /// Bumped whenever `file_index` gets a new file list.
+    file_index_generation: usize,
+    file_matches: FileMatches,
+    /// Input of the open Go to Line dialog.
+    go_to_line: Option<String>,
+    /// Character index to scroll the editor to on the next frame.
+    scroll_to: Option<usize>,
     /// Unsaved-changes dialog being shown, if any.
     pending_close: Option<PendingClose>,
     /// Unsaved changes were saved or discarded, so the window may close.
@@ -106,7 +120,7 @@ pub struct ForgeApp {
     /// Change markers, blame and change peek for open files.
     editor_git: EditorGit,
     /// Move the cursor to (and scroll to) this 1-based line next frame.
-    goto_line: Option<usize>,
+    jump_to_line: Option<usize>,
     /// Requested jump to the next (+1) or previous (-1) change.
     change_nav: Option<i8>,
 }
@@ -146,7 +160,7 @@ impl ForgeApp {
             panes: Vec::new(),
             active_pane: None,
             editor_git: EditorGit::default(),
-            goto_line: None,
+            jump_to_line: None,
             change_nav: None,
             workspace,
             documents: vec![Document::untitled()],
@@ -163,6 +177,16 @@ impl ForgeApp {
             updater,
             last_update_state: UpdateState::Idle,
             manual_update_check: false,
+            pending_commands: Vec::new(),
+            find: FindBar::default(),
+            search: SearchPanel::default(),
+            picker: Picker::default(),
+            picker_mode: PickerMode::default(),
+            file_index: FileIndex::default(),
+            file_index_generation: 0,
+            file_matches: FileMatches::default(),
+            go_to_line: None,
+            scroll_to: None,
             pending_close: None,
             allow_close: false,
             last_disk_poll: Instant::now(),
@@ -372,6 +396,7 @@ impl ForgeApp {
         self.panes.clear();
         self.active_pane = None;
         self.editor_git.clear();
+        self.search = SearchPanel::default();
         self.workspace = Some(Workspace::open(path));
     }
 
@@ -742,60 +767,83 @@ impl ForgeApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let (new, open, save, close) = ctx.input_mut(|i| {
-            (
-                i.consume_shortcut(&SHORTCUT_NEW),
-                i.consume_shortcut(&SHORTCUT_OPEN),
-                i.consume_shortcut(&SHORTCUT_SAVE),
-                i.consume_shortcut(&SHORTCUT_CLOSE),
-            )
-        });
-        let (explorer, scm, prs) = ctx.input_mut(|i| {
-            (
-                i.consume_shortcut(&SHORTCUT_EXPLORER),
-                i.consume_shortcut(&SHORTCUT_SCM),
-                i.consume_shortcut(&SHORTCUT_PRS),
-            )
-        });
-        let (blame, next_change, prev_change) = ctx.input_mut(|i| {
-            (
-                i.consume_shortcut(&SHORTCUT_BLAME),
-                i.consume_shortcut(&SHORTCUT_NEXT_CHANGE),
-                i.consume_shortcut(&SHORTCUT_PREV_CHANGE),
-            )
-        });
-        if blame {
-            self.editor_git.blame_on = !self.editor_git.blame_on;
+        if self.picker.open || self.go_to_line.is_some() {
+            // Let the dialog handle Escape; other shortcuts still work.
+        } else if self.find.open && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            self.close_find(ctx);
         }
-        if next_change {
-            self.change_nav = Some(1);
+        self.handle_tab(ctx);
+
+        // Editing shortcuts only apply when typing in the editor, so that
+        // e.g. Alt+Up in the find field doesn't move lines.
+        // A diff / PR / history tab hides the document, so it can't be edited.
+        let editor_focused = self.active_pane.is_none()
+            && (self.editor_has_focus(ctx)
+                || (ctx.memory(|m| m.focused().is_none())
+                    && !self.picker.open
+                    && self.go_to_line.is_none()));
+        for (cmd, shortcut) in Command::shortcut_table() {
+            if cmd.edits_text() && !editor_focused {
+                continue;
+            }
+            if ctx.input_mut(|i| i.consume_shortcut(&shortcut)) {
+                self.run_command(ctx, cmd);
+            }
         }
-        if prev_change {
-            self.change_nav = Some(-1);
-        }
-        if explorer {
-            self.show_sidebar(SidebarView::Explorer);
-        }
-        if scm {
-            self.show_sidebar(SidebarView::SourceControl);
-        }
-        if prs {
-            self.show_sidebar(SidebarView::PullRequests);
-        }
-        if new {
-            self.new_file();
-        }
-        if open {
-            self.open_file_dialog();
-        }
-        if save {
-            self.save_active();
-        }
-        if close {
-            match self.active_pane {
+    }
+
+    fn run_command(&mut self, ctx: &egui::Context, cmd: Command) {
+        match cmd {
+            Command::NewFile => self.new_file(),
+            Command::OpenFile => self.open_file_dialog(),
+            Command::OpenFolder => self.open_folder_dialog(),
+            Command::Save => self.save_active(),
+            Command::CloseTab => match self.active_pane {
                 Some(i) => self.close_pane(i),
                 None => self.close_tab(self.active),
+            },
+            Command::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Command::Find => {
+                self.active_pane = None;
+                self.open_find(ctx, false);
             }
+            Command::Replace => {
+                self.active_pane = None;
+                self.open_find(ctx, true);
+            }
+            Command::FindInProject => self.open_project_search(ctx),
+            Command::ToggleComment
+            | Command::Indent
+            | Command::Outdent
+            | Command::DuplicateLine
+            | Command::MoveLineUp
+            | Command::MoveLineDown => self.edit_command(ctx, cmd),
+            Command::QuickOpen => self.open_quick_open(ctx),
+            Command::GoToLine => {
+                self.active_pane = None;
+                self.open_go_to_line();
+            }
+            Command::ShowCommandPalette => self.open_command_palette(),
+            Command::ShowExplorer => self.show_sidebar(SidebarView::Explorer),
+            Command::ShowSourceControl => self.show_sidebar(SidebarView::SourceControl),
+            Command::ShowPullRequests => self.show_sidebar(SidebarView::PullRequests),
+            Command::ToggleBlame => self.editor_git.blame_on = !self.editor_git.blame_on,
+            Command::NextChange => self.change_nav = Some(1),
+            Command::PreviousChange => self.change_nav = Some(-1),
+            Command::FileHistory => {
+                let rel = self
+                    .documents
+                    .get(self.active)
+                    .and_then(|d| d.path.as_deref())
+                    .and_then(|p| self.source_control.rel_path(p));
+                self.open_history(rel);
+            }
+            Command::RepositoryHistory => self.open_history(None),
+            Command::SelectTheme => self.open_theme_picker(),
+            Command::ReloadThemes => self.reload_themes(ctx),
+            Command::OpenThemesFolder => self.open_themes_folder(),
+            Command::LanguageServers => self.server_browser.open = true,
+            Command::CheckForUpdates => self.check_for_updates(ctx),
         }
     }
 
@@ -814,115 +862,83 @@ impl ForgeApp {
 
     // ---- panels --------------------------------------------------------
 
+    /// A menu entry for `cmd`, showing its shortcut. Clicking queues the command.
+    fn menu_item(&mut self, ui: &mut egui::Ui, cmd: Command) {
+        let mut button = egui::Button::new(cmd.label());
+        if let Some(shortcut) = cmd.shortcuts().first() {
+            button = button.shortcut_text(ui.ctx().format_shortcut(shortcut));
+        }
+        let enabled = match cmd {
+            Command::CheckForUpdates => !matches!(
+                self.updater.state(),
+                UpdateState::Checking | UpdateState::Installing(_)
+            ),
+            Command::QuickOpen | Command::FindInProject => self.workspace.is_some(),
+            _ => true,
+        };
+        if ui.add_enabled(enabled, button).clicked() {
+            self.pending_commands.push(cmd);
+            ui.close();
+        }
+    }
+
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
+        use Command::*;
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
-                let ctx = ui.ctx().clone();
-                if ui
-                    .add(
-                        egui::Button::new("New File")
-                            .shortcut_text(ctx.format_shortcut(&SHORTCUT_NEW)),
-                    )
-                    .clicked()
-                {
-                    self.new_file();
-                }
-                if ui
-                    .add(
-                        egui::Button::new("Open File…")
-                            .shortcut_text(ctx.format_shortcut(&SHORTCUT_OPEN)),
-                    )
-                    .clicked()
-                {
-                    self.open_file_dialog();
-                }
-                if ui.button("Open Folder…").clicked() {
-                    self.open_folder_dialog();
+                for cmd in [NewFile, OpenFile, OpenFolder] {
+                    self.menu_item(ui, cmd);
                 }
                 ui.separator();
-                if ui
-                    .add(
-                        egui::Button::new("Save")
-                            .shortcut_text(ctx.format_shortcut(&SHORTCUT_SAVE)),
-                    )
-                    .clicked()
-                {
-                    self.save_active();
-                }
-                if ui
-                    .add(
-                        egui::Button::new("Close Tab")
-                            .shortcut_text(ctx.format_shortcut(&SHORTCUT_CLOSE)),
-                    )
-                    .clicked()
-                {
-                    self.close_tab(self.active);
+                self.menu_item(ui, Save);
+                self.menu_item(ui, CloseTab);
+                ui.separator();
+                self.menu_item(ui, Quit);
+            });
+            ui.menu_button("Edit", |ui| {
+                for cmd in [Find, Replace, FindInProject] {
+                    self.menu_item(ui, cmd);
                 }
                 ui.separator();
-                if ui.button("Quit").clicked() {
-                    ui.send_viewport_cmd(egui::ViewportCommand::Close);
+                for cmd in [ToggleComment, Indent, Outdent] {
+                    self.menu_item(ui, cmd);
+                }
+                ui.separator();
+                for cmd in [DuplicateLine, MoveLineUp, MoveLineDown] {
+                    self.menu_item(ui, cmd);
                 }
             });
+            ui.menu_button("Go", |ui| {
+                self.menu_item(ui, QuickOpen);
+                self.menu_item(ui, GoToLine);
+            });
             ui.menu_button("View", |ui| {
-                let ctx = ui.ctx().clone();
-                for (view, shortcut) in [
-                    (SidebarView::Explorer, SHORTCUT_EXPLORER),
-                    (SidebarView::SourceControl, SHORTCUT_SCM),
-                    (SidebarView::PullRequests, SHORTCUT_PRS),
-                ] {
-                    if ui
-                        .add(
-                            egui::Button::new(view.title())
-                                .shortcut_text(ctx.format_shortcut(&shortcut)),
-                        )
-                        .clicked()
-                    {
-                        self.show_sidebar(view);
-                        ui.close();
-                    }
+                self.menu_item(ui, ShowCommandPalette);
+                ui.separator();
+                self.menu_item(ui, ShowExplorer);
+                let mut search = egui::Button::new("Search");
+                if let Some(s) = FindInProject.shortcuts().first() {
+                    search = search.shortcut_text(ui.ctx().format_shortcut(s));
                 }
+                if ui.add(search).clicked() {
+                    self.pending_commands.push(FindInProject);
+                    ui.close();
+                }
+                self.menu_item(ui, ShowSourceControl);
+                self.menu_item(ui, ShowPullRequests);
                 ui.separator();
                 let mut blame = self.editor_git.blame_on;
-                if ui
-                    .add(egui::Checkbox::new(&mut blame, "Blame"))
-                    .on_hover_text(ctx.format_shortcut(&SHORTCUT_BLAME))
-                    .changed()
-                {
+                let mut checkbox = ui.add(egui::Checkbox::new(&mut blame, "Blame"));
+                if let Some(s) = ToggleBlame.shortcuts().first() {
+                    checkbox = checkbox.on_hover_text(ui.ctx().format_shortcut(s));
+                }
+                if checkbox.changed() {
                     self.editor_git.blame_on = blame;
                 }
-                if ui
-                    .add(
-                        egui::Button::new("Next Change")
-                            .shortcut_text(ctx.format_shortcut(&SHORTCUT_NEXT_CHANGE)),
-                    )
-                    .clicked()
-                {
-                    self.change_nav = Some(1);
-                    ui.close();
-                }
-                if ui
-                    .add(
-                        egui::Button::new("Previous Change")
-                            .shortcut_text(ctx.format_shortcut(&SHORTCUT_PREV_CHANGE)),
-                    )
-                    .clicked()
-                {
-                    self.change_nav = Some(-1);
-                    ui.close();
-                }
-                let active_path = self.documents.get(self.active).and_then(|d| d.path.clone());
-                if ui
-                    .add_enabled(active_path.is_some(), egui::Button::new("File History"))
-                    .clicked()
-                {
-                    let rel = active_path.and_then(|p| self.source_control.rel_path(&p));
-                    self.open_history(rel);
-                    ui.close();
-                }
-                if ui.button("Repository History").clicked() {
-                    self.open_history(None);
-                    ui.close();
-                }
+                self.menu_item(ui, NextChange);
+                self.menu_item(ui, PreviousChange);
+                self.menu_item(ui, FileHistory);
+                self.menu_item(ui, RepositoryHistory);
                 ui.separator();
                 ui.menu_button("Theme", |ui| {
                     let mut chosen = None;
@@ -935,31 +951,16 @@ impl ForgeApp {
                         self.set_theme(ui.ctx(), idx);
                     }
                     ui.separator();
-                    if ui.button("Reload Themes").clicked() {
-                        self.reload_themes(ui.ctx());
-                    }
-                    if ui.button("Open Themes Folder").clicked() {
-                        self.open_themes_folder();
-                    }
+                    self.menu_item(ui, SelectTheme);
+                    self.menu_item(ui, ReloadThemes);
+                    self.menu_item(ui, OpenThemesFolder);
                 });
             });
             ui.menu_button("Tools", |ui| {
-                if ui.button("Language Servers…").clicked() {
-                    self.server_browser.open = true;
-                    ui.close();
-                }
+                self.menu_item(ui, LanguageServers);
             });
             ui.menu_button("Help", |ui| {
-                let busy = matches!(
-                    self.updater.state(),
-                    UpdateState::Checking | UpdateState::Installing(_)
-                );
-                if ui
-                    .add_enabled(!busy, egui::Button::new("Check for Updates"))
-                    .clicked()
-                {
-                    self.check_for_updates(ui.ctx());
-                }
+                self.menu_item(ui, CheckForUpdates);
                 let mut auto = self
                     .settings
                     .auto_update
@@ -978,14 +979,6 @@ impl ForgeApp {
     }
 
     fn explorer(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new("EXPLORER")
-                .small()
-                .strong()
-                .color(self.current_theme().ui.text_muted.0),
-        );
-        ui.add_space(2.0);
         let Some(ws) = &mut self.workspace else {
             if ui.button("Open Folder…").clicked() {
                 self.open_folder_dialog();
@@ -1033,6 +1026,10 @@ impl ForgeApp {
         let colors = self.current_theme().ui.clone();
         match self.sidebar_view {
             SidebarView::Explorer => self.explorer(ui),
+            SidebarView::Search => {
+                ui.add_space(4.0);
+                self.search_view(ui);
+            }
             SidebarView::SourceControl => {
                 ui.add_space(4.0);
                 match self.scm_panel.show(ui, &mut self.source_control, &colors) {
@@ -1391,6 +1388,7 @@ impl ForgeApp {
         let Some(doc) = self.documents.get(self.active) else {
             return;
         };
+        let id = editor_id(doc);
         let path = doc.path.clone();
         let sc = &self.source_control;
         let rel = path.as_deref().and_then(|p| sc.rel_path(p));
@@ -1450,7 +1448,7 @@ impl ForgeApp {
                             .iter()
                             .find(|c| c.start + 1 > line)
                             .or(found_conflicts.first());
-                        self.goto_line = next.map(|c| c.start + 1);
+                        self.jump_to_line = next.map(|c| c.start + 1);
                     }
                     ConflictBarAction::MarkResolved => {
                         self.save_active();
@@ -1482,21 +1480,33 @@ impl ForgeApp {
         let digit_width = ui.fonts_mut(|f| f.glyph_width(&font, '0'));
         let gutter_width = gutter::width(doc.line_count(), digit_width);
         let current_line = self.cursor.0;
-        let editor_id = egui::Id::unique(("editor", self.active));
+        let mut scroll_to = self.scroll_to.take();
+        let matches: &[Match] = if self.find.open {
+            &self.find.matches
+        } else {
+            &[]
+        };
+        let current_match = self.find.current;
+
+        let visuals = ui.visuals();
+        let background = visuals.text_edit_bg_color();
+        let accent = colors.accent.0;
+        let hl = HighlightColors {
+            find: accent.gamma_multiply(0.25),
+            find_current: accent.gamma_multiply(0.55),
+            bracket_fill: visuals.selection.bg_fill.gamma_multiply(0.35),
+            bracket_stroke: Stroke::new(1.0, visuals.weak_text_color()),
+        };
 
         // Move the cursor for "go to change / conflict".
-        let mut scroll_line = None;
-        if let Some(line) = self.goto_line.take() {
-            let mut state =
-                egui::text_edit::TextEditState::load(ui.ctx(), editor_id).unwrap_or_default();
+        if let Some(line) = self.jump_to_line.take() {
+            let mut state = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
             let idx = scm::line_start_char(&doc.text, line);
             state
                 .cursor
-                .set_char_range(Some(egui::text::CCursorRange::one(
-                    egui::text::CCursor::new(idx),
-                )));
-            state.store(ui.ctx(), editor_id);
-            scroll_line = Some(line);
+                .set_char_range(Some(egui::text::CCursorRange::one(CCursor::new(idx))));
+            state.store(ui.ctx(), id);
+            scroll_to = Some(idx);
         }
 
         let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
@@ -1509,15 +1519,14 @@ impl ForgeApp {
         let editor_rect = ui.available_rect_before_wrap();
         // The editor fills the whole central panel, so draw it without the default
         // `TextEdit` frame: that frame outlines the widget on hover and, since the
-        // editor keeps focus, permanently in the selection stroke color.
-        let frame = egui::Frame::NONE
-            .fill(ui.visuals().text_edit_bg_color())
-            .inner_margin(egui::Margin {
-                left: gutter_width as i8,
-                right: 4,
-                top: 2,
-                bottom: 2,
-            });
+        // editor keeps focus, permanently in the selection stroke color. The
+        // background is painted separately, underneath the match highlights.
+        let frame = egui::Frame::NONE.inner_margin(egui::Margin {
+            left: gutter_width as i8,
+            right: 4,
+            top: 2,
+            bottom: 2,
+        });
 
         let output = egui::ScrollArea::both()
             .id_salt("editor_scroll")
@@ -1532,8 +1541,9 @@ impl ForgeApp {
                         );
                         r.x_range()
                     });
+                    let underlay = ui.painter().add(Shape::Noop);
                     let output = egui::TextEdit::multiline(&mut doc.text)
-                        .id(editor_id)
+                        .id(id)
                         .code_editor()
                         .lock_focus(true)
                         .desired_width(f32::INFINITY)
@@ -1541,6 +1551,52 @@ impl ForgeApp {
                         .frame(frame)
                         .layouter(&mut layouter)
                         .show(ui);
+
+                    let galley = &output.galley;
+                    let offset = output.galley_pos.to_vec2();
+                    let mut shapes = vec![Shape::rect_filled(
+                        output.response.response.rect,
+                        0.0,
+                        background,
+                    )];
+
+                    // Find matches, only those on screen.
+                    let visible = visible_chars(galley, ui.clip_rect().translate(-offset));
+                    let first = matches.partition_point(|m| m.chars.end < visible.start);
+                    for (i, m) in matches.iter().enumerate().skip(first) {
+                        if m.chars.start > visible.end {
+                            break;
+                        }
+                        let fill = if Some(i) == current_match {
+                            hl.find_current
+                        } else {
+                            hl.find
+                        };
+                        for r in range_rects(galley, m.chars.clone()) {
+                            shapes.push(Shape::rect_filled(r.translate(offset), 2.0, fill));
+                        }
+                    }
+
+                    // Matching bracket pair around the caret.
+                    if let Some(range) = output.cursor_range
+                        && range.is_empty()
+                        && output.response.response.has_focus()
+                        && let Some((a, b)) =
+                            ops::matching_bracket(&doc.text, range.primary.index.into())
+                    {
+                        for c in [a, b] {
+                            let r = range_rects(galley, c..c + 1)[0].translate(offset);
+                            shapes.push(Shape::rect_filled(r, 2.0, hl.bracket_fill));
+                            shapes.push(Shape::rect_stroke(
+                                r,
+                                2.0,
+                                hl.bracket_stroke,
+                                egui::StrokeKind::Inside,
+                            ));
+                        }
+                    }
+                    ui.painter().set(underlay, Shape::Vec(shapes));
+
                     gutter::paint(
                         ui,
                         &output,
@@ -1582,10 +1638,9 @@ impl ForgeApp {
                             peek_anchor = gutter::line_rect(&output, last);
                         }
                     }
-                    if let Some(line) = scroll_line
-                        && let Some(r) = gutter::line_rect(&output, line)
-                    {
-                        ui.scroll_to_rect(r, Some(egui::Align::Center));
+                    if let Some(c) = scroll_to {
+                        let r = galley.pos_from_cursor(CCursor::new(c)).translate(offset);
+                        ui.scroll_to_rect(r.expand(digit_width * 4.0), Some(egui::Align::Center));
                     }
                     output
                 })
@@ -1634,7 +1689,7 @@ impl ForgeApp {
             }
             Some(EditorAction::GoToChange(i)) => {
                 if let (Some(p), Some(h)) = (&path, changes.as_ref().and_then(|c| c.hunks.get(i))) {
-                    self.goto_line = Some(h.start);
+                    self.jump_to_line = Some(h.start);
                     self.editor_git.peek = Some(Peek {
                         path: p.clone(),
                         hunk: i,
@@ -1652,6 +1707,84 @@ impl ForgeApp {
             None => {}
         }
     }
+}
+
+struct HighlightColors {
+    find: egui::Color32,
+    find_current: egui::Color32,
+    bracket_fill: egui::Color32,
+    bracket_stroke: Stroke,
+}
+
+/// Range of character indices on rows that intersect `clip` (in galley coordinates).
+fn visible_chars(galley: &Galley, clip: Rect) -> Range<usize> {
+    let mut start = None;
+    let mut chars = 0;
+    for row in &galley.rows {
+        let rect = row.rect();
+        let count: usize = row.char_count_including_newline().into();
+        if rect.bottom() >= clip.top() && start.is_none() {
+            start = Some(chars);
+        }
+        if rect.top() > clip.bottom() {
+            break;
+        }
+        chars += count;
+    }
+    start.unwrap_or(chars)..chars
+}
+
+/// Rectangles (in galley coordinates) covering the characters in `range`, one
+/// per row the range spans.
+fn range_rects(galley: &Galley, range: Range<usize>) -> Vec<Rect> {
+    let a = galley.pos_from_cursor(CCursor::new(range.start));
+    let b = galley.pos_from_cursor(CCursor::new(range.end));
+    let min_width = 4.0;
+    if (a.top() - b.top()).abs() < 0.5 {
+        let right = b.left().max(a.left() + min_width);
+        return vec![Rect::from_min_max(a.min, pos2(right, a.bottom()))];
+    }
+    // Spans rows: from the start to the end of its row, full rows in between,
+    // and the start of the last row up to the end.
+    let mut rects = Vec::new();
+    for row in &galley.rows {
+        let r = row.rect();
+        if r.bottom() <= a.top() || r.top() >= b.bottom() {
+            continue;
+        }
+        let left = if r.top() <= a.top() {
+            a.left()
+        } else {
+            r.left()
+        };
+        let right = if r.bottom() >= b.bottom() {
+            b.left()
+        } else {
+            r.right().max(left + min_width)
+        };
+        if right > left {
+            rects.push(Rect::from_min_max(
+                pos2(left, r.top()),
+                pos2(right, r.bottom()),
+            ));
+        }
+    }
+    rects
+}
+
+/// A small on/off button for search options. Returns true when toggled.
+fn toggle(ui: &mut egui::Ui, value: &mut bool, label: &str, hint: &str) -> bool {
+    let clicked = ui
+        .add(egui::Button::selectable(
+            *value,
+            RichText::new(label).monospace(),
+        ))
+        .on_hover_text(hint)
+        .clicked();
+    if clicked {
+        *value = !*value;
+    }
+    clicked
 }
 
 /// Banner above a file with merge conflicts.
@@ -1803,6 +1936,7 @@ impl eframe::App for ForgeApp {
         }
         self.servers.poll();
         self.poll_updater();
+        self.search.search.poll();
         self.poll_disk(&ctx);
         self.source_control.poll();
         self.github
@@ -1834,7 +1968,7 @@ impl eframe::App for ForgeApp {
                     |v| match v {
                         SidebarView::SourceControl => changes,
                         SidebarView::PullRequests => review_requests,
-                        SidebarView::Explorer => 0,
+                        SidebarView::Explorer | SidebarView::Search => 0,
                     },
                     &colors,
                 );
@@ -1870,6 +2004,7 @@ impl eframe::App for ForgeApp {
                     }
                     _ => {
                         self.disk_banner(ui);
+                        self.find_bar(ui);
                         self.editor(ui);
                     }
                 }
@@ -1878,6 +2013,12 @@ impl eframe::App for ForgeApp {
         if self.server_browser.open {
             let kinds = self.project_file_kinds();
             self.server_browser.show(&ctx, &mut self.servers, &kinds);
+        }
+
+        self.show_picker(&ctx);
+        self.go_to_line_dialog(&ctx);
+        for cmd in std::mem::take(&mut self.pending_commands) {
+            self.run_command(&ctx, cmd);
         }
         self.close_dialog(&ctx);
     }

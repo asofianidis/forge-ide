@@ -1,5 +1,6 @@
 //! The activity bar: a narrow strip on the far left that switches the
-//! sidebar between the explorer, source control and pull requests.
+//! sidebar between the explorer, project search, source control and pull
+//! requests.
 
 use egui::{Sense, Stroke, Ui, vec2};
 
@@ -10,16 +11,23 @@ use crate::theme::UiColors;
 pub enum SidebarView {
     #[default]
     Explorer,
+    Search,
     SourceControl,
     PullRequests,
 }
 
 impl SidebarView {
-    pub const ALL: [SidebarView; 3] = [Self::Explorer, Self::SourceControl, Self::PullRequests];
+    pub const ALL: [SidebarView; 4] = [
+        Self::Explorer,
+        Self::Search,
+        Self::SourceControl,
+        Self::PullRequests,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
             Self::Explorer => "Explorer",
+            Self::Search => "Search",
             Self::SourceControl => "Source Control",
             Self::PullRequests => "Pull Requests",
         }
@@ -28,6 +36,7 @@ impl SidebarView {
     fn icon(self) -> Icon {
         match self {
             Self::Explorer => Icon::Files,
+            Self::Search => Icon::Search,
             Self::SourceControl => Icon::Branch,
             Self::PullRequests => Icon::PullRequest,
         }

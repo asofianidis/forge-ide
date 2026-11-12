@@ -2,12 +2,16 @@
 
 mod app;
 mod cli;
+mod commands;
 mod editor;
+mod fuzzy;
 mod git;
 mod github;
 mod history;
 mod lsp;
+mod palette;
 mod panes;
+mod search;
 mod settings;
 mod task;
 mod theme;
