@@ -59,6 +59,8 @@ pub enum Command {
     LanguageServers,
     RestartLanguageServers,
     ToggleFormatOnSave,
+    ToggleTerminal,
+    RestartTerminal,
     CheckForUpdates,
 }
 
@@ -136,6 +138,8 @@ impl Command {
         Command::LanguageServers,
         Command::RestartLanguageServers,
         Command::ToggleFormatOnSave,
+        Command::ToggleTerminal,
+        Command::RestartTerminal,
         Command::CheckForUpdates,
     ];
 
@@ -194,6 +198,8 @@ impl Command {
             Command::LanguageServers => "Language Servers…",
             Command::RestartLanguageServers => "Restart Language Servers",
             Command::ToggleFormatOnSave => "Format on Save",
+            Command::ToggleTerminal => "Toggle Terminal",
+            Command::RestartTerminal => "Restart Shell",
             Command::CheckForUpdates => "Check for Updates",
         }
     }
@@ -213,6 +219,7 @@ impl Command {
             | ToggleLineNumbers | IncreaseFontSize | DecreaseFontSize | ResetFontSize
             | SelectTheme | ReloadThemes | OpenThemesFolder => "View",
             LanguageServers | RestartLanguageServers | ToggleFormatOnSave => "Tools",
+            ToggleTerminal | RestartTerminal => "Terminal",
             CheckForUpdates => "Help",
         }
     }
@@ -288,6 +295,8 @@ impl Command {
             }
             Command::DecreaseFontSize => &const { one(shortcut(CMD, Key::Minus)) },
             Command::ResetFontSize => &const { one(shortcut(CMD, Key::Num0)) },
+            // Ctrl+` on every platform, as in other editors.
+            Command::ToggleTerminal => &const { one(shortcut(Modifiers::CTRL, Key::Backtick)) },
             _ => &[],
         }
     }
@@ -384,5 +393,9 @@ mod tests {
         assert_eq!(unique.len(), Command::ALL.len());
         assert_eq!(Command::Find.palette_label(), "Edit: Find");
         assert_eq!(Command::OpenSettings.palette_label(), "File: Settings");
+        assert_eq!(
+            Command::RestartTerminal.palette_label(),
+            "Terminal: Restart Shell"
+        );
     }
 }

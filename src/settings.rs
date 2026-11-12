@@ -33,6 +33,10 @@ pub struct Settings {
     pub word_wrap: bool,
     /// Show line numbers in the editor gutter.
     pub line_numbers: bool,
+    /// Shell for the integrated terminal, with optional arguments (e.g. `"bash --login"`).
+    /// Defaults to PowerShell on Windows and `$SHELL` elsewhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_shell: Option<String>,
     /// Recently opened folders, most recent first.
     pub recent_folders: Vec<PathBuf>,
     /// Open tabs per folder, most recently used first.
@@ -66,6 +70,7 @@ impl Default for Settings {
             font_size: DEFAULT_FONT_SIZE,
             word_wrap: false,
             line_numbers: true,
+            terminal_shell: None,
             recent_folders: Vec::new(),
             sessions: Vec::new(),
         }
@@ -193,6 +198,7 @@ mod tests {
         assert_eq!(s.theme.as_deref(), Some("Blossom"));
         assert_eq!(s.auto_update, None);
         assert!(s.recent_folders.is_empty());
+        assert_eq!(s.terminal_shell, None);
         let s: Settings = toml::from_str("").unwrap();
         assert!(s.theme.is_none());
     }
@@ -273,6 +279,7 @@ mod tests {
             font_size: 16.0,
             word_wrap: true,
             line_numbers: false,
+            terminal_shell: Some("bash --login".into()),
             ..Settings::default()
         };
         s.add_recent_folder(Path::new("/code/a"));

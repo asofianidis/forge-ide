@@ -38,6 +38,8 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
 - Language server client: installed servers start automatically for open files (see below)
 - Git source control (see below) with live change markers in the editor gutter
 - GitHub pull requests through the GitHub CLI (see below)
+- Integrated terminal (Ctrl+\`): your shell in a pseudo-terminal below the editor, with colors
+  and scrollback (see below)
 - Themes: built-in **Blossom** (default) and **Blossom Light**, plus custom TOML themes
 - Settings window (Ctrl+,): color theme, font size, word wrap, line numbers, format on save,
   update checks. Changes apply and save immediately; the file can also be edited as TOML
@@ -204,6 +206,23 @@ keyword = "#0f9d8f"
 See [`themes/example.toml`](themes/example.toml) for every key. After editing a file, use
 **View → Theme → Reload Themes**. Files that fail to load are reported in the status bar.
 
+## Terminal
+
+Ctrl+\` (Ctrl on macOS too), **Terminal → Toggle Terminal** or the command palette opens a
+resizable panel below the editor running your shell in the open folder. It defaults to `$SHELL`
+(PowerShell on Windows); set `terminal_shell` in `settings.toml` to use another, with arguments:
+
+```toml
+terminal_shell = "bash --login"
+```
+
+`settings.toml` lives next to the themes folder (e.g. `~/.config/forge-ide/` on Linux); a change
+applies the next time the shell starts. Output
+supports 16/256/true colors, bold/italic/underline/inverse and wide characters; scroll back with
+the mouse wheel. Ctrl+C reaches the shell. When the shell exits the panel shows its exit code;
+press Enter, click the restart button or run **Terminal: Restart Shell** to start a new one.
+Ctrl+\` while the terminal has focus hides it (the shell keeps running).
+
 ## Getting started
 
 Requires a recent stable Rust toolchain (edition 2024).
@@ -245,6 +264,7 @@ cargo run --release -- path/to/project
 | Format document        | Ctrl+Shift+I                            |
 | Problems               | Ctrl+Shift+M                            |
 | Next / prev. problem   | F8 / Shift+F8                           |
+| Toggle terminal        | Ctrl+\` (Ctrl on macOS too)             |
 | Settings               | Ctrl+,                                  |
 | Toggle word wrap       | Alt+Z                                   |
 | Font size bigger / smaller / reset | Ctrl+= / Ctrl+- / Ctrl+0    |
@@ -265,7 +285,8 @@ src/
 │   ├── find_bar.rs      # find / replace bar
 │   ├── search_panel.rs  # "Search" sidebar
 │   ├── preferences.rs   # Settings window, font size / word wrap / line numbers
-│   └── pickers.rs       # quick open, command palette, theme picker
+│   ├── pickers.rs       # quick open, command palette, theme picker
+│   └── terminal_panel.rs # terminal panel: show / hide, restart
 ├── commands.rs          # every action: name, menu, shortcut (menus + palette use it)
 ├── palette.rs           # list picker used by quick open and the command palette
 ├── fuzzy.rs             # fuzzy matcher for file and command names
@@ -274,6 +295,7 @@ src/
 ├── history.rs           # commit graph tab and interactive rebase tab
 ├── cli.rs               # running git and gh
 ├── task.rs              # background work helper
+├── terminal.rs          # integrated terminal (PTY + vt100 screen, key encoding)
 ├── settings.rs          # persisted preferences (settings.toml)
 ├── theme.rs             # built-in + custom themes
 ├── updater.rs           # self-update from GitHub releases
@@ -326,7 +348,7 @@ src/
 - [x] Project search, quick open
 - [x] Command palette
 - [x] Unsaved-changes prompt on close
-- [ ] Integrated terminal
+- [x] Integrated terminal
 - [x] Language server discovery and installation
 - [x] LSP client: diagnostics, hover, go to definition, completion, rename, references, formatting
 - [ ] LSP client (diagnostics, completion, go to definition)
