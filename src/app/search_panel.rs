@@ -36,7 +36,7 @@ impl ForgeApp {
             && !sel.is_empty()
         {
             let selected: String = doc
-                .text
+                .text()
                 .chars()
                 .skip(sel.start)
                 .take(sel.end - sel.start)
@@ -68,14 +68,14 @@ impl ForgeApp {
         if doc.path.as_deref() != Some(path) {
             return;
         }
-        let start = ops::line_start(&doc.text, line);
+        let start = ops::line_start(doc.text(), line);
         let line_text: &str = {
             let byte = doc
-                .text
+                .text()
                 .char_indices()
                 .nth(start)
-                .map_or(doc.text.len(), |(b, _)| b);
-            let rest = &doc.text[byte..];
+                .map_or(doc.text().len(), |(b, _)| b);
+            let rest = &doc.text()[byte..];
             &rest[..rest.find('\n').unwrap_or(rest.len())]
         };
         // The file may have changed since the search ran; clamp to the line.

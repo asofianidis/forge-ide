@@ -14,6 +14,12 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
   git status follow changes made by other programs as they happen. Unmodified open files reload;
   files with unsaved edits show a banner to reload or keep your version
 - Tabbed editing with unsaved-change indicators
+- Rope-backed buffers with grouped undo/redo history. Every edit is undoable, including line
+  commands, replace, hunk revert, conflict resolution, language-server edits and reloads from
+  disk; undoing back to the saved state clears the unsaved marker.
+  *Limitation:* egui's `TextEdit` needs the text as one contiguous string, so the buffer keeps a
+  `String` mirror for rendering and layout is still O(file size). Truly large files need a custom
+  editor widget that lays out only the visible lines; the buffer is the model for that.
 - Session restore: each folder reopens with the tabs, selected tab and cursor positions it had
   last time. Starting Forge without a folder argument opens the last folder you used
   (`forge-ide .` opens the current directory)
@@ -241,6 +247,8 @@ cargo run --release -- path/to/project
 | Save                   | Ctrl+S                                  |
 | Save as                | Ctrl+Shift+S                            |
 | Close tab              | Ctrl+W                                  |
+| Undo                   | Ctrl+Z                                  |
+| Redo                   | Ctrl+Y / Ctrl+Shift+Z (Cmd+Shift+Z on macOS) |
 | Next / previous tab    | Ctrl+Tab / Ctrl+Shift+Tab (Ctrl on macOS too) |
 | Command palette        | Ctrl+Shift+P                            |
 | Go to file             | Ctrl+P                                  |
@@ -331,6 +339,7 @@ src/
 │   ├── text.rs          # positions/encodings, URIs, snippets, applying edits
 │   └── browser.rs       # "Language Servers" window
 └── editor/
+    ├── buffer.rs        # rope-backed text buffer, undo/redo history
     ├── document.rs      # open file buffer, load/save, dirty tracking
     ├── find.rs          # in-file find / replace
     ├── ops.rs           # comment, indent, move lines, auto-indent/pairs, brackets
@@ -343,7 +352,7 @@ src/
 ## Roadmap
 
 - [x] Line-number gutter
-- [ ] Rope-based buffer for large files, undo/redo history
+- [x] Rope-based buffer for large files, undo/redo history
 - [x] Find / replace, go to line
 - [x] Project search, quick open
 - [x] Command palette

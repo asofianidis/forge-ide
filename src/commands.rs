@@ -18,6 +18,8 @@ pub enum Command {
     OpenSettings,
     OpenSettingsFile,
     Quit,
+    Undo,
+    Redo,
     Find,
     Replace,
     FindInProject,
@@ -97,6 +99,8 @@ impl Command {
         Command::OpenSettings,
         Command::OpenSettingsFile,
         Command::Quit,
+        Command::Undo,
+        Command::Redo,
         Command::Find,
         Command::Replace,
         Command::FindInProject,
@@ -157,6 +161,8 @@ impl Command {
             Command::OpenSettings => "Settings…",
             Command::OpenSettingsFile => "Open Settings File (TOML)",
             Command::Quit => "Quit",
+            Command::Undo => "Undo",
+            Command::Redo => "Redo",
             Command::Find => "Find",
             Command::Replace => "Replace",
             Command::FindInProject => "Find in Project",
@@ -210,8 +216,9 @@ impl Command {
         match self {
             NewFile | OpenFile | OpenFolder | OpenRecent | Save | SaveAs | CloseTab
             | RevealActiveFile | OpenSettings | OpenSettingsFile | Quit => "File",
-            Find | Replace | FindInProject | ToggleComment | Indent | Outdent | DuplicateLine
-            | MoveLineUp | MoveLineDown | TriggerSuggest | RenameSymbol | FormatDocument => "Edit",
+            Undo | Redo | Find | Replace | FindInProject | ToggleComment | Indent | Outdent
+            | DuplicateLine | MoveLineUp | MoveLineDown | TriggerSuggest | RenameSymbol
+            | FormatDocument => "Edit",
             QuickOpen | GoToLine | NextTab | PreviousTab | GoToDefinition | FindReferences
             | NextProblem | PreviousProblem | NextChange | PreviousChange => "Go",
             ShowCommandPalette | ShowExplorer | ShowSourceControl | ShowPullRequests
@@ -244,6 +251,15 @@ impl Command {
             Command::Save => &const { one(shortcut(CMD, Key::S)) },
             Command::SaveAs => &const { one(shortcut(CMD_SHIFT, Key::S)) },
             Command::CloseTab => &const { one(shortcut(CMD, Key::W)) },
+            Command::Undo => &const { one(shortcut(CMD, Key::Z)) },
+            // Cmd+Shift+Z is the usual redo on macOS, Ctrl+Y on Windows and Linux.
+            Command::Redo => {
+                if cfg!(target_os = "macos") {
+                    &const { [shortcut(CMD_SHIFT, Key::Z), shortcut(CMD, Key::Y)] }
+                } else {
+                    &const { [shortcut(CMD, Key::Y), shortcut(CMD_SHIFT, Key::Z)] }
+                }
+            }
             Command::Find => &const { one(shortcut(CMD, Key::F)) },
             // macOS reserves Cmd+H for "Hide", so the menu shows Cmd+Option+F
             // there (as other editors do) and Cmd+H is kept as an alternative.
@@ -306,7 +322,9 @@ impl Command {
     pub fn edits_text(self) -> bool {
         matches!(
             self,
-            Command::ToggleComment
+            Command::Undo
+                | Command::Redo
+                | Command::ToggleComment
                 | Command::Indent
                 | Command::Outdent
                 | Command::DuplicateLine
@@ -366,6 +384,8 @@ mod tests {
         assert!(pos(Command::PreviousChange) < pos(Command::NextChange));
         assert!(pos(Command::FindReferences) < pos(Command::GoToDefinition));
         assert!(pos(Command::PreviousProblem) < pos(Command::NextProblem));
+        // Cmd+Z would also match Cmd+Shift+Z.
+        assert!(pos(Command::Redo) < pos(Command::Undo));
         assert!(pos(Command::SaveAs) < pos(Command::Save));
         assert!(pos(Command::PreviousTab) < pos(Command::NextTab));
     }
