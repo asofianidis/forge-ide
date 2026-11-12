@@ -12,8 +12,11 @@ pub enum Command {
     OpenFolder,
     OpenRecent,
     Save,
+    SaveAs,
     CloseTab,
     RevealActiveFile,
+    OpenSettings,
+    OpenSettingsFile,
     Quit,
     Undo,
     Redo,
@@ -31,6 +34,8 @@ pub enum Command {
     FormatDocument,
     QuickOpen,
     GoToLine,
+    NextTab,
+    PreviousTab,
     GoToDefinition,
     FindReferences,
     NextProblem,
@@ -45,12 +50,19 @@ pub enum Command {
     PreviousChange,
     FileHistory,
     RepositoryHistory,
+    ToggleWordWrap,
+    ToggleLineNumbers,
+    IncreaseFontSize,
+    DecreaseFontSize,
+    ResetFontSize,
     SelectTheme,
     ReloadThemes,
     OpenThemesFolder,
     LanguageServers,
     RestartLanguageServers,
     ToggleFormatOnSave,
+    ToggleTerminal,
+    RestartTerminal,
     CheckForUpdates,
 }
 
@@ -70,6 +82,7 @@ const fn shortcut(modifiers: Modifiers, key: Key) -> KeyboardShortcut {
 const CMD: Modifiers = Modifiers::COMMAND;
 const CMD_SHIFT: Modifiers = Modifiers::COMMAND.plus(Modifiers::SHIFT);
 const CMD_ALT: Modifiers = Modifiers::COMMAND.plus(Modifiers::ALT);
+const CTRL_SHIFT: Modifiers = Modifiers::CTRL.plus(Modifiers::SHIFT);
 const ALT: Modifiers = Modifiers::ALT;
 const ALT_SHIFT: Modifiers = Modifiers::ALT.plus(Modifiers::SHIFT);
 
@@ -80,8 +93,11 @@ impl Command {
         Command::OpenFolder,
         Command::OpenRecent,
         Command::Save,
+        Command::SaveAs,
         Command::CloseTab,
         Command::RevealActiveFile,
+        Command::OpenSettings,
+        Command::OpenSettingsFile,
         Command::Quit,
         Command::Undo,
         Command::Redo,
@@ -99,6 +115,8 @@ impl Command {
         Command::FormatDocument,
         Command::QuickOpen,
         Command::GoToLine,
+        Command::NextTab,
+        Command::PreviousTab,
         Command::GoToDefinition,
         Command::FindReferences,
         Command::NextProblem,
@@ -113,12 +131,19 @@ impl Command {
         Command::PreviousChange,
         Command::FileHistory,
         Command::RepositoryHistory,
+        Command::ToggleWordWrap,
+        Command::ToggleLineNumbers,
+        Command::IncreaseFontSize,
+        Command::DecreaseFontSize,
+        Command::ResetFontSize,
         Command::SelectTheme,
         Command::ReloadThemes,
         Command::OpenThemesFolder,
         Command::LanguageServers,
         Command::RestartLanguageServers,
         Command::ToggleFormatOnSave,
+        Command::ToggleTerminal,
+        Command::RestartTerminal,
         Command::CheckForUpdates,
     ];
 
@@ -130,8 +155,11 @@ impl Command {
             Command::OpenFolder => "Open Folder…",
             Command::OpenRecent => "Open Recent Folder…",
             Command::Save => "Save",
+            Command::SaveAs => "Save As…",
             Command::CloseTab => "Close Tab",
             Command::RevealActiveFile => REVEAL_LABEL,
+            Command::OpenSettings => "Settings…",
+            Command::OpenSettingsFile => "Open Settings File (TOML)",
             Command::Quit => "Quit",
             Command::Undo => "Undo",
             Command::Redo => "Redo",
@@ -149,6 +177,8 @@ impl Command {
             Command::FormatDocument => "Format Document",
             Command::QuickOpen => "Go to File…",
             Command::GoToLine => "Go to Line…",
+            Command::NextTab => "Next Tab",
+            Command::PreviousTab => "Previous Tab",
             Command::GoToDefinition => "Go to Definition",
             Command::FindReferences => "Find All References",
             Command::NextProblem => "Next Problem",
@@ -163,12 +193,19 @@ impl Command {
             Command::PreviousChange => "Previous Change",
             Command::FileHistory => "File History",
             Command::RepositoryHistory => "Repository History",
+            Command::ToggleWordWrap => "Toggle Word Wrap",
+            Command::ToggleLineNumbers => "Toggle Line Numbers",
+            Command::IncreaseFontSize => "Increase Font Size",
+            Command::DecreaseFontSize => "Decrease Font Size",
+            Command::ResetFontSize => "Reset Font Size",
             Command::SelectTheme => "Color Theme…",
             Command::ReloadThemes => "Reload Themes",
             Command::OpenThemesFolder => "Open Themes Folder",
             Command::LanguageServers => "Language Servers…",
             Command::RestartLanguageServers => "Restart Language Servers",
             Command::ToggleFormatOnSave => "Format on Save",
+            Command::ToggleTerminal => "Toggle Terminal",
+            Command::RestartTerminal => "Restart Shell",
             Command::CheckForUpdates => "Check for Updates",
         }
     }
@@ -177,17 +214,19 @@ impl Command {
     pub fn category(self) -> &'static str {
         use Command::*;
         match self {
-            NewFile | OpenFile | OpenFolder | OpenRecent | Save | CloseTab | RevealActiveFile
-            | Quit => "File",
+            NewFile | OpenFile | OpenFolder | OpenRecent | Save | SaveAs | CloseTab
+            | RevealActiveFile | OpenSettings | OpenSettingsFile | Quit => "File",
             Undo | Redo | Find | Replace | FindInProject | ToggleComment | Indent | Outdent
             | DuplicateLine | MoveLineUp | MoveLineDown | TriggerSuggest | RenameSymbol
             | FormatDocument => "Edit",
-            QuickOpen | GoToLine | GoToDefinition | FindReferences | NextProblem
-            | PreviousProblem => "Go",
+            QuickOpen | GoToLine | NextTab | PreviousTab | GoToDefinition | FindReferences
+            | NextProblem | PreviousProblem | NextChange | PreviousChange => "Go",
             ShowCommandPalette | ShowExplorer | ShowSourceControl | ShowPullRequests
-            | ShowProblems | ToggleBlame | NextChange | PreviousChange | FileHistory
-            | RepositoryHistory | SelectTheme | ReloadThemes | OpenThemesFolder => "View",
+            | ShowProblems | ToggleBlame | FileHistory | RepositoryHistory | ToggleWordWrap
+            | ToggleLineNumbers | IncreaseFontSize | DecreaseFontSize | ResetFontSize
+            | SelectTheme | ReloadThemes | OpenThemesFolder => "View",
             LanguageServers | RestartLanguageServers | ToggleFormatOnSave => "Tools",
+            ToggleTerminal | RestartTerminal => "Terminal",
             CheckForUpdates => "Help",
         }
     }
@@ -210,6 +249,7 @@ impl Command {
             Command::NewFile => &const { one(shortcut(CMD, Key::N)) },
             Command::OpenFile => &const { one(shortcut(CMD, Key::O)) },
             Command::Save => &const { one(shortcut(CMD, Key::S)) },
+            Command::SaveAs => &const { one(shortcut(CMD_SHIFT, Key::S)) },
             Command::CloseTab => &const { one(shortcut(CMD, Key::W)) },
             Command::Undo => &const { one(shortcut(CMD, Key::Z)) },
             // Cmd+Shift+Z is the usual redo on macOS, Ctrl+Y on Windows and Linux.
@@ -242,6 +282,9 @@ impl Command {
             Command::OpenRecent => &const { one(shortcut(Modifiers::CTRL, Key::R)) },
             // Ctrl+G on every platform; Cmd+G is "find next" on macOS.
             Command::GoToLine => &const { one(shortcut(Modifiers::CTRL, Key::G)) },
+            // Ctrl+Tab on every platform: Cmd+Tab switches apps on macOS.
+            Command::NextTab => &const { one(shortcut(Modifiers::CTRL, Key::Tab)) },
+            Command::PreviousTab => &const { one(shortcut(CTRL_SHIFT, Key::Tab)) },
             Command::ShowCommandPalette => &const { one(shortcut(CMD_SHIFT, Key::P)) },
             Command::ShowExplorer => &const { one(shortcut(CMD_SHIFT, Key::E)) },
             Command::ShowSourceControl => &const { one(shortcut(CMD_SHIFT, Key::G)) },
@@ -259,6 +302,17 @@ impl Command {
             Command::PreviousProblem => &const { one(shortcut(Modifiers::SHIFT, Key::F8)) },
             Command::ShowProblems => &const { one(shortcut(CMD_SHIFT, Key::M)) },
             Command::PreviousChange => &const { one(shortcut(ALT_SHIFT, Key::F5)) },
+            Command::OpenSettings => &const { one(shortcut(CMD, Key::Comma)) },
+            Command::ToggleWordWrap => &const { one(shortcut(ALT, Key::Z)) },
+            // Cmd+= and Cmd+Shift+= (Cmd++) both make the text bigger. These
+            // replace egui's whole-UI keyboard zoom, which is turned off.
+            Command::IncreaseFontSize => {
+                &const { [shortcut(CMD, Key::Equals), shortcut(CMD, Key::Plus)] }
+            }
+            Command::DecreaseFontSize => &const { one(shortcut(CMD, Key::Minus)) },
+            Command::ResetFontSize => &const { one(shortcut(CMD, Key::Num0)) },
+            // Ctrl+` on every platform, as in other editors.
+            Command::ToggleTerminal => &const { one(shortcut(Modifiers::CTRL, Key::Backtick)) },
             _ => &[],
         }
     }
@@ -332,6 +386,25 @@ mod tests {
         assert!(pos(Command::PreviousProblem) < pos(Command::NextProblem));
         // Cmd+Z would also match Cmd+Shift+Z.
         assert!(pos(Command::Redo) < pos(Command::Undo));
+        assert!(pos(Command::SaveAs) < pos(Command::Save));
+        assert!(pos(Command::PreviousTab) < pos(Command::NextTab));
+    }
+
+    /// egui's `consume_shortcut` ignores an extra Shift, so the plain
+    /// shortcut would swallow its Shift variant if it were checked first.
+    #[test]
+    fn shift_variants_are_not_swallowed() {
+        let table = Command::shortcut_table();
+        for (i, (cmd, s)) in table.iter().enumerate() {
+            for (other, earlier) in &table[..i] {
+                assert!(
+                    !s.modifiers.matches_logically(earlier.modifiers)
+                        || s.logical_key != earlier.logical_key
+                        || s.modifiers == earlier.modifiers,
+                    "{other:?} is checked before {cmd:?} and would swallow it"
+                );
+            }
+        }
     }
 
     #[test]
@@ -339,5 +412,10 @@ mod tests {
         let unique: HashSet<_> = Command::ALL.iter().collect();
         assert_eq!(unique.len(), Command::ALL.len());
         assert_eq!(Command::Find.palette_label(), "Edit: Find");
+        assert_eq!(Command::OpenSettings.palette_label(), "File: Settings");
+        assert_eq!(
+            Command::RestartTerminal.palette_label(),
+            "Terminal: Restart Shell"
+        );
     }
 }

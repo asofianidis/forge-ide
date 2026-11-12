@@ -14,6 +14,7 @@ mod panes;
 mod search;
 mod settings;
 mod task;
+mod terminal;
 mod theme;
 mod ui;
 mod updater;
