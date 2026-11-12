@@ -11,6 +11,13 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
 - Syntax highlighting for many languages (via [syntect](https://github.com/trishume/syntect))
 - Line-number gutter with current-line highlight
 - Cursor line/column in the status bar
+- Find and replace in the current file, with match case, whole word and regex options
+  (regex replacements can use `$1` / `${name}` capture groups)
+- Project-wide search (**View → Search**) built on ripgrep's `ignore` and `grep-searcher`
+  crates, so `.gitignore`d, hidden and binary files are skipped
+- Quick open (fuzzy file search) and a command palette that reaches every menu action
+- Line editing: go to line, toggle comment, indent/outdent a selection (Tab / Shift+Tab
+  work on multi-line selections), duplicate and move lines, matching-bracket highlighting
 - Native open/save dialogs (via [rfd](https://github.com/PolyMeilex/rfd))
 - Language server browser (**Tools → Language Servers…**): finds servers for the
   languages in your project, shows which are installed, and installs missing ones
@@ -85,14 +92,26 @@ cargo run --release -- path/to/project
 
 ### Keyboard shortcuts
 
-| Action     | Shortcut |
-|------------|----------|
-| New file   | Ctrl+N   |
-| Open file  | Ctrl+O   |
-| Save       | Ctrl+S   |
-| Close tab  | Ctrl+W   |
+| Action                 | Shortcut                                |
+|------------------------|-----------------------------------------|
+| New file               | Ctrl+N                                  |
+| Open file              | Ctrl+O                                  |
+| Save                   | Ctrl+S                                  |
+| Close tab              | Ctrl+W                                  |
+| Command palette        | Ctrl+Shift+P                            |
+| Go to file             | Ctrl+P                                  |
+| Go to line             | Ctrl+G (Ctrl on macOS too), `line:col` works |
+| Find                   | Ctrl+F (Enter / Shift+Enter, F3 / Shift+F3 step through matches) |
+| Replace                | Ctrl+H (Cmd+Option+F on macOS)          |
+| Find in project        | Ctrl+Shift+F                            |
+| Show explorer          | Ctrl+Shift+E                            |
+| Toggle line comment    | Ctrl+/                                  |
+| Indent / outdent       | Ctrl+] / Ctrl+[ (or Tab / Shift+Tab)    |
+| Move line up / down    | Alt+Up / Alt+Down                       |
+| Duplicate line         | Shift+Alt+Down                          |
 
-(Cmd instead of Ctrl on macOS.)
+(Cmd instead of Ctrl on macOS, except for Go to line.) macOS uses Cmd+H to hide the app, so
+Replace is also on Cmd+Option+F there.
 
 ## Project layout
 
@@ -100,6 +119,15 @@ cargo run --release -- path/to/project
 src/
 ├── main.rs              # entry point, window setup
 ├── app.rs               # application state and UI layout
+├── app/
+│   ├── editing.rs       # line-editing commands, selection helpers, Go to Line
+│   ├── find_bar.rs      # find / replace bar
+│   ├── search_panel.rs  # "Search" sidebar
+│   └── pickers.rs       # quick open, command palette, theme picker
+├── commands.rs          # every action: name, menu, shortcut (menus + palette use it)
+├── palette.rs           # list picker used by quick open and the command palette
+├── fuzzy.rs             # fuzzy matcher for file and command names
+├── search.rs            # project file listing and text search (ignore + grep-searcher)
 ├── settings.rs          # persisted preferences (settings.toml)
 ├── theme.rs             # built-in + custom themes
 ├── updater.rs           # self-update from GitHub releases
@@ -111,6 +139,8 @@ src/
 │   └── browser.rs       # "Language Servers" window
 └── editor/
     ├── document.rs      # open file buffer, load/save, dirty tracking
+    ├── find.rs          # in-file find / replace
+    ├── ops.rs           # comment, indent, duplicate/move lines, bracket matching
     ├── gutter.rs        # line-number gutter
     └── highlight.rs     # syntect → egui LayoutJob highlighting
 ```
@@ -119,8 +149,9 @@ src/
 
 - [x] Line-number gutter
 - [ ] Rope-based buffer for large files, undo/redo history
-- [ ] Find / replace, go to line
-- [ ] Command palette
+- [x] Find / replace, go to line
+- [x] Project search, quick open
+- [x] Command palette
 - [ ] Unsaved-changes prompt on close
 - [ ] Integrated terminal
 - [x] Language server discovery and installation
