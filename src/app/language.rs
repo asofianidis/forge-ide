@@ -125,7 +125,7 @@ impl ForgeApp {
         let docs: Vec<(&Path, &str)> = self
             .documents
             .iter()
-            .filter_map(|d| Some((d.path.as_deref()?, d.text.as_str())))
+            .filter_map(|d| Some((d.path.as_deref()?, d.text())))
             .collect();
         let root = self.workspace.as_ref().map(|w| w.root.path.as_path());
         let servers = &self.servers;
@@ -211,7 +211,7 @@ impl ForgeApp {
         let Some(doc) = self.documents.get_mut(idx) else {
             return;
         };
-        doc.text = text::apply_edits(&doc.text, edits);
+        doc.apply_edits(edits.iter().map(|e| (e.range.clone(), e.text.as_str())));
         let id = editor_id(doc);
         if let Some(mut state) = egui::TextEdit::load_state(ctx, id)
             && let Some(range) = state.cursor.char_range()
@@ -302,7 +302,7 @@ impl ForgeApp {
         let path = doc.path.clone();
 
         if let (Some(at), Some(p)) = (frame.definition_at, &path) {
-            let text = doc.text.clone();
+            let text = doc.text().to_owned();
             if let Err(e) = self.lsp.definition(p, &text, at) {
                 self.status = e;
             }
@@ -371,11 +371,11 @@ impl ForgeApp {
             .cloned()
             .collect();
         let word = doc
-            .text
+            .text()
             .chars()
             .nth(at)
             .filter(|&c| text::is_word_char(c))
-            .and_then(|_| text::word_at(&doc.text, at));
+            .and_then(|_| text::word_at(doc.text(), at));
         let mut range = word.clone().unwrap_or(at..at + 1);
         for p in &problems {
             range = range.start.min(p.range.start)..range.end.max(p.range.end);
@@ -385,7 +385,7 @@ impl ForgeApp {
             && let Some(p) = path
             && self.lsp.supports(p, Feature::Hover)
         {
-            let text = doc.text.clone();
+            let text = doc.text().to_owned();
             loading = self.lsp.hover(p, &text, at).is_ok();
         }
         if !loading && problems.is_empty() {
@@ -493,7 +493,7 @@ impl ForgeApp {
             self.status = "Save the file to use language features".to_owned();
             return;
         };
-        let text = self.documents[self.active].text.clone();
+        let text = self.documents[self.active].text().to_owned();
         if let Err(e) = send(&mut self.lsp, &path, &text, at) {
             self.status = e;
         }
@@ -531,7 +531,7 @@ impl ForgeApp {
         if doc.path.as_deref() != Some(location.path.as_path()) {
             return;
         }
-        let at = location.chars(&doc.text).start;
+        let at = location.chars(doc.text()).start;
         self.set_selection(ctx, Selection::caret(at), true);
     }
 
@@ -543,7 +543,7 @@ impl ForgeApp {
             .map(|location| {
                 let text = files.entry(location.path.clone()).or_insert_with(|| {
                     match self.doc_index(&location.path) {
-                        Some(i) => Some(self.documents[i].text.clone()),
+                        Some(i) => Some(self.documents[i].text().to_owned()),
                         None => std::fs::read_to_string(&location.path).ok(),
                     }
                 });
@@ -634,7 +634,7 @@ impl ForgeApp {
         let Some(path) = &doc.path else {
             return;
         };
-        let mut problems = self.lsp.problems(path, &doc.text);
+        let mut problems = self.lsp.problems(path, doc.text());
         if problems.is_empty() {
             self.status = "No problems in this file".to_owned();
             return;
@@ -672,7 +672,7 @@ impl ForgeApp {
         let Some((path, at)) = self.active_file(ctx) else {
             return;
         };
-        let text = self.documents[self.active].text.clone();
+        let text = self.documents[self.active].text().to_owned();
         if let Err(e) = self.lsp.completion(&path, &text, at, None) {
             self.status = e;
         }
@@ -682,7 +682,7 @@ impl ForgeApp {
     /// when the caret leaves the word, and opens it on identifier or trigger
     /// characters.
     fn update_completion(&mut self, doc_id: u64, path: &Path, caret: usize, typed: Option<char>) {
-        let text = &self.documents[self.active].text;
+        let text = self.documents[self.active].text();
         let mut requery = None;
         if let Some(c) = &mut self.language.completion {
             let query: Option<String> = (c.doc == doc_id && caret >= c.start).then(|| {
@@ -713,7 +713,7 @@ impl ForgeApp {
         if let Some(trigger) = requery
             && self.lsp.supports(path, Feature::Completion)
         {
-            let text = text.clone();
+            let text = text.to_owned();
             let _ = self.lsp.completion(path, &text, caret, trigger);
         }
     }
@@ -734,9 +734,9 @@ impl ForgeApp {
             return;
         }
         let caret = self.selection(ctx).end;
-        let start = text::word_start(&doc.text, at);
+        let start = text::word_start(doc.text(), at);
         let query: String = doc
-            .text
+            .text()
             .chars()
             .skip(start)
             .take(caret.saturating_sub(start))
@@ -775,7 +775,7 @@ impl ForgeApp {
             return;
         }
         let caret = self.selection(ctx).end;
-        let index = LineIndex::new(&doc.text);
+        let index = LineIndex::new(doc.text());
         // Text typed since the request shifts the end of the server's range.
         let typed_since = caret.saturating_sub(c.at);
         let (range, insert) = match &item.text_edit {
@@ -813,7 +813,7 @@ impl ForgeApp {
         let extra = item
             .additional_text_edits
             .as_deref()
-            .map(|e| text::char_edits(&doc.text, e, c.encoding))
+            .map(|e| text::char_edits(doc.text(), e, c.encoding))
             .unwrap_or_default();
         let start = text::map_offset(range.start, &extra);
         let len = snippet.text.chars().count();
@@ -826,8 +826,8 @@ impl ForgeApp {
             range,
             text: snippet.text,
         });
-        let new_text = text::apply_edits(&doc.text, &edits);
-        self.documents[self.active].text = new_text;
+        self.documents[self.active]
+            .apply_edits(edits.iter().map(|e| (e.range.clone(), e.text.as_str())));
         self.set_selection(ctx, selection, true);
     }
 
@@ -896,19 +896,24 @@ impl ForgeApp {
             return;
         };
         let doc = &self.documents[self.active];
-        let Some(word) = text::word_at(&doc.text, at) else {
+        let Some(word) = text::word_at(doc.text(), at) else {
             self.status = "Put the cursor on a symbol to rename it".to_owned();
             return;
         };
         if !self.lsp.supports(&path, Feature::Rename) {
-            let text = doc.text.clone();
+            let text = doc.text().to_owned();
             // Reports why (no server, still starting, not supported).
             if let Err(e) = self.lsp.rename(&path, &text, at, "") {
                 self.status = e;
             }
             return;
         }
-        let input = doc.text.chars().skip(word.start).take(word.len()).collect();
+        let input = doc
+            .text()
+            .chars()
+            .skip(word.start)
+            .take(word.len())
+            .collect();
         self.language.rename = Some(RenameDialog {
             path,
             at: word.start,
@@ -970,7 +975,7 @@ impl ForgeApp {
         let Some(idx) = self.doc_index(&dialog.path) else {
             return;
         };
-        let text = self.documents[idx].text.clone();
+        let text = self.documents[idx].text().to_owned();
         match self.lsp.rename(&dialog.path, &text, dialog.at, new_name) {
             Ok(()) => self.status = format!("Renaming to {new_name}…"),
             Err(e) => self.status = e,
@@ -996,7 +1001,7 @@ impl ForgeApp {
         for (path, edits) in files {
             changes += edits.len();
             if let Some(idx) = self.doc_index(&path) {
-                let char_edits = text::char_edits(&self.documents[idx].text, &edits, encoding);
+                let char_edits = text::char_edits(self.documents[idx].text(), &edits, encoding);
                 self.edit_document(ctx, idx, &char_edits);
                 continue;
             }
@@ -1040,7 +1045,7 @@ impl ForgeApp {
         let Some(path) = doc.path.clone() else {
             return false;
         };
-        let text = doc.text.clone();
+        let text = doc.text().to_owned();
         let indent = ops::indent_unit(&text);
         match self.lsp.format(&path, &text, &indent, then_save) {
             Ok(()) => {
@@ -1093,7 +1098,7 @@ impl ForgeApp {
         let Some(idx) = self.doc_index(path) else {
             return;
         };
-        if self.documents[idx].text == req.text {
+        if self.documents[idx].text() == req.text {
             let char_edits = text::char_edits(&req.text, edits, encoding);
             self.edit_document(ctx, idx, &char_edits);
             if !then_save {

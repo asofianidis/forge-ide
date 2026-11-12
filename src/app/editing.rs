@@ -59,11 +59,42 @@ impl ForgeApp {
         let Some(doc) = self.documents.get_mut(self.active) else {
             return;
         };
-        doc.text = edit.text;
+        doc.set_text(&edit.text);
         self.set_selection(ctx, edit.selection, true);
         // Keep the caret in view without re-centering the editor on every edit.
         self.scroll_to = None;
         self.reveal = Some(edit.selection.end);
+    }
+
+    /// Undoes (or with `redo`, redoes) the last step in the active document
+    /// and puts the caret where the change was.
+    pub(super) fn undo(&mut self, ctx: &egui::Context, redo: bool) {
+        if self.active_pane.is_some() {
+            return;
+        }
+        let Some(doc) = self.documents.get_mut(self.active) else {
+            return;
+        };
+        let caret = if redo {
+            doc.buffer.redo()
+        } else {
+            doc.buffer.undo()
+        };
+        match caret {
+            Some(at) => {
+                self.set_selection(ctx, Selection::caret(at), true);
+                self.scroll_to = None;
+                self.reveal = Some(at);
+            }
+            None => {
+                self.status = if redo {
+                    "Nothing to redo"
+                } else {
+                    "Nothing to undo"
+                }
+                .to_owned();
+            }
+        }
     }
 
     /// Typing aids, applied before the editor widget sees the input: Enter
@@ -83,7 +114,7 @@ impl ForgeApp {
             };
             let ext = doc.language_key();
             let quotes = ops::auto_close_quotes(&ext);
-            let text = doc.text.as_str();
+            let text = doc.text();
             let edit = match event {
                 Event::Text(t) => {
                     let mut chars = t.chars();
@@ -126,7 +157,7 @@ impl ForgeApp {
         let Some(doc) = self.documents.get(self.active) else {
             return;
         };
-        let text = doc.text.as_str();
+        let text = doc.text();
         let edit = match cmd {
             Command::ToggleComment => match ops::comment_style(&doc.language_key()) {
                 Some(style) => ops::toggle_comment(text, sel, style),
@@ -170,7 +201,7 @@ impl ForgeApp {
                 return;
             };
             let multi_line = doc
-                .text
+                .text()
                 .chars()
                 .skip(sel.start)
                 .take(sel.end - sel.start)
@@ -178,7 +209,7 @@ impl ForgeApp {
             if multi_line {
                 self.edit_command(ctx, Command::Indent);
             } else {
-                let edit = ops::insert(&doc.text, sel, &ops::indent_unit(&doc.text));
+                let edit = ops::insert(doc.text(), sel, &ops::indent_unit(doc.text()));
                 self.apply_edit(ctx, edit);
             }
         }
@@ -229,7 +260,7 @@ impl ForgeApp {
         if enter {
             self.go_to_line = None;
             if let Some((line, col)) = target {
-                let at = ops::line_col_to_char(&doc.text, line.min(line_count), col);
+                let at = ops::line_col_to_char(doc.text(), line.min(line_count), col);
                 self.set_selection(ctx, Selection::caret(at), true);
             }
         }

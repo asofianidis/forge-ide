@@ -392,7 +392,7 @@ impl ForgeApp {
                 // Replace a pristine untitled tab instead of piling up tabs.
                 if let [only] = self.documents.as_slice()
                     && only.path.is_none()
-                    && only.text.is_empty()
+                    && only.text().is_empty()
                 {
                     self.documents.clear();
                 }
@@ -598,7 +598,7 @@ impl ForgeApp {
             Ok(()) => {
                 self.status = format!("Saved {}", doc.title());
                 if let Some(path) = &doc.path {
-                    self.lsp.did_save(path, &doc.text);
+                    self.lsp.did_save(path, doc.text());
                 }
                 true
             }
@@ -855,6 +855,8 @@ impl ForgeApp {
                 }
             }
             Command::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Command::Undo => self.undo(ctx, false),
+            Command::Redo => self.undo(ctx, true),
             Command::Find => {
                 self.active_pane = None;
                 self.open_find(ctx, false);
@@ -942,6 +944,16 @@ impl ForgeApp {
                 UpdateState::Checking | UpdateState::Installing(_)
             ),
             Command::QuickOpen | Command::FindInProject => self.workspace.is_some(),
+            Command::Undo | Command::Redo => {
+                self.active_pane.is_none()
+                    && self.documents.get(self.active).is_some_and(|d| {
+                        if cmd == Command::Undo {
+                            d.buffer.can_undo()
+                        } else {
+                            d.buffer.can_redo()
+                        }
+                    })
+            }
             _ => true,
         };
         if ui.add_enabled(enabled, button).clicked() {
@@ -967,6 +979,9 @@ impl ForgeApp {
                 self.menu_item(ui, Quit);
             });
             ui.menu_button("Edit", |ui| {
+                self.menu_item(ui, Undo);
+                self.menu_item(ui, Redo);
+                ui.separator();
                 for cmd in [Find, Replace, FindInProject] {
                     self.menu_item(ui, cmd);
                 }
@@ -1453,13 +1468,13 @@ impl ForgeApp {
         let rel = path.as_deref().and_then(|p| sc.rel_path(p));
         let (changes, blame) = match &path {
             Some(p) => (
-                self.editor_git.changes(sc, p, &doc.text),
-                self.editor_git.blame(sc, p, &doc.text),
+                self.editor_git.changes(sc, p, doc.text()),
+                self.editor_git.blame(sc, p, doc.text()),
             ),
             None => (None, None),
         };
-        let found_conflicts = if doc.text.contains("<<<<<<<") {
-            conflicts::find(&doc.text)
+        let found_conflicts = if doc.text().contains("<<<<<<<") {
+            conflicts::find(doc.text())
         } else {
             Vec::new()
         };
@@ -1499,7 +1514,8 @@ impl ForgeApp {
                 match bar {
                     ConflictBarAction::AcceptAll(how) => {
                         let doc = &mut self.documents[self.active];
-                        doc.text = conflicts::resolve_all(&doc.text, how);
+                        let resolved = conflicts::resolve_all(doc.text(), how);
+                        doc.set_text(&resolved);
                     }
                     ConflictBarAction::Next => {
                         let line = self.cursor.0;
@@ -1534,7 +1550,7 @@ impl ForgeApp {
 
         let problems = path
             .as_deref()
-            .map(|p| self.lsp.problems(p, &self.documents[self.active].text))
+            .map(|p| self.lsp.problems(p, self.documents[self.active].text()))
             .unwrap_or_default();
         let can_define = path
             .as_deref()
@@ -1570,7 +1586,7 @@ impl ForgeApp {
         // Move the cursor for "go to change / conflict".
         if let Some(line) = self.jump_to_line.take() {
             let mut state = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
-            let idx = scm::line_start_char(&doc.text, line);
+            let idx = scm::line_start_char(doc.text(), line);
             state
                 .cursor
                 .set_char_range(Some(egui::text::CCursorRange::one(CCursor::new(idx))));
@@ -1597,7 +1613,7 @@ impl ForgeApp {
             bottom: 2,
         });
 
-        let output = egui::ScrollArea::both()
+        let mut output = egui::ScrollArea::both()
             .id_salt("editor_scroll")
             .auto_shrink(false)
             .show(ui, |ui| {
@@ -1611,7 +1627,7 @@ impl ForgeApp {
                         r.x_range()
                     });
                     let underlay = ui.painter().add(Shape::Noop);
-                    let output = egui::TextEdit::multiline(&mut doc.text)
+                    let output = egui::TextEdit::multiline(&mut doc.buffer)
                         .id(id)
                         .code_editor()
                         .lock_focus(true)
@@ -1651,7 +1667,7 @@ impl ForgeApp {
                         && range.is_empty()
                         && output.response.response.has_focus()
                         && let Some((a, b)) =
-                            ops::matching_bracket(&doc.text, range.primary.index.into())
+                            ops::matching_bracket(doc.text(), range.primary.index.into())
                     {
                         for c in [a, b] {
                             let r = range_rects(galley, c..c + 1)[0].translate(offset);
@@ -1678,11 +1694,11 @@ impl ForgeApp {
                         && can_define
                         && ui.input(|i| i.modifiers.command)
                         && doc
-                            .text
+                            .text()
                             .chars()
                             .nth(at)
                             .is_some_and(crate::lsp::text::is_word_char)
-                        && let Some(word) = crate::lsp::text::word_at(&doc.text, at)
+                        && let Some(word) = crate::lsp::text::word_at(doc.text(), at)
                     {
                         language::underline(ui, &output, word, colors.link.0);
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -1761,6 +1777,11 @@ impl ForgeApp {
             })
             .inner;
 
+        // Undo history lives in the document's `Buffer` (Ctrl+Z is handled as
+        // a command before the widget sees it), so drop egui's own snapshots,
+        // which copy the whole text.
+        output.state.clear_undoer();
+
         if let Some(range) = output.cursor_range {
             self.cursor = doc.line_col(range.primary.index.into());
         }
@@ -1780,7 +1801,7 @@ impl ForgeApp {
                 editor_rect,
                 c,
                 idx,
-                &doc.text,
+                doc.text(),
                 can_stage,
                 &colors,
             ) {
@@ -1790,7 +1811,8 @@ impl ForgeApp {
 
         match action {
             Some(EditorAction::Revert(h)) => {
-                doc.text = crate::git::line_changes::revert(&doc.text, &h);
+                let reverted = crate::git::line_changes::revert(doc.text(), &h);
+                doc.set_text(&reverted);
                 self.editor_git.peek = None;
                 self.status = "Reverted change (save to keep it)".to_owned();
             }
@@ -1815,7 +1837,8 @@ impl ForgeApp {
                 self.open_pane(Pane::Commit(pane));
             }
             Some(EditorAction::Resolve(c, how)) => {
-                doc.text = conflicts::resolve(&doc.text, &c, how);
+                let resolved = conflicts::resolve(doc.text(), &c, how);
+                doc.set_text(&resolved);
             }
             None => {}
         }

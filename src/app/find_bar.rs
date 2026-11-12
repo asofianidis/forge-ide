@@ -45,7 +45,7 @@ impl ForgeApp {
             && !sel.is_empty()
         {
             let selected: String = doc
-                .text
+                .text()
                 .chars()
                 .skip(sel.start)
                 .take(sel.end - sel.start)
@@ -82,7 +82,7 @@ impl ForgeApp {
         let Some(doc) = self.documents.get(self.active) else {
             return;
         };
-        let hash = text_hash(&doc.text);
+        let hash = text_hash(doc.text());
         let key = (doc.id, hash, self.find.query.clone(), self.find.options);
         let previous = self.find.computed_for.replace(key.clone());
         if previous.as_ref() == Some(&key) {
@@ -106,7 +106,7 @@ impl ForgeApp {
                 return;
             }
         };
-        self.find.matches = find::find_all(&doc.text, &re);
+        self.find.matches = find::find_all(doc.text(), &re);
         self.find.regex = Some(re);
         let from = self.selection(ctx).start;
         self.find.current = self
@@ -152,13 +152,13 @@ impl ForgeApp {
             return;
         };
         let (text, after) = find::replace_one(
-            &doc.text,
+            doc.text(),
             re,
             m,
             &self.find.replacement,
             self.find.options.regex,
         );
-        doc.text = text;
+        doc.set_text(&text);
         // Continue from just after the replacement.
         self.set_selection(ctx, Selection::caret(after), false);
         self.find.computed_for = None;
@@ -174,15 +174,15 @@ impl ForgeApp {
             return;
         };
         let (text, count) = find::replace_all(
-            &doc.text,
+            doc.text(),
             re,
             &self.find.replacement,
             self.find.options.regex,
         );
         if count > 0 {
-            doc.text = text;
+            doc.set_text(&text);
             let caret = self.selection(ctx).start;
-            let len = self.documents[self.active].text.chars().count();
+            let len = self.documents[self.active].text().chars().count();
             self.set_selection(ctx, Selection::caret(caret.min(len)), false);
         }
         self.status = match count {

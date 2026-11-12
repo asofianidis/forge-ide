@@ -1,8 +1,13 @@
+use std::hash::{Hash, Hasher};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use anyhow::Context as _;
+use egui::TextBuffer as _;
+
+use super::Buffer;
 
 fn next_id() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -36,9 +41,13 @@ pub struct Document {
     /// Unique for the session; keys per-document widget state such as the cursor.
     pub id: u64,
     pub path: Option<PathBuf>,
-    pub text: String,
-    /// Text as of the last load/save, used to compute the dirty flag.
-    saved_text: String,
+    /// The text and its undo history. The editor widget edits it directly;
+    /// everything else should go through [`Self::set_text`] or
+    /// [`Self::apply_edits`] so each change is one undo step.
+    pub buffer: Buffer,
+    /// Hash of the text as of the last load/save, to tell whether the file on
+    /// disk still matches it without keeping a second copy of the text.
+    saved_hash: u64,
     /// Modification time of the file as of the last load, save or poll.
     disk_mtime: Option<SystemTime>,
     pub disk: DiskState,
@@ -49,8 +58,8 @@ impl Document {
         Self {
             id: next_id(),
             path: None,
-            text: String::new(),
-            saved_text: String::new(),
+            buffer: Buffer::default(),
+            saved_hash: hash(""),
             disk_mtime: None,
             disk: DiskState::InSync,
         }
@@ -62,8 +71,8 @@ impl Document {
         Ok(Self {
             id: next_id(),
             path: Some(path.to_path_buf()),
-            saved_text: text.clone(),
-            text,
+            saved_hash: hash(&text),
+            buffer: Buffer::from(text.as_str()),
             disk_mtime: mtime(path),
             disk: DiskState::InSync,
         })
@@ -71,9 +80,10 @@ impl Document {
 
     pub fn save(&mut self) -> anyhow::Result<()> {
         let path = self.path.as_ref().context("document has no path")?;
-        std::fs::write(path, &self.text)
+        std::fs::write(path, self.text())
             .with_context(|| format!("failed to write {}", path.display()))?;
-        self.saved_text.clone_from(&self.text);
+        self.saved_hash = hash(self.text());
+        self.buffer.mark_saved();
         self.disk_mtime = mtime(path);
         self.disk = DiskState::InSync;
         Ok(())
@@ -89,9 +99,38 @@ impl Document {
         self.has_unsaved_edits() || self.disk == DiskState::Deleted
     }
 
-    /// Whether the buffer differs from what was last loaded or saved.
+    /// Whether the buffer differs from what was last loaded or saved. Undoing
+    /// back to that state counts as unchanged.
     pub fn has_unsaved_edits(&self) -> bool {
-        self.text != self.saved_text
+        self.buffer.is_modified()
+    }
+
+    pub fn text(&self) -> &str {
+        self.buffer.as_str()
+    }
+
+    /// Replaces the text as one undo step (recording only what differs).
+    /// Returns whether anything changed.
+    pub fn set_text(&mut self, text: &str) -> bool {
+        self.buffer.set_text(text)
+    }
+
+    /// Applies non-overlapping replacements of char ranges as one undo step.
+    /// Returns whether anything changed.
+    pub fn apply_edits<S: AsRef<str>>(
+        &mut self,
+        edits: impl IntoIterator<Item = (Range<usize>, S)>,
+    ) -> bool {
+        self.buffer.apply_edits(edits)
+    }
+
+    /// Shows `disk_text` as the saved state. The reload is an undo step of its
+    /// own, so the previous buffer can be brought back (it then counts as
+    /// unsaved).
+    fn load_from_disk(&mut self, disk_text: &str) {
+        self.buffer.set_text(disk_text);
+        self.buffer.mark_saved();
+        self.saved_hash = hash(disk_text);
     }
 
     /// Checks whether another program changed or deleted the file.
@@ -119,14 +158,13 @@ impl Document {
         // A file mid-write may not be valid UTF-8 yet; try again next poll.
         let disk_text = std::fs::read_to_string(path).ok()?;
         self.disk_mtime = modified;
-        if disk_text == self.saved_text {
+        if hash(&disk_text) == self.saved_hash {
             // Touched, or restored to what we had: nothing to resolve.
             self.disk = DiskState::InSync;
             return None;
         }
-        if self.text == self.saved_text {
-            self.text.clone_from(&disk_text);
-            self.saved_text = disk_text;
+        if !self.has_unsaved_edits() {
+            self.load_from_disk(&disk_text);
             self.disk = DiskState::InSync;
             Some(DiskEvent::Reloaded)
         } else {
@@ -139,8 +177,7 @@ impl Document {
     pub fn reload_from_disk(&mut self) {
         if let DiskState::Changed(disk_text) = std::mem::replace(&mut self.disk, DiskState::InSync)
         {
-            self.text.clone_from(&disk_text);
-            self.saved_text = disk_text;
+            self.load_from_disk(&disk_text);
         }
     }
 
@@ -180,36 +217,24 @@ impl Document {
 
     /// Number of lines in the buffer (an empty buffer has one line).
     pub fn line_count(&self) -> usize {
-        self.text.bytes().filter(|&b| b == b'\n').count() + 1
+        self.buffer.line_count()
     }
 
     /// 1-based (line, column) of a character offset.
     pub fn line_col(&self, char_idx: usize) -> (usize, usize) {
-        let mut line = 1;
-        let mut col = 1;
-        for c in self.text.chars().take(char_idx) {
-            if c == '\n' {
-                line += 1;
-                col = 1;
-            } else {
-                col += 1;
-            }
-        }
-        (line, col)
+        self.buffer.line_col(char_idx)
     }
 
     /// Character offset of a 1-based (line, column), clamped to the text.
     pub fn char_index(&self, line: usize, col: usize) -> usize {
-        let mut idx = 0;
-        for (i, text) in self.text.split('\n').enumerate() {
-            let len = text.chars().count();
-            if i + 1 == line.max(1) {
-                return idx + col.saturating_sub(1).min(len);
-            }
-            idx += len + 1;
-        }
-        self.text.chars().count()
+        self.buffer.char_index(line, col)
     }
+}
+
+fn hash(text: &str) -> u64 {
+    let mut hasher = std::hash::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn mtime(path: &Path) -> Option<SystemTime> {
@@ -223,7 +248,7 @@ mod tests {
     #[test]
     fn line_col_counts_newlines() {
         let mut doc = Document::untitled();
-        doc.text = "ab\ncd\nef".into();
+        doc.set_text("ab\ncd\nef");
         assert_eq!(doc.line_col(0), (1, 1));
         assert_eq!(doc.line_col(2), (1, 3));
         assert_eq!(doc.line_col(3), (2, 1));
@@ -233,7 +258,7 @@ mod tests {
     #[test]
     fn char_index_inverts_line_col_and_clamps() {
         let mut doc = Document::untitled();
-        doc.text = "ab\ncd\nef".into();
+        doc.set_text("ab\ncd\nef");
         for idx in 0..=8 {
             let (line, col) = doc.line_col(idx);
             assert_eq!(doc.char_index(line, col), idx);
@@ -248,9 +273,9 @@ mod tests {
     fn line_count_includes_trailing_empty_line() {
         let mut doc = Document::untitled();
         assert_eq!(doc.line_count(), 1);
-        doc.text = "a\nb".into();
+        doc.set_text("a\nb");
         assert_eq!(doc.line_count(), 2);
-        doc.text.push('\n');
+        doc.set_text("a\nb\n");
         assert_eq!(doc.line_count(), 3);
     }
 
@@ -258,8 +283,27 @@ mod tests {
     fn dirty_tracking() {
         let mut doc = Document::untitled();
         assert!(!doc.is_dirty());
-        doc.text.push('x');
+        doc.buffer.insert_text("x", egui::text::CharIndex(0));
         assert!(doc.is_dirty());
+        doc.buffer.undo();
+        assert!(!doc.is_dirty(), "undoing back to the saved text is clean");
+        doc.set_text("y");
+        assert!(doc.is_dirty());
+    }
+
+    #[test]
+    fn save_marks_clean_and_undo_past_it_is_dirty() {
+        let file = TempFile::new("save", "a");
+        let mut doc = Document::open(&file.0).unwrap();
+        doc.set_text("ab");
+        doc.save().unwrap();
+        assert!(!doc.is_dirty());
+        assert_eq!(std::fs::read_to_string(&file.0).unwrap(), "ab");
+        doc.buffer.undo();
+        assert_eq!(doc.text(), "a");
+        assert!(doc.is_dirty());
+        doc.buffer.redo();
+        assert!(!doc.is_dirty());
     }
 
     /// A scratch file whose mtime can be bumped deterministically.
@@ -297,7 +341,7 @@ mod tests {
         let file = TempFile::new("quiet", "a");
         let mut doc = Document::open(&file.0).unwrap();
         assert_eq!(doc.poll_disk(), None);
-        doc.text.push('b');
+        doc.set_text("ab");
         doc.save().unwrap();
         assert_eq!(
             doc.poll_disk(),
@@ -312,32 +356,42 @@ mod tests {
         let mut doc = Document::open(&file.0).unwrap();
         file.write_externally("new");
         assert_eq!(doc.poll_disk(), Some(DiskEvent::Reloaded));
-        assert_eq!(doc.text, "new");
+        assert_eq!(doc.text(), "new");
         assert!(!doc.is_dirty());
         assert_eq!(doc.poll_disk(), None);
+        // The reload is undoable; the old text then counts as unsaved.
+        doc.buffer.undo();
+        assert_eq!(doc.text(), "old");
+        assert!(doc.is_dirty());
+        doc.buffer.redo();
+        assert!(!doc.is_dirty());
     }
 
     #[test]
     fn dirty_buffer_conflicts_and_resolves() {
         let file = TempFile::new("conflict", "old");
         let mut doc = Document::open(&file.0).unwrap();
-        doc.text = "mine".into();
+        doc.set_text("mine");
         file.write_externally("theirs");
         assert_eq!(doc.poll_disk(), Some(DiskEvent::Conflict));
-        assert_eq!(doc.text, "mine", "unsaved edits are never overwritten");
+        assert_eq!(doc.text(), "mine", "unsaved edits are never overwritten");
         assert_eq!(doc.disk, DiskState::Changed("theirs".into()));
 
         doc.reload_from_disk();
-        assert_eq!(doc.text, "theirs");
+        assert_eq!(doc.text(), "theirs");
         assert!(!doc.is_dirty());
         assert_eq!(doc.disk, DiskState::InSync);
+        // Taking the file's version doesn't lose the local edits for good.
+        doc.buffer.undo();
+        assert_eq!(doc.text(), "mine");
+        assert!(doc.is_dirty());
     }
 
     #[test]
     fn keep_local_leaves_buffer_dirty() {
         let file = TempFile::new("keep", "old");
         let mut doc = Document::open(&file.0).unwrap();
-        doc.text = "mine".into();
+        doc.set_text("mine");
         file.write_externally("theirs");
         doc.poll_disk();
         doc.keep_local();
@@ -372,5 +426,114 @@ mod tests {
         file.write_externally("text");
         assert_eq!(doc.poll_disk(), None);
         assert!(!doc.is_dirty());
+    }
+
+    /// The editor's commands compute a new text (or char edits) and hand it to
+    /// the document, as `app` does. Each must be one undo step that restores
+    /// the text exactly, with the rope kept in sync for line/column lookups.
+    mod programmatic_edits {
+        use super::*;
+        use crate::editor::{conflicts, find, ops};
+        use crate::lsp::text;
+
+        /// Applies `new` the way the app does, then checks it undoes and
+        /// redoes as one step.
+        fn check_one_step(before: &str, new: &str) {
+            let mut doc = Document::untitled();
+            doc.buffer = Buffer::from(before);
+            assert!(doc.set_text(new));
+            assert_eq!(doc.text(), new);
+            assert!(doc.is_dirty());
+            let caret = doc.buffer.undo().expect("undoable");
+            assert!(caret <= before.chars().count());
+            assert_eq!(doc.text(), before);
+            assert!(!doc.is_dirty());
+            assert!(!doc.buffer.can_undo(), "{new:?} took more than one step");
+            doc.buffer.redo();
+            assert_eq!(doc.text(), new);
+            let last = new.chars().count();
+            assert_eq!(doc.line_col(last).0, new.split('\n').count());
+        }
+
+        #[test]
+        fn line_commands() {
+            let text = "fn main() {\n    let é = 1;\n    let ✨ = 2;\n}\n";
+            let sel = ops::Selection::new(16, 30);
+            let style = ops::comment_style("rs").unwrap();
+            check_one_step(text, &ops::toggle_comment(text, sel, style).text);
+            check_one_step(text, &ops::indent(text, sel, "    ").text);
+            check_one_step(text, &ops::outdent(text, sel, "    ").text);
+            check_one_step(text, &ops::duplicate_lines(text, sel).text);
+            check_one_step(text, &ops::move_lines(text, sel, true).unwrap().text);
+            check_one_step(text, &ops::newline(text, sel, "    ", "rs").text);
+            let typed = ops::type_char(text, ops::Selection::caret(11), '(', &[]).unwrap();
+            check_one_step(text, &typed.text);
+        }
+
+        #[test]
+        fn replace_and_replace_all() {
+            let text = "aé aé\naé";
+            let re = find::build_regex("aé", find::FindOptions::default()).unwrap();
+            let matches = find::find_all(text, &re);
+            let (one, _) = find::replace_one(text, &re, &matches[1], "✨", false);
+            check_one_step(text, &one);
+            let (all, count) = find::replace_all(text, &re, "b", false);
+            assert_eq!(count, 3);
+            check_one_step(text, &all);
+        }
+
+        #[test]
+        fn conflict_resolution() {
+            let text = "a\n<<<<<<< HEAD\nmine\n=======\ntheirs\n>>>>>>> b\nz\n";
+            let found = conflicts::find(text);
+            for how in [
+                conflicts::Resolution::Current,
+                conflicts::Resolution::Incoming,
+                conflicts::Resolution::Both,
+            ] {
+                check_one_step(text, &conflicts::resolve(text, &found[0], how));
+                check_one_step(text, &conflicts::resolve_all(text, how));
+            }
+        }
+
+        #[test]
+        fn hunk_revert() {
+            let base = "one\ntwo\nthree\n";
+            let text = "one\nTWO ✨\nthree\nfour\n";
+            let changes = crate::git::line_changes::compute(base, text);
+            for hunk in &changes.hunks {
+                check_one_step(text, &crate::git::line_changes::revert(text, hunk));
+            }
+        }
+
+        #[test]
+        fn language_server_edits() {
+            use lsp_types::{Position, Range, TextEdit};
+            let text = "let 🦀 = 1;\nlet b = 🦀;\n";
+            let edit = |l1, c1, l2, c2, t: &str| TextEdit {
+                range: Range::new(Position::new(l1, c1), Position::new(l2, c2)),
+                new_text: t.to_owned(),
+            };
+            // A rename (UTF-16 offsets: the emoji is two units), plus an
+            // insert at the top as a completion's extra edit would make.
+            let edits = [
+                edit(0, 4, 0, 6, "x"),
+                edit(1, 8, 1, 10, "x"),
+                edit(0, 0, 0, 0, "use y;\n"),
+            ];
+            let char_edits = text::char_edits(text, &edits, text::Encoding::Utf16);
+            let expected = text::apply_edits(text, &char_edits);
+            assert_eq!(expected, "use y;\nlet x = 1;\nlet b = x;\n");
+
+            let mut doc = Document::untitled();
+            doc.buffer = Buffer::from(text);
+            assert!(doc.apply_edits(char_edits.iter().map(|e| (e.range.clone(), &e.text))));
+            assert_eq!(doc.text(), expected);
+            assert_eq!(doc.line_col(doc.text().chars().count()), (4, 1));
+            doc.buffer.undo();
+            assert_eq!(doc.text(), text);
+            assert!(!doc.is_dirty());
+            assert!(!doc.buffer.can_undo());
+        }
     }
 }
