@@ -149,7 +149,7 @@ impl ForgeApp {
 
     /// Re-reads a folder in the tree right away, without waiting for the
     /// watcher, and re-checks git status.
-    fn reload_tree_dir(&mut self, dir: &Path) {
+    pub(super) fn reload_tree_dir(&mut self, dir: &Path) {
         if let Some(node) = self.workspace.as_mut().and_then(|ws| ws.root.find_mut(dir)) {
             node.reload();
         }
