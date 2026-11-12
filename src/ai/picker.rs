@@ -11,7 +11,6 @@ use crate::theme::UiColors;
 
 const CLAUDE_ORANGE: Color32 = Color32::from_rgb(0xD9, 0x77, 0x57);
 const ROW_HEIGHT: f32 = 30.0;
-const LIST_HEIGHT: f32 = 300.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -116,16 +115,29 @@ pub fn button(
     }
 
     let mut changed = false;
-    egui::Popup::menu(&response)
+    let debug_open = std::env::var("FORGE_DEBUG_PICKER").is_ok_and(|v| v == id_salt);
+    let mut popup = egui::Popup::menu(&response)
         .id(egui::Id::unique(("model_picker", id_salt)))
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .align(egui::RectAlign::TOP_START)
-        .gap(6.0)
+        .gap(6.0);
+    if debug_open {
+        popup = popup.open(true);
+    }
+    popup
         .show(|ui| {
             changed = contents(ui, choice, access, state, catalog, colors);
         });
     changed
 }
+
+// Fixed layout: a popup has no size of its own, so anything that fills
+// "available" space would grow it every frame.
+const RAIL_W: f32 = 40.0;
+const LIST_W: f32 = 330.0;
+const REASON_W: f32 = 180.0;
+const GAP: f32 = 14.0;
+const BODY_H: f32 = 360.0;
 
 fn contents(
     ui: &mut Ui,
@@ -136,27 +148,37 @@ fn contents(
     colors: &UiColors,
 ) -> bool {
     let mut changed = false;
+    let width = RAIL_W + LIST_W + REASON_W + 2.0 * GAP;
+    ui.set_width(width);
     ui.spacing_mut().item_spacing = vec2(0.0, 2.0);
-    ui.horizontal_top(|ui| {
-        rail(ui, state, &catalog, colors);
-        ui.add_space(6.0);
-        ui.separator();
-        ui.add_space(6.0);
-        ui.vertical(|ui| {
-            ui.set_width(320.0);
-            changed |= model_list(ui, choice, state, &mut catalog, colors);
-        });
-        ui.add_space(6.0);
-        ui.separator();
-        ui.add_space(6.0);
-        ui.vertical(|ui| {
-            ui.set_width(170.0);
-            changed |= reasoning(ui, choice, colors);
-        });
-    });
+    let (body, _) = ui.allocate_exact_size(vec2(width, BODY_H), Sense::hover());
+    let column = |x: f32, w: f32| Rect::from_min_size(pos2(x, body.top()), vec2(w, BODY_H));
+    let rail_rect = column(body.left(), RAIL_W);
+    let list_rect = column(rail_rect.right() + GAP, LIST_W);
+    let reason_rect = column(list_rect.right() + GAP, REASON_W);
+    let divider = Stroke::new(1.0, colors.border.0);
+    ui.painter()
+        .vline(rail_rect.right() + GAP / 2.0, body.y_range(), divider);
+    ui.painter()
+        .vline(list_rect.right() + GAP / 2.0, body.y_range(), divider);
+    let mut child = |rect: Rect| {
+        let mut c = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(rect)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        c.set_clip_rect(rect.intersect(ui.clip_rect()));
+        c
+    };
+    rail(&mut child(rail_rect), state, &catalog, colors);
+    changed |= model_list(&mut child(list_rect), choice, state, &mut catalog, colors);
+    changed |= reasoning(&mut child(reason_rect), choice, colors);
+
     if let Some(access) = access {
-        ui.add_space(4.0);
-        ui.separator();
+        ui.add_space(6.0);
+        let y = ui.cursor().top();
+        ui.painter().hline(body.x_range(), y, divider);
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             ui.label(RichText::new("Access").small().color(colors.text_muted.0));
@@ -178,8 +200,7 @@ fn contents(
 }
 
 fn rail(ui: &mut Ui, state: &mut PickerState, catalog: &Catalog<'_>, colors: &UiColors) {
-    ui.vertical(|ui| {
-        ui.set_width(36.0);
+    {
         let tabs = std::iter::once(Tab::Favorites).chain(Provider::ALL.map(Tab::Provider));
         for (i, tab) in tabs.enumerate() {
             if i == 1 {
@@ -234,7 +255,7 @@ fn rail(ui: &mut Ui, state: &mut PickerState, catalog: &Catalog<'_>, colors: &Ui
                 state.show_more = false;
             }
         }
-    });
+    }
 }
 
 fn rows_for(provider: Provider, show_more: bool, custom: &[String]) -> Vec<Row> {
@@ -377,10 +398,13 @@ fn model_list(
 
     let mut select: Option<Row> = picked_by_key.map(|n| rows[n].clone());
     let mut toggle_fav: Option<String> = None;
+    // Fill the rest of the column, and no more.
+    let list_height = (ui.available_height() - 4.0).max(80.0);
     egui::ScrollArea::vertical()
         .id_salt("model_rows")
-        .max_height(LIST_HEIGHT)
-        .min_scrolled_height(LIST_HEIGHT.min(rows.len().max(4) as f32 * (ROW_HEIGHT + 2.0)))
+        .max_height(list_height)
+        .min_scrolled_height(list_height)
+        .auto_shrink([false, false])
         .show(ui, |ui| {
             if rows.is_empty() {
                 ui.add_space(8.0);
