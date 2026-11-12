@@ -141,9 +141,9 @@ impl ForgeApp {
             .iter()
             .filter(|&&c| c != Command::ShowCommandPalette)
             .map(|&c| {
-                let detail = c
-                    .shortcuts()
-                    .first()
+                let detail = self
+                    .keymap
+                    .shortcut(c)
                     .map(|s| ctx.format_shortcut(s))
                     .unwrap_or_default();
                 (PaletteCommand::Builtin(c), c.palette_label(), detail)

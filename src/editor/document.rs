@@ -7,7 +7,8 @@ use std::time::SystemTime;
 use anyhow::Context as _;
 use egui::TextBuffer as _;
 
-use super::Buffer;
+use super::{Buffer, ops};
+use crate::editorconfig::EditorConfig;
 
 fn next_id() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -51,6 +52,8 @@ pub struct Document {
     /// Modification time of the file as of the last load, save or poll.
     disk_mtime: Option<SystemTime>,
     pub disk: DiskState,
+    /// `.editorconfig` settings for the file's path.
+    pub editorconfig: EditorConfig,
 }
 
 impl Document {
@@ -62,6 +65,7 @@ impl Document {
             saved_hash: hash(""),
             disk_mtime: None,
             disk: DiskState::InSync,
+            editorconfig: EditorConfig::default(),
         }
     }
 
@@ -75,6 +79,7 @@ impl Document {
             buffer: Buffer::from(text.as_str()),
             disk_mtime: mtime(path),
             disk: DiskState::InSync,
+            editorconfig: EditorConfig::for_file(path),
         })
     }
 
@@ -89,9 +94,33 @@ impl Document {
         Ok(())
     }
 
-    pub fn save_as(&mut self, path: PathBuf) -> anyhow::Result<()> {
-        self.path = Some(path);
-        self.save()
+    /// Points the document at a new path (for Save As), picking up that
+    /// path's `.editorconfig` settings. Doesn't write anything.
+    pub fn set_path(&mut self, path: Option<PathBuf>) {
+        self.editorconfig = path
+            .as_deref()
+            .map(EditorConfig::for_file)
+            .unwrap_or_default();
+        self.path = path;
+    }
+
+    /// Re-reads the `.editorconfig` settings, after one of the files changed.
+    pub fn refresh_editorconfig(&mut self) {
+        if let Some(path) = &self.path {
+            self.editorconfig = EditorConfig::for_file(path);
+        }
+    }
+
+    /// The indentation to insert: from `.editorconfig`, else what the file
+    /// already uses.
+    pub fn indent_unit(&self) -> String {
+        self.editorconfig
+            .indent_unit(&ops::indent_unit(self.text()))
+    }
+
+    /// Tab width in columns, for language servers' formatting options.
+    pub fn tab_width(&self) -> usize {
+        self.editorconfig.tab_width().unwrap_or(4)
     }
 
     /// Unsaved edits, or a buffer whose file was deleted from under it.

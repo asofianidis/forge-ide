@@ -137,6 +137,7 @@ impl ForgeApp {
         self.extensions = Extensions::load(
             extensions::extensions_dir(),
             &self.settings.disabled_extensions,
+            self.keymap.table(),
         );
         self.reload_themes(ctx);
         if !report {

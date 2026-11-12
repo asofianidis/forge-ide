@@ -249,9 +249,10 @@ print a short, user-facing message to stderr and exit non-zero (in Python,
 Examples: `"Cmd+Shift+L"`, `"Ctrl+Alt+T"`, `"Alt+F7"`, `"F6"`.
 
 A shortcut needs Cmd, Ctrl or Alt, unless it is a function key, so that it
-never steals normal typing. A shortcut already used by Forge or by another
-extension is ignored, and the Extensions view shows a warning; the command
-still works from the palette. Avoid the built-in shortcuts listed in the
+never steals normal typing. A shortcut already used by Forge (including the
+user's own `[keybindings]` in `settings.toml`) or by another extension is
+ignored, and the Extensions view shows a warning; the command still works from
+the palette. Avoid the built-in shortcuts listed in the
 README, and prefer `Cmd+Alt+<letter>` or `Ctrl+Alt+<letter>` combinations.
 
 ### Prompts

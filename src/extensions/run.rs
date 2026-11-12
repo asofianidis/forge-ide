@@ -326,15 +326,8 @@ mod tests {
         );
         let inv = Invocation::new(&s, &ctx()).unwrap();
         assert_eq!(inv.program, Path::new("/ext/t").join("bin/tool"));
-        assert_eq!(
-            inv.args,
-            [
-                Path::new("src").join("main.rs").to_string_lossy().as_ref(),
-                "main.rs",
-                "3:7",
-                "typed"
-            ]
-        );
+        // The relative path keeps the file path's own separators.
+        assert_eq!(inv.args, ["src/main.rs", "main.rs", "3:7", "typed"]);
         assert_eq!(inv.cwd, Path::new("/work/src"));
         assert_eq!(inv.stdin.as_deref(), Some("sel"));
         assert!(

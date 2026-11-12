@@ -1,11 +1,13 @@
 //! Persisted user preferences, stored in `<config dir>/forge-ide/settings.toml`
 //! (or the file named by `FORGE_SETTINGS`).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::keymap::Keys;
 use crate::theme::config_dir;
 
 /// Folders kept in File → Open Recent.
@@ -33,6 +35,8 @@ pub struct Settings {
     pub word_wrap: bool,
     /// Show line numbers in the editor gutter.
     pub line_numbers: bool,
+    /// Show a zoomed-out overview of the file beside the editor.
+    pub minimap: bool,
     /// Shell for the integrated terminal, with optional arguments (e.g. `"bash --login"`).
     /// Defaults to PowerShell on Windows and `$SHELL` elsewhere.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -40,6 +44,9 @@ pub struct Settings {
     /// Ids of installed extensions that are switched off.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub disabled_extensions: Vec<String>,
+    /// Shortcuts by command id (`toggle_terminal = "cmd+j"`), replacing the
+    /// defaults. See [`crate::keymap`].
+    pub keybindings: BTreeMap<String, Keys>,
     /// Recently opened folders, most recent first.
     pub recent_folders: Vec<PathBuf>,
     /// Open tabs per folder, most recently used first.
@@ -73,8 +80,10 @@ impl Default for Settings {
             font_size: DEFAULT_FONT_SIZE,
             word_wrap: false,
             line_numbers: true,
+            minimap: true,
             terminal_shell: None,
             disabled_extensions: Vec::new(),
+            keybindings: BTreeMap::new(),
             recent_folders: Vec::new(),
             sessions: Vec::new(),
         }
@@ -213,6 +222,8 @@ mod tests {
         assert_eq!(s.font_size, DEFAULT_FONT_SIZE);
         assert!(!s.word_wrap);
         assert!(s.line_numbers);
+        assert!(s.minimap);
+        assert!(s.keybindings.is_empty());
         assert!(s.format_on_save);
         assert_eq!(Settings::parse("").unwrap(), Settings::default());
         let s = Settings::parse("word_wrap = true\nline_numbers = false").unwrap();
@@ -283,7 +294,16 @@ mod tests {
             font_size: 16.0,
             word_wrap: true,
             line_numbers: false,
+            minimap: false,
             terminal_shell: Some("bash --login".into()),
+            keybindings: [
+                ("save".to_owned(), Keys::One("cmd+s".into())),
+                (
+                    "find".to_owned(),
+                    Keys::Many(vec!["cmd+f".into(), "f3".into()]),
+                ),
+            ]
+            .into(),
             ..Settings::default()
         };
         s.add_recent_folder(Path::new("/code/a"));

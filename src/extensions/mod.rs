@@ -144,7 +144,11 @@ pub struct Extensions {
 impl Extensions {
     /// Loads every extension in `dir` (sorted by name). Extensions whose id is
     /// in `disabled` are loaded but switched off.
-    pub fn load(dir: Option<PathBuf>, disabled: &[String]) -> Self {
+    pub fn load(
+        dir: Option<PathBuf>,
+        disabled: &[String],
+        builtin: &[(Command, KeyboardShortcut)],
+    ) -> Self {
         let mut list: Vec<Extension> = dir
             .as_deref()
             .and_then(|d| std::fs::read_dir(d).ok())
@@ -172,16 +176,17 @@ impl Extensions {
             list,
             bindings: Vec::new(),
         };
-        exts.bind_shortcuts();
+        exts.bind_shortcuts(builtin);
         exts
     }
 
     /// Collects shortcuts of active commands, warning about any that clash
-    /// with a built-in command or an earlier extension.
-    fn bind_shortcuts(&mut self) {
-        let builtin: Vec<(Command, KeyboardShortcut)> = Command::shortcut_table();
+    /// with a built-in shortcut (from the keymap in effect) or an earlier
+    /// extension. Call again when the keymap changes.
+    pub fn bind_shortcuts(&mut self, builtin: &[(Command, KeyboardShortcut)]) {
         let mut bindings: Vec<Binding> = Vec::new();
         for ext in &mut self.list {
+            ext.warnings.clear();
             if !ext.is_active() {
                 continue;
             }
@@ -326,7 +331,8 @@ mod tests {
         );
         std::fs::create_dir_all(root.join(".install-staging")).unwrap();
 
-        let exts = Extensions::load(Some(root.clone()), &["off".to_owned()]);
+        let keymap = crate::keymap::Keymap::default();
+        let exts = Extensions::load(Some(root.clone()), &["off".to_owned()], keymap.table());
         let ids: Vec<String> = exts.list.iter().map(Extension::id).collect();
         assert_eq!(ids, ["broken", "good", "off"]);
 
@@ -353,10 +359,10 @@ mod tests {
             "t",
             "id = \"t\"\nname = \"T\"\nversion = \"1\"\nthemes = [\"dusk.toml\"]",
         );
-        let exts = Extensions::load(Some(root.clone()), &[]);
+        let exts = Extensions::load(Some(root.clone()), &[], &[]);
         assert!(exts.list[0].error.as_deref().unwrap().contains("dusk.toml"));
         std::fs::write(root.join("t/dusk.toml"), "name = \"Dusk\"").unwrap();
-        let exts = Extensions::load(Some(root.clone()), &[]);
+        let exts = Extensions::load(Some(root.clone()), &[], &[]);
         assert_eq!(exts.theme_files(), [root.join("t/dusk.toml")]);
         let _ = std::fs::remove_dir_all(&root);
     }

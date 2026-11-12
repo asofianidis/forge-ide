@@ -128,9 +128,7 @@ impl ForgeApp {
                     pressed: true,
                     modifiers,
                     ..
-                } if modifiers.is_none() => {
-                    Some(ops::newline(text, sel, &ops::indent_unit(text), &ext))
-                }
+                } if modifiers.is_none() => Some(ops::newline(text, sel, &doc.indent_unit(), &ext)),
                 Event::Key {
                     key: Key::Backspace,
                     pressed: true,
@@ -166,8 +164,8 @@ impl ForgeApp {
                     return;
                 }
             },
-            Command::Indent => ops::indent(text, sel, &ops::indent_unit(text)),
-            Command::Outdent => ops::outdent(text, sel, &ops::indent_unit(text)),
+            Command::Indent => ops::indent(text, sel, &doc.indent_unit()),
+            Command::Outdent => ops::outdent(text, sel, &doc.indent_unit()),
             Command::DuplicateLine => ops::duplicate_lines(text, sel),
             Command::MoveLineUp | Command::MoveLineDown => {
                 match ops::move_lines(text, sel, cmd == Command::MoveLineUp) {
@@ -209,7 +207,7 @@ impl ForgeApp {
             if multi_line {
                 self.edit_command(ctx, Command::Indent);
             } else {
-                let edit = ops::insert(doc.text(), sel, &ops::indent_unit(doc.text()));
+                let edit = ops::insert(doc.text(), sel, &doc.indent_unit());
                 self.apply_edit(ctx, edit);
             }
         }
