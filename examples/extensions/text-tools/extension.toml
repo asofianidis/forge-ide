@@ -1,0 +1,76 @@
+# Text Tools: an example Forge IDE extension.
+# See docs/extensions.md for every field.
+
+id = "text-tools"
+name = "Text Tools"
+version = "1.0.0"
+description = "Sort lines, count words, wrap text in a tag, list TODOs and more."
+author = "Forge IDE"
+homepage = "https://github.com/asofianidis/forge-ide/tree/main/examples/extensions/text-tools"
+min_forge_version = "0.1.0"
+
+themes = ["themes/paper.toml"]
+
+# The selection goes in on stdin; the sorted lines replace it.
+[[commands]]
+id = "sort-lines"
+title = "Sort Lines"
+program = "python3"
+args = ["${extensionPath}/tools.py", "sort"]
+windows = { program = "python" }
+stdin = "selection"
+output = "replace-selection"
+keybinding = "Cmd+Alt+O"
+
+# The whole buffer goes in; one line comes back for the status bar.
+[[commands]]
+id = "word-count"
+title = "Count Words"
+program = "python3"
+args = ["${extensionPath}/tools.py", "count"]
+windows = { program = "python" }
+stdin = "document"
+output = "status"
+
+# `prompt` asks for text first; it arrives as ${input}.
+[[commands]]
+id = "wrap-tag"
+title = "Wrap Selection in Tag…"
+program = "python3"
+args = ["${extensionPath}/tools.py", "wrap", "${input}"]
+windows = { program = "python" }
+prompt = "Tag name (e.g. div, strong)"
+stdin = "selection"
+output = "replace-selection"
+file_types = ["html", "htm", "xml", "svg", "md", "jsx", "tsx", "vue"]
+
+[[commands]]
+id = "insert-timestamp"
+title = "Insert Timestamp"
+program = "python3"
+args = ["${extensionPath}/tools.py", "timestamp"]
+windows = { program = "python" }
+output = "insert"
+
+# Scans the open folder and shows the result in an output tab.
+[[commands]]
+id = "list-todos"
+title = "List TODOs in Folder"
+program = "python3"
+args = ["${extensionPath}/tools.py", "todos", "${workspaceFolder}"]
+windows = { program = "python" }
+output = "panel"
+timeout = 120
+
+# Runs after every save of a Markdown or text file and rewrites the file
+# (then saves it again) if anything changed.
+[[commands]]
+id = "trim-trailing-whitespace"
+title = "Trim Trailing Whitespace"
+program = "python3"
+args = ["${extensionPath}/tools.py", "trim"]
+windows = { program = "python" }
+stdin = "document"
+output = "replace-document"
+file_types = ["md", "txt"]
+on_save = true

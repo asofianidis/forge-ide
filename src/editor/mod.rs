@@ -7,6 +7,7 @@ mod document;
 pub mod find;
 pub mod gutter;
 mod highlight;
+pub mod minimap;
 pub mod ops;
 pub mod scm;
 

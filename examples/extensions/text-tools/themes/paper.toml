@@ -1,0 +1,14 @@
+# A light theme contributed by the Text Tools extension.
+# Same format as custom themes; see themes/example.toml in the Forge repository.
+name = "Paper"
+extends = "Blossom Light"
+
+[ui]
+panel = "#f4f1ea"
+editor = "#fbf9f4"
+surface = "#efebe2"
+accent = "#2f6f62"
+accent_text = "#ffffff"
+selection = "#d6e6df"
+cursor = "#2f6f62"
+link = "#2f6f62"

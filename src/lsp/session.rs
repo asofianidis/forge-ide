@@ -387,6 +387,46 @@ pub struct Lsp {
     events: Vec<LspEvent>,
 }
 
+/// The `FormattingOptions` sent with a formatting request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormatOptions {
+    pub tab_size: usize,
+    pub insert_spaces: bool,
+    pub trim_trailing_whitespace: bool,
+    pub insert_final_newline: bool,
+}
+
+impl FormatOptions {
+    /// Options for indenting with `indent` (a tab, or spaces) where a tab is
+    /// `tab_width` columns, trimming whitespace and ending with a newline.
+    pub fn from_indent(indent: &str, tab_width: usize) -> Self {
+        Self {
+            tab_size: if indent == "\t" {
+                tab_width
+            } else {
+                indent.len()
+            }
+            .max(1),
+            insert_spaces: indent != "\t",
+            trim_trailing_whitespace: true,
+            insert_final_newline: true,
+        }
+    }
+
+    /// Options following the document's indentation and `.editorconfig`.
+    pub fn for_document(doc: &crate::editor::Document) -> Self {
+        let mut options = Self::from_indent(&doc.indent_unit(), doc.tab_width());
+        let ec = &doc.editorconfig;
+        if let Some(trim) = ec.trim_trailing_whitespace {
+            options.trim_trailing_whitespace = trim;
+        }
+        if let Some(final_newline) = ec.insert_final_newline {
+            options.insert_final_newline = final_newline;
+        }
+        options
+    }
+}
+
 impl Lsp {
     pub fn new(ctx: egui::Context) -> Self {
         Self::with_spawner(ctx, Box::new(Client::spawn))
@@ -733,23 +773,22 @@ impl Lsp {
         Ok(())
     }
 
-    /// Asks for formatting edits for the whole file, using the file's own
-    /// indentation (`tab_size` spaces, or tabs).
+    /// Asks for formatting edits for the whole file.
     pub fn format(
         &mut self,
         path: &Path,
         text: &str,
-        indent: &str,
+        options: &FormatOptions,
         then_save: bool,
     ) -> Result<(), String> {
         let (key, uri, _) = self.prepare(path, text, Feature::Formatting)?;
         let params = json!({
             "textDocument": { "uri": uri },
             "options": {
-                "tabSize": if indent == "\t" { 4 } else { indent.len().max(1) },
-                "insertSpaces": indent != "\t",
-                "trimTrailingWhitespace": true,
-                "insertFinalNewline": true,
+                "tabSize": options.tab_size,
+                "insertSpaces": options.insert_spaces,
+                "trimTrailingWhitespace": options.trim_trailing_whitespace,
+                "insertFinalNewline": options.insert_final_newline,
             },
         });
         let pending = Pending::Format {
@@ -1788,7 +1827,8 @@ mod tests {
         assert_eq!(target, Some((file.clone(), 1..2)));
 
         // Formatting that fails still lets the save go ahead.
-        lsp.format(&file, edited, "    ", true).unwrap();
+        lsp.format(&file, edited, &FormatOptions::from_indent("    ", 4), true)
+            .unwrap();
         let mut saved = false;
         poll_until(&mut lsp, |_, events| {
             for e in events {
@@ -2233,7 +2273,8 @@ mod clangd_tests {
         // Formatting.
         let messy = "int   main(void){return 0;}\n";
         lsp.sync(&[(&file, messy)], Some(&dir), find);
-        lsp.format(&file, messy, "    ", false).unwrap();
+        lsp.format(&file, messy, &FormatOptions::from_indent("    ", 4), false)
+            .unwrap();
         let (edits, enc) = wait_for(&mut lsp, |_, e| match e {
             LspEvent::Format {
                 edits, encoding, ..

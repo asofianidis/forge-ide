@@ -1,9 +1,12 @@
 //! The Settings window and the editor preferences it controls (font size,
-//! word wrap, line numbers), plus editing `settings.toml` directly.
+//! word wrap, line numbers, minimap), the Keyboard Shortcuts window, and
+//! editing `settings.toml` directly.
 
-use egui::TextStyle;
+use egui::{RichText, TextStyle};
 
-use super::ForgeApp;
+use super::{ForgeApp, keymap_errors_status};
+use crate::commands::Command;
+use crate::keymap::Keymap;
 use crate::settings::{self, Settings};
 use crate::updater;
 
@@ -58,6 +61,101 @@ impl ForgeApp {
         let on = !self.settings.breadcrumbs;
         self.update_settings(|s| s.breadcrumbs = on);
         self.status = format!("Breadcrumbs {}", if on { "on" } else { "off" });
+    }
+
+    pub(super) fn toggle_minimap(&mut self) {
+        let on = !self.settings.minimap;
+        self.update_settings(|s| s.minimap = on);
+        self.status = format!("Minimap {}", if on { "on" } else { "off" });
+    }
+
+    /// Rebuilds the keymap when the `[keybindings]` in the settings changed
+    /// (edited in a tab, or by another window), reporting bad entries.
+    pub(super) fn sync_keymap(&mut self) {
+        if self.settings.keybindings == self.keymap_source {
+            return;
+        }
+        let (keymap, errors) = Keymap::new(&self.settings.keybindings);
+        self.keymap = keymap;
+        self.keymap_source = self.settings.keybindings.clone();
+        self.extensions.bind_shortcuts(self.keymap.table());
+        if let Some(msg) = keymap_errors_status(&errors) {
+            self.status = msg;
+        }
+    }
+
+    /// Every command with its keybinding id and current shortcuts, for
+    /// writing `[keybindings]` in `settings.toml`.
+    pub(super) fn keybindings_window(&mut self, ctx: &egui::Context) {
+        let Some(filter) = &mut self.keybindings_filter else {
+            return;
+        };
+        let mut open = true;
+        let mut edit_file = false;
+        let (_, errors) = Keymap::new(&self.settings.keybindings);
+        let keymap = &self.keymap;
+        egui::Window::new("Keyboard Shortcuts")
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(560.0)
+            .default_height(480.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    "Change a shortcut by adding its command to [keybindings] in settings.toml, \
+                     e.g. toggle_terminal = \"cmd+j\". A list binds several; [] removes them.",
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Edit settings.toml").clicked() {
+                        edit_file = true;
+                    }
+                    ui.add(
+                        egui::TextEdit::singleline(filter)
+                            .hint_text("Filter")
+                            .desired_width(f32::INFINITY),
+                    )
+                });
+                for e in &errors {
+                    ui.colored_label(ui.visuals().warn_fg_color, format!("⚠ Ignored: {e}"));
+                }
+                ui.separator();
+                let query = filter.to_lowercase();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    egui::Grid::new("keybindings_grid")
+                        .num_columns(3)
+                        .striped(true)
+                        .spacing([16.0, 6.0])
+                        .show(ui, |ui| {
+                            for &cmd in Command::ALL {
+                                let id = cmd.id();
+                                let keys: Vec<String> = keymap
+                                    .shortcuts(cmd)
+                                    .iter()
+                                    .map(|s| ui.ctx().format_shortcut(s))
+                                    .collect();
+                                let keys = keys.join("   ");
+                                let label = cmd.palette_label();
+                                if !query.is_empty()
+                                    && ![&label, &id, &keys]
+                                        .iter()
+                                        .any(|t| t.to_lowercase().contains(&query))
+                                {
+                                    continue;
+                                }
+                                ui.label(label);
+                                ui.add(egui::Label::new(RichText::new(&id).monospace().weak()));
+                                ui.label(RichText::new(keys).monospace());
+                                ui.end_row();
+                            }
+                        });
+                });
+            });
+        let closed = !open || ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        if closed || edit_file {
+            self.keybindings_filter = None;
+        }
+        if edit_file {
+            self.open_settings_file();
+        }
     }
 
     /// Re-reads the settings file (after it was saved from an editor tab) and
@@ -118,6 +216,7 @@ impl ForgeApp {
         let mut line_numbers = self.settings.line_numbers;
         let mut inlay_hints = self.settings.inlay_hints;
         let mut breadcrumbs = self.settings.breadcrumbs;
+        let mut minimap = self.settings.minimap;
         let mut format_on_save = self.settings.format_on_save;
         let mut auto_update = self
             .settings
@@ -175,6 +274,8 @@ impl ForgeApp {
 
                         ui.label("Breadcrumbs");
                         changed |= ui.checkbox(&mut breadcrumbs, "").changed();
+                        ui.label("Minimap");
+                        changed |= ui.checkbox(&mut minimap, "").changed();
                         ui.end_row();
 
                         ui.label("Format on save");
@@ -207,6 +308,7 @@ impl ForgeApp {
                 || line_numbers != s.line_numbers
                 || inlay_hints != s.inlay_hints
                 || breadcrumbs != s.breadcrumbs
+                || minimap != s.minimap
                 || format_on_save != s.format_on_save
                 || auto_changed
             {
@@ -215,6 +317,7 @@ impl ForgeApp {
                     s.line_numbers = line_numbers;
                     s.inlay_hints = inlay_hints;
                     s.breadcrumbs = breadcrumbs;
+                    s.minimap = minimap;
                     s.format_on_save = format_on_save;
                     if auto_changed {
                         s.auto_update = Some(auto_update);

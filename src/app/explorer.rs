@@ -410,7 +410,15 @@ impl ForgeApp {
                 }
             }
         }
+        let editorconfig_changed = changes.rescan
+            || changes
+                .paths
+                .iter()
+                .any(|p| p.file_name() == Some(crate::editorconfig::FILE_NAME.as_ref()));
         for doc in &mut self.documents {
+            if editorconfig_changed {
+                doc.refresh_editorconfig();
+            }
             if !doc.path.as_deref().is_some_and(|p| changes.touches(p)) {
                 continue;
             }
