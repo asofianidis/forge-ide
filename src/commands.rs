@@ -23,12 +23,20 @@ pub enum Command {
     DuplicateLine,
     MoveLineUp,
     MoveLineDown,
+    TriggerSuggest,
+    RenameSymbol,
+    FormatDocument,
     QuickOpen,
     GoToLine,
+    GoToDefinition,
+    FindReferences,
+    NextProblem,
+    PreviousProblem,
     ShowCommandPalette,
     ShowExplorer,
     ShowSourceControl,
     ShowPullRequests,
+    ShowProblems,
     ToggleBlame,
     NextChange,
     PreviousChange,
@@ -38,6 +46,8 @@ pub enum Command {
     ReloadThemes,
     OpenThemesFolder,
     LanguageServers,
+    RestartLanguageServers,
+    ToggleFormatOnSave,
     CheckForUpdates,
 }
 
@@ -69,12 +79,20 @@ impl Command {
         Command::DuplicateLine,
         Command::MoveLineUp,
         Command::MoveLineDown,
+        Command::TriggerSuggest,
+        Command::RenameSymbol,
+        Command::FormatDocument,
         Command::QuickOpen,
         Command::GoToLine,
+        Command::GoToDefinition,
+        Command::FindReferences,
+        Command::NextProblem,
+        Command::PreviousProblem,
         Command::ShowCommandPalette,
         Command::ShowExplorer,
         Command::ShowSourceControl,
         Command::ShowPullRequests,
+        Command::ShowProblems,
         Command::ToggleBlame,
         Command::NextChange,
         Command::PreviousChange,
@@ -84,6 +102,8 @@ impl Command {
         Command::ReloadThemes,
         Command::OpenThemesFolder,
         Command::LanguageServers,
+        Command::RestartLanguageServers,
+        Command::ToggleFormatOnSave,
         Command::CheckForUpdates,
     ];
 
@@ -106,12 +126,20 @@ impl Command {
             Command::DuplicateLine => "Duplicate Line",
             Command::MoveLineUp => "Move Line Up",
             Command::MoveLineDown => "Move Line Down",
+            Command::TriggerSuggest => "Trigger Suggest",
+            Command::RenameSymbol => "Rename Symbol…",
+            Command::FormatDocument => "Format Document",
             Command::QuickOpen => "Go to File…",
             Command::GoToLine => "Go to Line…",
+            Command::GoToDefinition => "Go to Definition",
+            Command::FindReferences => "Find All References",
+            Command::NextProblem => "Next Problem",
+            Command::PreviousProblem => "Previous Problem",
             Command::ShowCommandPalette => "Command Palette…",
             Command::ShowExplorer => "Explorer",
             Command::ShowSourceControl => "Source Control",
             Command::ShowPullRequests => "Pull Requests",
+            Command::ShowProblems => "Problems…",
             Command::ToggleBlame => "Toggle Blame",
             Command::NextChange => "Next Change",
             Command::PreviousChange => "Previous Change",
@@ -121,6 +149,8 @@ impl Command {
             Command::ReloadThemes => "Reload Themes",
             Command::OpenThemesFolder => "Open Themes Folder",
             Command::LanguageServers => "Language Servers…",
+            Command::RestartLanguageServers => "Restart Language Servers",
+            Command::ToggleFormatOnSave => "Format on Save",
             Command::CheckForUpdates => "Check for Updates",
         }
     }
@@ -131,12 +161,13 @@ impl Command {
         match self {
             NewFile | OpenFile | OpenFolder | OpenRecent | Save | CloseTab | Quit => "File",
             Find | Replace | FindInProject | ToggleComment | Indent | Outdent | DuplicateLine
-            | MoveLineUp | MoveLineDown => "Edit",
-            QuickOpen | GoToLine => "Go",
+            | MoveLineUp | MoveLineDown | TriggerSuggest | RenameSymbol | FormatDocument => "Edit",
+            QuickOpen | GoToLine | GoToDefinition | FindReferences | NextProblem
+            | PreviousProblem => "Go",
             ShowCommandPalette | ShowExplorer | ShowSourceControl | ShowPullRequests
-            | ToggleBlame | NextChange | PreviousChange | FileHistory | RepositoryHistory
-            | SelectTheme | ReloadThemes | OpenThemesFolder => "View",
-            LanguageServers => "Tools",
+            | ShowProblems | ToggleBlame | NextChange | PreviousChange | FileHistory
+            | RepositoryHistory | SelectTheme | ReloadThemes | OpenThemesFolder => "View",
+            LanguageServers | RestartLanguageServers | ToggleFormatOnSave => "Tools",
             CheckForUpdates => "Help",
         }
     }
@@ -189,6 +220,15 @@ impl Command {
             Command::ShowPullRequests => &const { one(shortcut(CMD_SHIFT, Key::R)) },
             Command::ToggleBlame => &const { one(shortcut(CMD_ALT, Key::B)) },
             Command::NextChange => &const { one(shortcut(ALT, Key::F5)) },
+            // Ctrl+Space on every platform, as in other editors.
+            Command::TriggerSuggest => &const { one(shortcut(Modifiers::CTRL, Key::Space)) },
+            Command::RenameSymbol => &const { one(shortcut(Modifiers::NONE, Key::F2)) },
+            Command::FormatDocument => &const { one(shortcut(CMD_SHIFT, Key::I)) },
+            Command::GoToDefinition => &const { one(shortcut(Modifiers::NONE, Key::F12)) },
+            Command::FindReferences => &const { one(shortcut(Modifiers::SHIFT, Key::F12)) },
+            Command::NextProblem => &const { one(shortcut(Modifiers::NONE, Key::F8)) },
+            Command::PreviousProblem => &const { one(shortcut(Modifiers::SHIFT, Key::F8)) },
+            Command::ShowProblems => &const { one(shortcut(CMD_SHIFT, Key::M)) },
             Command::PreviousChange => &const { one(shortcut(ALT_SHIFT, Key::F5)) },
             _ => &[],
         }
@@ -205,6 +245,9 @@ impl Command {
                 | Command::DuplicateLine
                 | Command::MoveLineUp
                 | Command::MoveLineDown
+                | Command::TriggerSuggest
+                | Command::RenameSymbol
+                | Command::FormatDocument
         )
     }
 
@@ -254,6 +297,8 @@ mod tests {
         assert!(pos(Command::FindInProject) < pos(Command::Find));
         assert!(pos(Command::DuplicateLine) < pos(Command::MoveLineDown));
         assert!(pos(Command::PreviousChange) < pos(Command::NextChange));
+        assert!(pos(Command::FindReferences) < pos(Command::GoToDefinition));
+        assert!(pos(Command::PreviousProblem) < pos(Command::NextProblem));
     }
 
     #[test]

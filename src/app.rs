@@ -2,6 +2,7 @@
 
 mod editing;
 mod find_bar;
+mod language;
 mod pickers;
 mod search_panel;
 mod session;
@@ -26,7 +27,7 @@ use crate::git::{self, PanelAction, ScmPanel, SourceControl};
 use crate::github::model::{CheckOutcome, WorkflowRun};
 use crate::github::{BranchContext, GhEvent, GitHub, ListAction, PrListPanel};
 use crate::history::{HistoryPane, RebasePane};
-use crate::lsp::{ServerBrowser, ServerManager};
+use crate::lsp::{Feature, Lsp, ServerBrowser, ServerManager};
 use crate::palette::Picker;
 use crate::panes::{ChangesPane, CommitPane, LogPane, Pane, PaneAction};
 use crate::search::FileIndex;
@@ -40,6 +41,7 @@ use crate::workspace::{FileKinds, FileNode, Workspace};
 
 use editing::editor_id;
 use find_bar::FindBar;
+use language::{EditorFrame, LanguageUi};
 use pickers::{FileMatches, PickerMode};
 use search_panel::SearchPanel;
 
@@ -80,6 +82,10 @@ pub struct ForgeApp {
     cursor: (usize, usize),
     servers: ServerManager,
     server_browser: ServerBrowser,
+    /// Running language servers for the open files.
+    lsp: Lsp,
+    /// Hover, completion, rename and other language-feature UI state.
+    language: LanguageUi,
     /// Languages whose "install a language server" hint the user dismissed.
     dismissed_hints: HashSet<&'static str>,
     settings: Settings,
@@ -182,6 +188,8 @@ impl ForgeApp {
             cursor: (1, 1),
             servers: ServerManager::new(cc.egui_ctx.clone()),
             server_browser: ServerBrowser::default(),
+            lsp: Lsp::new(cc.egui_ctx.clone()),
+            language: LanguageUi::default(),
             dismissed_hints: HashSet::new(),
             settings,
             updater,
@@ -409,6 +417,8 @@ impl ForgeApp {
         self.panes.clear();
         self.active_pane = None;
         self.editor_git.clear();
+        self.lsp.restart();
+        self.language = LanguageUi::default();
         self.search = SearchPanel::default();
         self.workspace = Some(Workspace::open(path.clone()));
         self.folder_opened(&path);
@@ -562,10 +572,6 @@ impl ForgeApp {
         }
     }
 
-    fn save_active(&mut self) {
-        self.save(self.active);
-    }
-
     /// Saves a document, asking for a path if it has none. Returns whether it
     /// was saved (not cancelled and no error).
     fn save(&mut self, idx: usize) -> bool {
@@ -582,6 +588,9 @@ impl ForgeApp {
         let saved = match result {
             Ok(()) => {
                 self.status = format!("Saved {}", doc.title());
+                if let Some(path) = &doc.path {
+                    self.lsp.did_save(path, &doc.text);
+                }
                 true
             }
             Err(e) => {
@@ -858,6 +867,22 @@ impl ForgeApp {
             Command::ReloadThemes => self.reload_themes(ctx),
             Command::OpenThemesFolder => self.open_themes_folder(),
             Command::LanguageServers => self.server_browser.open = true,
+            Command::RestartLanguageServers => self.restart_language_servers(),
+            Command::ToggleFormatOnSave => {
+                let on = !self.settings.format_on_save;
+                self.update_settings(|s| s.format_on_save = on);
+                self.status = format!("Format on save {}", if on { "on" } else { "off" });
+            }
+            Command::TriggerSuggest => self.trigger_suggest(ctx),
+            Command::RenameSymbol => self.open_rename(ctx),
+            Command::FormatDocument => {
+                self.format_document(false);
+            }
+            Command::GoToDefinition => self.go_to_definition(ctx),
+            Command::FindReferences => self.find_references(ctx),
+            Command::NextProblem => self.go_to_problem(ctx, true),
+            Command::PreviousProblem => self.go_to_problem(ctx, false),
+            Command::ShowProblems => self.show_problems(),
             Command::CheckForUpdates => self.check_for_updates(ctx),
         }
     }
@@ -923,10 +948,20 @@ impl ForgeApp {
                 for cmd in [DuplicateLine, MoveLineUp, MoveLineDown] {
                     self.menu_item(ui, cmd);
                 }
+                ui.separator();
+                for cmd in [TriggerSuggest, RenameSymbol, FormatDocument] {
+                    self.menu_item(ui, cmd);
+                }
             });
             ui.menu_button("Go", |ui| {
                 self.menu_item(ui, QuickOpen);
                 self.menu_item(ui, GoToLine);
+                ui.separator();
+                self.menu_item(ui, GoToDefinition);
+                self.menu_item(ui, FindReferences);
+                ui.separator();
+                self.menu_item(ui, NextProblem);
+                self.menu_item(ui, PreviousProblem);
             });
             ui.menu_button("View", |ui| {
                 self.menu_item(ui, ShowCommandPalette);
@@ -942,6 +977,7 @@ impl ForgeApp {
                 }
                 self.menu_item(ui, ShowSourceControl);
                 self.menu_item(ui, ShowPullRequests);
+                self.menu_item(ui, ShowProblems);
                 ui.separator();
                 let mut blame = self.editor_git.blame_on;
                 let mut checkbox = ui.add(egui::Checkbox::new(&mut blame, "Blame"));
@@ -974,6 +1010,16 @@ impl ForgeApp {
             });
             ui.menu_button("Tools", |ui| {
                 self.menu_item(ui, LanguageServers);
+                self.menu_item(ui, RestartLanguageServers);
+                ui.separator();
+                let mut on = self.settings.format_on_save;
+                if ui
+                    .checkbox(&mut on, "Format on Save")
+                    .on_hover_text("Format with the language server before saving")
+                    .changed()
+                {
+                    self.update_settings(|s| s.format_on_save = on);
+                }
             });
             ui.menu_button("Help", |ui| {
                 self.menu_item(ui, CheckForUpdates);
@@ -1238,6 +1284,8 @@ impl ForgeApp {
                     ui.separator();
                     ui.label(format!("Ln {}, Col {}", self.cursor.0, self.cursor.1));
                 }
+                ui.separator();
+                self.language_status(ui);
             });
         });
     }
@@ -1488,6 +1536,15 @@ impl ForgeApp {
             }
         }
 
+        let problems = path
+            .as_deref()
+            .map(|p| self.lsp.problems(p, &self.documents[self.active].text))
+            .unwrap_or_default();
+        let can_define = path
+            .as_deref()
+            .is_some_and(|p| self.lsp.supports(p, Feature::Definition));
+        let mut lsp_frame = EditorFrame::default();
+
         let doc = &mut self.documents[self.active];
         let extension = doc.extension().to_owned();
         let highlighter = &mut self.highlighter;
@@ -1611,6 +1668,47 @@ impl ForgeApp {
                         }
                     }
                     ui.painter().set(underlay, Shape::Vec(shapes));
+                    language::paint_problems(ui, &output, &problems, &visible, &colors);
+                    let response = &output.response.response;
+
+                    // What the language features need: the symbol under the
+                    // pointer, the caret, and what was typed.
+                    let pointer = ui
+                        .input(|i| i.pointer.hover_pos())
+                        .filter(|_| response.contains_pointer())
+                        .and_then(|p| language::char_at(&output, p));
+                    if let Some((at, _)) = pointer
+                        && can_define
+                        && ui.input(|i| i.modifiers.command)
+                        && doc
+                            .text
+                            .chars()
+                            .nth(at)
+                            .is_some_and(crate::lsp::text::is_word_char)
+                        && let Some(word) = crate::lsp::text::word_at(&doc.text, at)
+                    {
+                        language::underline(ui, &output, word, colors.link.0);
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        if ui.input(|i| i.pointer.primary_clicked()) {
+                            lsp_frame.definition_at = Some(at);
+                        }
+                    }
+                    lsp_frame.pointer = pointer;
+                    if let Some(range) = output.cursor_range
+                        && response.has_focus()
+                    {
+                        let c: usize = range.primary.index.into();
+                        let r = galley.pos_from_cursor(CCursor::new(c)).translate(offset);
+                        lsp_frame.caret = Some((c, r));
+                    }
+                    if response.changed() {
+                        lsp_frame.typed = ui.input(|i| {
+                            i.events.iter().rev().find_map(|e| match e {
+                                egui::Event::Text(t) => t.chars().last(),
+                                _ => None,
+                            })
+                        });
+                    }
 
                     gutter::paint(
                         ui,
@@ -1721,6 +1819,8 @@ impl ForgeApp {
             }
             None => {}
         }
+        lsp_frame.problems = problems;
+        self.after_editor(ui.ctx(), lsp_frame);
     }
 }
 
@@ -1964,9 +2064,12 @@ impl eframe::App for ForgeApp {
         self.intercept_close(&ctx);
         // The dialog is modal; keep shortcuts from acting behind it.
         if self.pending_close.is_none() {
+            self.completion_keys(&ctx);
             self.handle_shortcuts(&ctx);
         }
         self.servers.poll();
+        self.sync_language_servers();
+        self.handle_lsp_events(&ctx);
         self.poll_updater();
         self.search.search.poll();
         self.poll_disk(&ctx);
@@ -2049,6 +2152,7 @@ impl eframe::App for ForgeApp {
 
         self.show_picker(&ctx);
         self.go_to_line_dialog(&ctx);
+        self.rename_dialog(&ctx);
         for cmd in std::mem::take(&mut self.pending_commands) {
             self.run_command(&ctx, cmd);
         }

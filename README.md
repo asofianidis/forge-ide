@@ -27,10 +27,28 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
 - Language server browser (**Tools → Language Servers…**): finds servers for the
   languages in your project, shows which are installed, and installs missing ones
   with one click via the language's own toolchain (rustup, npm, go, pipx, …)
+- Language server client: installed servers start automatically for open files (see below)
 - Git source control (see below) with live change markers in the editor gutter
 - GitHub pull requests through the GitHub CLI (see below)
 - Themes: built-in **Blossom** (default) and **Blossom Light**, plus custom TOML themes
 - Automatic updates from GitHub releases
+
+## Language servers
+
+When a file has an installed language server (see **Tools → Language Servers…**), Forge starts
+it for the open folder and keeps it in sync as you type. The status bar shows the server and what
+it is doing (e.g. indexing progress).
+
+- **Diagnostics**: errors, warnings and hints are underlined in the editor; the status bar counts
+  errors and warnings across the project. Click the counts (or Cmd/Ctrl+Shift+M) for a list of
+  every problem, and use F8 / Shift+F8 to step through the current file's
+- **Hover**: rest the pointer on a symbol for its documentation (and any diagnostics there)
+- **Go to definition**: F12, or Cmd/Ctrl+click a symbol
+- **Completion** as you type, after trigger characters like `.`, or with Ctrl+Space. Up/Down to
+  choose, Enter or Tab to accept, Escape to dismiss. Snippets and auto-imports are applied
+- **Rename symbol** (F2) across files, **Find all references** (Shift+F12)
+- **Format document** (Cmd/Ctrl+Shift+I), and **Tools → Format on Save**
+- **Tools → Restart Language Servers** if a server gets stuck or crashes
 
 ## Source control
 
@@ -186,6 +204,13 @@ cargo run --release -- path/to/project
 | Indent / outdent       | Ctrl+] / Ctrl+[ (or Tab / Shift+Tab)    |
 | Move line up / down    | Alt+Up / Alt+Down                       |
 | Duplicate line         | Shift+Alt+Down                          |
+| Go to definition       | F12 (or Ctrl+click)                     |
+| Find all references    | Shift+F12                               |
+| Rename symbol          | F2                                      |
+| Trigger completion     | Ctrl+Space (Ctrl on macOS too)          |
+| Format document        | Ctrl+Shift+I                            |
+| Problems               | Ctrl+Shift+M                            |
+| Next / prev. problem   | F8 / Shift+F8                           |
 
 (Cmd instead of Ctrl on macOS, except for Go to line.) macOS uses Cmd+H to hide the app, so
 Replace is also on Cmd+Option+F there. Every action is also in the command palette.
@@ -198,6 +223,7 @@ src/
 ├── app.rs               # application state and UI layout
 ├── app/
 │   ├── editing.rs       # line-editing commands, selection helpers, Go to Line
+│   ├── language.rs      # diagnostics, hover, completion, definition, rename, formatting UI
 │   ├── find_bar.rs      # find / replace bar
 │   ├── search_panel.rs  # "Search" sidebar
 │   └── pickers.rs       # quick open, command palette, theme picker
@@ -237,6 +263,10 @@ src/
 │   ├── catalog.rs       # known language servers and their install commands
 │   ├── detect.rs        # finding installed servers / package managers
 │   ├── install.rs       # background install jobs
+│   ├── rpc.rs           # JSON-RPC framing over stdio
+│   ├── client.rs        # one server process: threads, initialize handshake
+│   ├── session.rs       # servers per workspace, document sync, requests → editor events
+│   ├── text.rs          # positions/encodings, URIs, snippets, applying edits
 │   └── browser.rs       # "Language Servers" window
 └── editor/
     ├── document.rs      # open file buffer, load/save, dirty tracking
@@ -258,6 +288,7 @@ src/
 - [ ] Unsaved-changes prompt on close
 - [ ] Integrated terminal
 - [x] Language server discovery and installation
+- [x] LSP client: diagnostics, hover, go to definition, completion, rename, references, formatting
 - [ ] LSP client (diagnostics, completion, go to definition)
 - [x] Themes
 - [x] Git source control and GitHub pull requests

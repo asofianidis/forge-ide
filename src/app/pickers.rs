@@ -15,6 +15,8 @@ pub(super) enum PickerMode {
     Commands,
     Themes,
     RecentFolders,
+    /// Definitions, references or problems from the language server.
+    Locations,
 }
 
 /// Fuzzy-matched file list, cached until the query or the index changes.
@@ -54,6 +56,12 @@ impl ForgeApp {
     pub(super) fn open_theme_picker(&mut self) {
         self.go_to_line = None;
         self.picker_mode = PickerMode::Themes;
+        self.picker.open("");
+    }
+
+    pub(super) fn open_locations_picker(&mut self) {
+        self.go_to_line = None;
+        self.picker_mode = PickerMode::Locations;
         self.picker.open("");
     }
 
@@ -223,6 +231,14 @@ impl ForgeApp {
                     .show(ctx, "Select a color theme", &items, None, &style)
                 {
                     self.set_theme(ctx, themes[i]);
+                }
+            }
+            PickerMode::Locations => {
+                let (items, indices) = self.location_picker_items(&self.picker.query);
+                let hint = self.language.locations_hint;
+                if let Some(i) = self.picker.show(ctx, hint, &items, None, &style) {
+                    let location = self.language.locations[indices[i]].location.clone();
+                    self.go_to_location(ctx, &location);
                 }
             }
             PickerMode::RecentFolders => {
