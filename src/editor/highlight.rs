@@ -6,13 +6,19 @@
 //! comment). Typing in a large file costs about one line of parsing, not the
 //! whole file.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontId, Stroke};
 use syntect::highlighting::{
     FontStyle, HighlightIterator, HighlightState, Highlighter as ThemeHighlighter, Style, Theme,
 };
-use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
+use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxSet};
 use syntect::util::LinesWithEndings;
+
+use super::decorate::{StyleOverride, semantic_scopes};
+use crate::lsp::features::token_mods;
 
 /// Parser and highlighter state at the start of a line.
 #[derive(Clone, PartialEq, Eq)]
@@ -46,6 +52,10 @@ pub struct Highlighter {
     syntaxes: SyntaxSet,
     theme: Theme,
     cache: Option<Cached>,
+    /// Theme style of each semantic token type and modifiers seen so far.
+    semantic: HashMap<(Arc<str>, u8), Option<StyleOverride>>,
+    /// Bumped on every theme change, so styles derived from it are redone.
+    generation: u64,
 }
 
 impl Highlighter {
@@ -54,6 +64,8 @@ impl Highlighter {
             syntaxes: SyntaxSet::load_defaults_newlines(),
             theme,
             cache: None,
+            semantic: HashMap::new(),
+            generation: 0,
         }
     }
 
@@ -61,6 +73,51 @@ impl Highlighter {
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
         self.cache = None;
+        self.semantic.clear();
+        self.generation += 1;
+    }
+
+    /// Changes whenever the theme does.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// How the theme styles a semantic token, or `None` to leave the syntax
+    /// highlighting as it is (no matching theme rule, or a token kind syntax
+    /// highlighting handles itself).
+    pub fn semantic_style(&mut self, kind: &Arc<str>, modifiers: u8) -> Option<StyleOverride> {
+        let key = (Arc::clone(kind), modifiers);
+        if let Some(style) = self.semantic.get(&key) {
+            return *style;
+        }
+        let style = self.lookup_semantic(kind, modifiers);
+        self.semantic.insert(key, style);
+        style
+    }
+
+    fn lookup_semantic(&self, kind: &str, modifiers: u8) -> Option<StyleOverride> {
+        let scopes = semantic_scopes(
+            kind,
+            modifiers & token_mods::READONLY != 0,
+            modifiers & token_mods::DEFAULT_LIBRARY != 0,
+        );
+        let theme = ThemeHighlighter::new(&self.theme);
+        let found = scopes.iter().find_map(|s| {
+            let style = theme.style_mod_for_stack(&[Scope::new(s).ok()?]);
+            let fg = style.foreground?;
+            Some((Color32::from_rgb(fg.r, fg.g, fg.b), style.font_style))
+        });
+        let deprecated = modifiers & token_mods::DEPRECATED != 0;
+        if found.is_none() && !deprecated {
+            return None;
+        }
+        Some(StyleOverride {
+            color: found.map(|(c, _)| c),
+            italics: found
+                .and_then(|(_, f)| f)
+                .map(|f| f.contains(FontStyle::ITALIC)),
+            strikethrough: deprecated,
+        })
     }
 
     pub fn highlight(&mut self, text: &str, extension: &str, font: FontId) -> LayoutJob {
@@ -295,6 +352,27 @@ mod tests {
         assert!(small.sections.iter().all(|s| s.format.font_id.size == 10.0));
         assert!(large.sections.iter().all(|s| s.format.font_id.size == 20.0));
         assert_eq!(sections(&small), sections(&large));
+    }
+
+    #[test]
+    fn resolves_semantic_tokens_through_theme_scopes() {
+        let mut h = highlighter();
+        let function: Arc<str> = Arc::from("function");
+        let style = h
+            .semantic_style(&function, 0)
+            .expect("theme colors functions");
+        assert!(style.color.is_some());
+        assert!(!style.strikethrough);
+        // Comments are left to syntax highlighting.
+        assert_eq!(h.semantic_style(&Arc::from("comment"), 0), None);
+        // Unknown kinds only pick up the deprecated strikethrough.
+        let unknown: Arc<str> = Arc::from("somethingNew");
+        assert_eq!(h.semantic_style(&unknown, 0), None);
+        let old = h.semantic_style(&unknown, token_mods::DEPRECATED).unwrap();
+        assert!(old.strikethrough && old.color.is_none());
+        let generation = h.generation();
+        h.set_theme(h.theme.clone());
+        assert_ne!(h.generation(), generation);
     }
 
     #[test]

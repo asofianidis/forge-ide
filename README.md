@@ -65,6 +65,23 @@ it is doing (e.g. indexing progress).
 - **Completion** as you type, after trigger characters like `.`, or with Ctrl+Space. Up/Down to
   choose, Enter or Tab to accept, Escape to dismiss. Snippets and auto-imports are applied
 - **Rename symbol** (F2) across files, **Find all references** (Shift+F12)
+- **Quick fixes and code actions** (Cmd/Ctrl+.): fixes for the diagnostic under the caret,
+  refactors and source actions, in a menu at the caret. Hovering a problem also offers
+  **Quick Fix…**. Actions that need the server to compute their edit (rust-analyzer's assists)
+  are resolved when chosen, and actions that run a server command work too
+- **Signature help** while typing a call's arguments: the signature shows above the caret with
+  the current parameter highlighted, and follows the caret until you leave the call. Opens on
+  `(` (or Cmd/Ctrl+Shift+Space); click ‹ › to page through overloads
+- **Go to Symbol in File** (Cmd/Ctrl+Shift+O) and **Go to Symbol in Workspace** (Cmd/Ctrl+T),
+  in the fuzzy picker. The workspace search asks every running server as you type
+- **Breadcrumbs** above the editor: the file's path and the symbols around the caret. Click a
+  symbol to jump to one beside it. **View → Breadcrumbs** turns them off
+- **Inlay hints**: types and parameter names shown inline in small labels. They make room in
+  the line rather than covering code, and don't change the text or cursor positions.
+  **View → Inlay Hints** turns them off
+- **Semantic highlighting**: the server's classification of each identifier (parameter, field,
+  method, macro, enum member, …) is layered over syntax highlighting, colored from the theme.
+  Hints and colors stay in place while you type and refresh when you pause
 - **Format document** (Cmd/Ctrl+Shift+I), and **Tools → Format on Save**
 - **Tools → Restart Language Servers** if a server gets stuck or crashes
 

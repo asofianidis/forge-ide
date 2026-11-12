@@ -1,5 +1,6 @@
 //! Top-level application state and UI layout.
 
+mod code_actions;
 mod editing;
 mod explorer;
 mod find_bar;
@@ -8,7 +9,10 @@ mod pickers;
 mod preferences;
 mod search_panel;
 mod session;
+mod signature;
+mod symbols;
 mod terminal_panel;
+mod views;
 
 use std::collections::HashSet;
 use std::ops::Range;
@@ -20,6 +24,7 @@ use egui::{Galley, Key, Modifiers, Rect, RichText, Shape, Stroke, TextStyle, pos
 
 use crate::commands::Command;
 use crate::editor::conflicts::{self, Resolution};
+use crate::editor::decorate;
 use crate::editor::find::Match;
 use crate::editor::ops;
 use crate::editor::scm::{self, EditorAction, EditorGit, Peek};
@@ -1016,6 +1021,12 @@ impl ForgeApp {
                 self.status = format!("Format on save {}", if on { "on" } else { "off" });
             }
             Command::TriggerSuggest => self.trigger_suggest(ctx),
+            Command::TriggerParameterHints => self.trigger_parameter_hints(ctx),
+            Command::QuickFix => self.quick_fix(ctx),
+            Command::GoToSymbol => self.go_to_symbol(),
+            Command::GoToWorkspaceSymbol => self.go_to_workspace_symbol(),
+            Command::ToggleInlayHints => self.toggle_inlay_hints(),
+            Command::ToggleBreadcrumbs => self.toggle_breadcrumbs(),
             Command::RenameSymbol => self.open_rename(ctx),
             Command::FormatDocument => {
                 self.format_document(false);
@@ -1124,13 +1135,21 @@ impl ForgeApp {
                     self.menu_item(ui, cmd);
                 }
                 ui.separator();
-                for cmd in [TriggerSuggest, RenameSymbol, FormatDocument] {
+                for cmd in [
+                    TriggerSuggest,
+                    TriggerParameterHints,
+                    QuickFix,
+                    RenameSymbol,
+                    FormatDocument,
+                ] {
                     self.menu_item(ui, cmd);
                 }
             });
             ui.menu_button("Go", |ui| {
                 self.menu_item(ui, QuickOpen);
                 self.menu_item(ui, GoToLine);
+                self.menu_item(ui, GoToSymbol);
+                self.menu_item(ui, GoToWorkspaceSymbol);
                 ui.separator();
                 self.menu_item(ui, GoToDefinition);
                 self.menu_item(ui, FindReferences);
@@ -1174,6 +1193,10 @@ impl ForgeApp {
                 self.menu_checkbox(ui, ToggleWordWrap, &mut wrap, "Word Wrap");
                 let mut numbers = self.settings.line_numbers;
                 self.menu_checkbox(ui, ToggleLineNumbers, &mut numbers, "Line Numbers");
+                let mut hints = self.settings.inlay_hints;
+                self.menu_checkbox(ui, ToggleInlayHints, &mut hints, "Inlay Hints");
+                let mut crumbs = self.settings.breadcrumbs;
+                self.menu_checkbox(ui, ToggleBreadcrumbs, &mut crumbs, "Breadcrumbs");
                 for cmd in [IncreaseFontSize, DecreaseFontSize, ResetFontSize] {
                     self.menu_item(ui, cmd);
                 }
@@ -1737,11 +1760,10 @@ impl ForgeApp {
             scroll_to = Some(idx);
         }
 
-        let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
-            let mut job = highlighter.highlight(text.as_str(), &extension, font.clone());
-            job.wrap.max_width = wrap_width;
-            ui.painter().layout_job(job)
-        };
+        // Semantic highlighting and inlay hints from the language server.
+        let mut views = path.as_ref().and_then(|p| self.language.views.get_mut(p));
+        let hint_color = self.settings.inlay_hints.then_some(colors.text_muted.0);
+        let hint_fill = colors.text_muted.0.gamma_multiply(0.14);
 
         let mut peek_anchor = None;
         let editor_rect = ui.available_rect_before_wrap();
@@ -1777,6 +1799,17 @@ impl ForgeApp {
                     } else {
                         f32::INFINITY
                     };
+                    let mut layouter =
+                        |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
+                            let text = text.as_str();
+                            let mut job = highlighter.highlight(text, &extension, font.clone());
+                            if let Some(v) = views.as_deref_mut() {
+                                let overlay = v.overlay(ui, text, highlighter, &font, hint_color);
+                                decorate::apply(&mut job, overlay);
+                            }
+                            job.wrap.max_width = wrap_width;
+                            ui.painter().layout_job(job)
+                        };
                     let output = egui::TextEdit::multiline(&mut doc.buffer)
                         .id(id)
                         .code_editor()
@@ -1831,6 +1864,9 @@ impl ForgeApp {
                         }
                     }
                     ui.painter().set(underlay, Shape::Vec(shapes));
+                    if let Some(v) = views.as_deref() {
+                        views::paint_hints(ui, &output, v.placed_hints(), &visible, hint_fill);
+                    }
                     language::paint_problems(ui, &output, &problems, &visible, &colors);
                     let response = &output.response.response;
 
@@ -1857,12 +1893,13 @@ impl ForgeApp {
                         }
                     }
                     lsp_frame.pointer = pointer;
-                    if let Some(range) = output.cursor_range
-                        && response.has_focus()
-                    {
+                    if let Some(range) = output.cursor_range {
                         let c: usize = range.primary.index.into();
                         let r = galley.pos_from_cursor(CCursor::new(c)).translate(offset);
-                        lsp_frame.caret = Some((c, r));
+                        lsp_frame.caret_rect = Some(r);
+                        if response.has_focus() {
+                            lsp_frame.caret = Some((c, r));
+                        }
                     }
                     if response.changed() {
                         lsp_frame.typed = ui.input(|i| {
@@ -2209,7 +2246,9 @@ impl eframe::App for ForgeApp {
         self.intercept_close(&ctx);
         // The dialog is modal; keep shortcuts from acting behind it.
         if self.pending_close.is_none() && self.explorer_dialog.is_none() {
+            self.code_action_keys(&ctx);
             self.completion_keys(&ctx);
+            self.signature_keys(&ctx);
             self.handle_shortcuts(&ctx);
         }
         self.servers.poll();
@@ -2294,6 +2333,7 @@ impl eframe::App for ForgeApp {
                     _ => {
                         self.disk_banner(ui);
                         self.find_bar(ui);
+                        self.breadcrumbs(ui);
                         self.editor(ui);
                     }
                 }

@@ -11,20 +11,33 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use lsp_types::{
-    CompletionItem, CompletionResponse, Diagnostic, DiagnosticSeverity, DocumentChangeOperation,
-    DocumentChanges, GotoDefinitionResponse, Hover, HoverContents, HoverProviderCapability,
-    MarkedString, MarkupKind, NumberOrString, OneOf, ProgressParams, ProgressParamsValue,
-    PublishDiagnosticsParams, ServerCapabilities, ShowMessageParams, TextDocumentSyncCapability,
+    CodeAction, CodeActionOrCommand, CodeActionProviderCapability, CompletionItem,
+    CompletionResponse, Diagnostic, DiagnosticSeverity, DocumentChangeOperation, DocumentChanges,
+    DocumentSymbolResponse, GotoDefinitionResponse, Hover, HoverContents, HoverProviderCapability,
+    InlayHint, MarkedString, MarkupKind, NumberOrString, OneOf, ProgressParams,
+    ProgressParamsValue, PublishDiagnosticsParams, SemanticTokensFullOptions,
+    SemanticTokensOptions, SemanticTokensResult, SemanticTokensServerCapabilities,
+    ServerCapabilities, ShowMessageParams, SignatureHelp, TextDocumentSyncCapability,
     TextDocumentSyncSaveOptions, TextEdit, Uri, WorkDoneProgress, WorkspaceEdit,
+    WorkspaceSymbolResponse,
 };
 use serde_json::{Value, json};
 
 use super::catalog::ServerSpec;
 use super::client::{Client, ClientState};
+use super::features::{
+    DocSymbol, Hint, SemanticSpan, SymbolLocation, decode_document_symbols, decode_inlay_hints,
+    decode_semantic_tokens, decode_workspace_symbols,
+};
 use super::rpc::{self, Incoming, ResponseError};
 use super::text::{Encoding, LineIndex, language_id, path_to_uri, uri_to_path};
+
+/// How long a file must stay unchanged before its views are asked for again.
+const VIEW_DELAY: Duration = Duration::from_millis(250);
 
 /// A server instance: which server, for which workspace root.
 pub type ServerKey = (&'static str, PathBuf);
@@ -42,6 +55,12 @@ pub enum Feature {
     Completion,
     Rename,
     Formatting,
+    CodeActions,
+    SignatureHelp,
+    DocumentSymbols,
+    WorkspaceSymbols,
+    InlayHints,
+    SemanticTokens,
 }
 
 impl Feature {
@@ -53,6 +72,12 @@ impl Feature {
             Feature::Completion => "completion",
             Feature::Rename => "rename",
             Feature::Formatting => "formatting",
+            Feature::CodeActions => "code actions",
+            Feature::SignatureHelp => "signature help",
+            Feature::DocumentSymbols => "document symbols",
+            Feature::WorkspaceSymbols => "workspace symbols",
+            Feature::InlayHints => "inlay hints",
+            Feature::SemanticTokens => "semantic highlighting",
         }
     }
 
@@ -70,6 +95,64 @@ impl Feature {
             Feature::Completion => caps.completion_provider.is_some(),
             Feature::Rename => enabled(&caps.rename_provider),
             Feature::Formatting => enabled(&caps.document_formatting_provider),
+            Feature::CodeActions => matches!(
+                caps.code_action_provider,
+                Some(
+                    CodeActionProviderCapability::Simple(true)
+                        | CodeActionProviderCapability::Options(_)
+                )
+            ),
+            Feature::SignatureHelp => caps.signature_help_provider.is_some(),
+            Feature::DocumentSymbols => enabled(&caps.document_symbol_provider),
+            Feature::WorkspaceSymbols => enabled(&caps.workspace_symbol_provider),
+            Feature::InlayHints => enabled(&caps.inlay_hint_provider),
+            Feature::SemanticTokens => semantic_options(caps).is_some(),
+        }
+    }
+}
+
+/// Semantic token options, if the server can send tokens for a whole file.
+fn semantic_options(caps: &ServerCapabilities) -> Option<&SemanticTokensOptions> {
+    let options = match caps.semantic_tokens_provider.as_ref()? {
+        SemanticTokensServerCapabilities::SemanticTokensOptions(o) => o,
+        SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(r) => {
+            &r.semantic_tokens_options
+        }
+    };
+    matches!(
+        options.full,
+        Some(SemanticTokensFullOptions::Bool(true) | SemanticTokensFullOptions::Delta { .. })
+    )
+    .then_some(options)
+}
+
+/// Information the editor keeps showing for a file and refreshes as it
+/// changes, rather than asking for on demand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    SemanticTokens,
+    InlayHints,
+    Symbols,
+}
+
+impl View {
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    fn feature(self) -> Feature {
+        match self {
+            View::SemanticTokens => Feature::SemanticTokens,
+            View::InlayHints => Feature::InlayHints,
+            View::Symbols => Feature::DocumentSymbols,
+        }
+    }
+
+    fn method(self) -> &'static str {
+        match self {
+            View::SemanticTokens => "textDocument/semanticTokens/full",
+            View::InlayHints => "textDocument/inlayHint",
+            View::Symbols => "textDocument/documentSymbol",
         }
     }
 }
@@ -133,6 +216,50 @@ pub enum LspEvent {
         encoding: Encoding,
         then_save: bool,
     },
+    /// Code actions available at `at` in `path`.
+    CodeActions {
+        path: PathBuf,
+        at: usize,
+        actions: Vec<CodeActionOrCommand>,
+        encoding: Encoding,
+    },
+    /// A code action with its edit filled in.
+    CodeActionResolved {
+        path: PathBuf,
+        action: CodeAction,
+        encoding: Encoding,
+    },
+    /// Signatures of the call around `at`, or `None` outside of one.
+    SignatureHelp {
+        path: PathBuf,
+        at: usize,
+        help: Option<SignatureHelp>,
+        encoding: Encoding,
+    },
+    /// Ranges in these events are chars in `text`, the file as it was when
+    /// asked; it may have changed since.
+    SemanticTokens {
+        path: PathBuf,
+        text: Arc<str>,
+        tokens: Vec<SemanticSpan>,
+    },
+    InlayHints {
+        path: PathBuf,
+        text: Arc<str>,
+        hints: Vec<Hint>,
+    },
+    DocumentSymbols {
+        path: PathBuf,
+        text: Arc<str>,
+        symbols: Vec<DocSymbol>,
+        /// Asked for by Go to Symbol, which is waiting for them.
+        open_picker: bool,
+    },
+    /// Matches for `query` from one server.
+    WorkspaceSymbols {
+        query: String,
+        symbols: Vec<SymbolLocation>,
+    },
     /// Something worth showing in the status bar.
     Message(String),
 }
@@ -191,14 +318,48 @@ struct OpenDoc {
     version: i32,
     /// The text as last sent to the server.
     text: String,
+    /// When the text last changed, to wait for typing to pause.
+    changed: Option<Instant>,
+    /// The version each [`View`] was last asked for at.
+    views: [Option<i32>; 3],
 }
 
 enum Pending {
-    Hover { path: PathBuf, at: usize },
+    Hover {
+        path: PathBuf,
+        at: usize,
+    },
     Locations(LocationKind),
-    Completion { path: PathBuf, at: usize },
+    Completion {
+        path: PathBuf,
+        at: usize,
+    },
     Rename,
-    Format { path: PathBuf, then_save: bool },
+    Format {
+        path: PathBuf,
+        then_save: bool,
+    },
+    CodeActions {
+        path: PathBuf,
+        at: usize,
+    },
+    ResolveCodeAction {
+        path: PathBuf,
+    },
+    ExecuteCommand,
+    SignatureHelp {
+        path: PathBuf,
+        at: usize,
+    },
+    View {
+        path: PathBuf,
+        view: View,
+        text: Arc<str>,
+        open_picker: bool,
+    },
+    WorkspaceSymbols {
+        query: String,
+    },
 }
 
 #[derive(Default)]
@@ -368,6 +529,8 @@ impl Lsp {
                 uri,
                 version: 0,
                 text: text.to_owned(),
+                changed: None,
+                views: [None; 3],
             },
         );
     }
@@ -381,6 +544,7 @@ impl Lsp {
             return;
         }
         doc.version += 1;
+        doc.changed = Some(Instant::now());
         doc.text.clear();
         doc.text.push_str(text);
         if let Some(client) = self.clients.get_mut(&doc.key) {
@@ -469,12 +633,23 @@ impl Lsp {
         let id = client.request(method, params);
         if supersede
             && let Some((old_key, old_id)) = self.latest.insert(method, (key.clone(), id))
-            && self.pending.remove(&(old_key.clone(), old_id)).is_some()
-            && let Some(old) = self.clients.get_mut(&old_key)
+            && let Some(old) = self.pending.remove(&(old_key.clone(), old_id))
         {
-            old.cancel(old_id);
+            self.not_sent(&old);
+            if let Some(client) = self.clients.get_mut(&old_key) {
+                client.cancel(old_id);
+            }
         }
         self.pending.insert((key, id), pending);
+    }
+
+    /// A view request was dropped before it was answered: ask again later.
+    fn not_sent(&mut self, pending: &Pending) {
+        if let Pending::View { path, view, .. } = pending
+            && let Some(doc) = self.docs.get_mut(path)
+        {
+            doc.views[view.index()] = None;
+        }
     }
 
     fn position_params(uri: &Uri, text: &str, at: usize, enc: Encoding) -> Value {
@@ -583,6 +758,270 @@ impl Lsp {
         };
         self.send_request(key, "textDocument/formatting", params, pending, false);
         Ok(())
+    }
+
+    /// Asks for code actions (quick fixes, refactors) for `range`, telling the
+    /// server which diagnostics are there.
+    pub fn code_actions(
+        &mut self,
+        path: &Path,
+        text: &str,
+        range: Range<usize>,
+    ) -> Result<(), String> {
+        let (key, uri, enc) = self.prepare(path, text, Feature::CodeActions)?;
+        let at = range.start;
+        let index = LineIndex::new(text);
+        let range = lsp_types::Range::new(
+            index.position_of(range.start, enc),
+            index.position_of(range.end, enc),
+        );
+        let diagnostics: Vec<&Diagnostic> = self
+            .diagnostics
+            .get(path)
+            .filter(|(k, _)| *k == key)
+            .map(|(_, all)| {
+                all.iter()
+                    .filter(|d| d.range.start <= range.end && range.start <= d.range.end)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "range": range,
+            "context": { "diagnostics": diagnostics, "triggerKind": 1 },
+        });
+        let pending = Pending::CodeActions {
+            path: path.to_path_buf(),
+            at,
+        };
+        self.send_request(key, "textDocument/codeAction", params, pending, true);
+        Ok(())
+    }
+
+    /// Asks the server to fill in a code action's edit. Returns false if the
+    /// server can't, in which case the action has nothing to apply.
+    pub fn resolve_code_action(
+        &mut self,
+        path: &Path,
+        text: &str,
+        action: &CodeAction,
+    ) -> Result<bool, String> {
+        let (key, _, _) = self.prepare(path, text, Feature::CodeActions)?;
+        let resolvable = matches!(
+            &self.clients[&key].capabilities().code_action_provider,
+            Some(CodeActionProviderCapability::Options(o)) if o.resolve_provider == Some(true)
+        );
+        if !resolvable {
+            return Ok(false);
+        }
+        let params = serde_json::to_value(action).unwrap_or_default();
+        let pending = Pending::ResolveCodeAction {
+            path: path.to_path_buf(),
+        };
+        self.send_request(key, "codeAction/resolve", params, pending, false);
+        Ok(true)
+    }
+
+    /// Runs a server command, e.g. from a code action. Any edits it makes
+    /// arrive as `workspace/applyEdit` requests.
+    pub fn execute_command(
+        &mut self,
+        path: &Path,
+        text: &str,
+        command: &lsp_types::Command,
+    ) -> Result<(), String> {
+        let (key, _, _) = self.prepare(path, text, Feature::CodeActions)?;
+        let params = json!({
+            "command": command.command,
+            "arguments": command.arguments.clone().unwrap_or_default(),
+        });
+        self.send_request(
+            key,
+            "workspace/executeCommand",
+            params,
+            Pending::ExecuteCommand,
+            false,
+        );
+        Ok(())
+    }
+
+    /// Asks for the signature of the call around `at`. `trigger` is the
+    /// character just typed, if it is a trigger; `retrigger` means a popup is
+    /// already showing and is being kept up to date.
+    pub fn signature_help(
+        &mut self,
+        path: &Path,
+        text: &str,
+        at: usize,
+        trigger: Option<char>,
+        retrigger: bool,
+    ) -> Result<(), String> {
+        let (key, uri, enc) = self.prepare(path, text, Feature::SignatureHelp)?;
+        let mut params = Self::position_params(&uri, text, at, enc);
+        // Invoked = 1, typed a trigger character = 2, content changed = 3.
+        let kind = match (trigger, retrigger) {
+            (Some(_), _) => 2,
+            (None, true) => 3,
+            (None, false) => 1,
+        };
+        params["context"] = json!({ "triggerKind": kind, "isRetrigger": retrigger });
+        if let Some(c) = trigger {
+            params["context"]["triggerCharacter"] = json!(c.to_string());
+        }
+        let pending = Pending::SignatureHelp {
+            path: path.to_path_buf(),
+            at,
+        };
+        self.send_request(key, "textDocument/signatureHelp", params, pending, true);
+        Ok(())
+    }
+
+    /// Characters that open signature help, and ones that update it while
+    /// it is open (e.g. `(` and `,`).
+    pub fn signature_triggers(&self, path: &Path) -> (Vec<char>, Vec<char>) {
+        let Some(options) = self
+            .docs
+            .get(path)
+            .and_then(|d| self.clients.get(&d.key))
+            .and_then(|c| c.capabilities().signature_help_provider.as_ref())
+        else {
+            return Default::default();
+        };
+        let chars = |list: &Option<Vec<String>>| -> Vec<char> {
+            list.iter()
+                .flatten()
+                .filter_map(|s| s.chars().last())
+                .collect()
+        };
+        (
+            chars(&options.trigger_characters),
+            chars(&options.retrigger_characters),
+        )
+    }
+
+    /// Asks for the file's symbols now (Go to Symbol), rather than waiting
+    /// for [`Lsp::refresh_views`].
+    pub fn document_symbols(&mut self, path: &Path, text: &str) -> Result<(), String> {
+        let (key, uri, enc) = self.prepare(path, text, Feature::DocumentSymbols)?;
+        let version = self.docs[path].version;
+        self.request_view(key, path, uri, enc, Arc::from(text), View::Symbols, true);
+        self.docs.get_mut(path).expect("prepared above").views[View::Symbols.index()] =
+            Some(version);
+        Ok(())
+    }
+
+    /// Searches every running server's workspace for symbols matching
+    /// `query`. Returns how many servers were asked.
+    pub fn workspace_symbols(&mut self, query: &str) -> usize {
+        // Answers to an older query are no longer wanted.
+        let stale: Vec<(ServerKey, i64)> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| matches!(p, Pending::WorkspaceSymbols { .. }))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for (key, id) in stale {
+            self.pending.remove(&(key.clone(), id));
+            if let Some(client) = self.clients.get_mut(&key) {
+                client.cancel(id);
+            }
+        }
+        let keys: Vec<ServerKey> = self
+            .clients
+            .iter()
+            .filter(|(_, c)| {
+                c.is_ready() && Feature::WorkspaceSymbols.supported_by(c.capabilities())
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in &keys {
+            let pending = Pending::WorkspaceSymbols {
+                query: query.to_owned(),
+            };
+            let params = json!({ "query": query });
+            self.send_request(key.clone(), "workspace/symbol", params, pending, false);
+        }
+        keys.len()
+    }
+
+    /// Keeps `path`'s views (semantic tokens, inlay hints, symbols) up to
+    /// date: asks for the ones in `views` once the text has stopped changing
+    /// for a moment. Call every frame for the file being shown.
+    pub fn refresh_views(&mut self, path: &Path, views: &[View]) {
+        let Some(doc) = self.docs.get(path) else {
+            return;
+        };
+        let Some(client) = self.clients.get(&doc.key) else {
+            return;
+        };
+        if !client.is_ready() {
+            return;
+        }
+        let due: Vec<View> = views
+            .iter()
+            .copied()
+            .filter(|v| {
+                doc.views[v.index()] != Some(doc.version)
+                    && v.feature().supported_by(client.capabilities())
+            })
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        let wait = doc
+            .changed
+            .map_or(Duration::ZERO, |t| VIEW_DELAY.saturating_sub(t.elapsed()));
+        if !wait.is_zero() {
+            self.ctx.request_repaint_after(wait);
+            return;
+        }
+        let (key, uri, version, enc) = (
+            doc.key.clone(),
+            doc.uri.clone(),
+            doc.version,
+            client.encoding,
+        );
+        let text: Arc<str> = Arc::from(doc.text.as_str());
+        for view in due {
+            self.request_view(
+                key.clone(),
+                path,
+                uri.clone(),
+                enc,
+                Arc::clone(&text),
+                view,
+                false,
+            );
+            if let Some(doc) = self.docs.get_mut(path) {
+                doc.views[view.index()] = Some(version);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn request_view(
+        &mut self,
+        key: ServerKey,
+        path: &Path,
+        uri: Uri,
+        enc: Encoding,
+        text: Arc<str>,
+        view: View,
+        open_picker: bool,
+    ) {
+        let mut params = json!({ "textDocument": { "uri": uri } });
+        if view == View::InlayHints {
+            let index = LineIndex::new(&text);
+            let end = index.position_of(usize::MAX, enc);
+            params["range"] = json!({ "start": { "line": 0, "character": 0 }, "end": end });
+        }
+        let pending = Pending::View {
+            path: path.to_path_buf(),
+            view,
+            text,
+            open_picker,
+        };
+        self.send_request(key, view.method(), params, pending, true);
     }
 
     /// Answers a server's `workspace/applyEdit` request.
@@ -694,7 +1133,16 @@ impl Lsp {
     fn on_error(&mut self, key: &ServerKey, pending: Pending, e: &ResponseError) {
         let quiet = matches!(e.code, rpc::REQUEST_CANCELLED | rpc::CONTENT_MODIFIED);
         let what = match pending {
-            Pending::Hover { .. } | Pending::Completion { .. } => return,
+            Pending::Hover { .. }
+            | Pending::Completion { .. }
+            | Pending::SignatureHelp { .. }
+            | Pending::WorkspaceSymbols { .. }
+            | Pending::View {
+                open_picker: false, ..
+            } => return,
+            Pending::View { .. } => "Go to symbol",
+            Pending::CodeActions { .. } => "Code actions",
+            Pending::ResolveCodeAction { .. } | Pending::ExecuteCommand => "Code action",
             Pending::Format { path, then_save } => {
                 self.events.push(LspEvent::Format {
                     path,
@@ -797,7 +1245,112 @@ impl Lsp {
                     then_save,
                 });
             }
+            Pending::CodeActions { path, at } => {
+                let actions = serde_json::from_value::<Option<Vec<CodeActionOrCommand>>>(value)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                self.events.push(LspEvent::CodeActions {
+                    path,
+                    at,
+                    actions,
+                    encoding,
+                });
+            }
+            Pending::ResolveCodeAction { path } => {
+                match serde_json::from_value::<CodeAction>(value) {
+                    Ok(action) => self.events.push(LspEvent::CodeActionResolved {
+                        path,
+                        action,
+                        encoding,
+                    }),
+                    Err(e) => self.events.push(LspEvent::Message(format!(
+                        "Code action failed: unexpected reply ({e})"
+                    ))),
+                }
+            }
+            Pending::ExecuteCommand => {}
+            Pending::SignatureHelp { path, at } => {
+                let help = serde_json::from_value::<Option<SignatureHelp>>(value)
+                    .ok()
+                    .flatten()
+                    .filter(|h| !h.signatures.is_empty());
+                self.events.push(LspEvent::SignatureHelp {
+                    path,
+                    at,
+                    help,
+                    encoding,
+                });
+            }
+            Pending::View {
+                path,
+                view,
+                text,
+                open_picker,
+            } => self.on_view(key, path, view, text, open_picker, value),
+            Pending::WorkspaceSymbols { query } => {
+                let symbols = serde_json::from_value::<Option<WorkspaceSymbolResponse>>(value)
+                    .ok()
+                    .flatten()
+                    .map(|r| decode_workspace_symbols(r, encoding))
+                    .unwrap_or_default();
+                self.events
+                    .push(LspEvent::WorkspaceSymbols { query, symbols });
+            }
         }
+    }
+
+    fn on_view(
+        &mut self,
+        key: &ServerKey,
+        path: PathBuf,
+        view: View,
+        text: Arc<str>,
+        open_picker: bool,
+        value: Value,
+    ) {
+        let encoding = self.encoding(key);
+        let event = match view {
+            View::SemanticTokens => {
+                let Some(legend) = self
+                    .clients
+                    .get(key)
+                    .and_then(|c| semantic_options(c.capabilities()))
+                    .map(|o| o.legend.clone())
+                else {
+                    return;
+                };
+                let Ok(Some(SemanticTokensResult::Tokens(tokens))) =
+                    serde_json::from_value::<Option<SemanticTokensResult>>(value)
+                else {
+                    return;
+                };
+                let tokens = decode_semantic_tokens(&text, &tokens.data, &legend, encoding);
+                LspEvent::SemanticTokens { path, text, tokens }
+            }
+            View::InlayHints => {
+                let hints = serde_json::from_value::<Option<Vec<InlayHint>>>(value)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let hints = decode_inlay_hints(&text, hints, encoding);
+                LspEvent::InlayHints { path, text, hints }
+            }
+            View::Symbols => {
+                let symbols = serde_json::from_value::<Option<DocumentSymbolResponse>>(value)
+                    .ok()
+                    .flatten()
+                    .map(|r| decode_document_symbols(&text, r, encoding))
+                    .unwrap_or_default();
+                LspEvent::DocumentSymbols {
+                    path,
+                    text,
+                    symbols,
+                    open_picker,
+                }
+            }
+        };
+        self.events.push(event);
     }
 
     fn on_notification(&mut self, key: &ServerKey, method: &str, params: Value) {
@@ -814,6 +1367,19 @@ impl Lsp {
                 } else {
                     self.diagnostics.insert(path, (key.clone(), p.diagnostics));
                 }
+            }
+            // Something changed project-wide (e.g. indexing finished): ask
+            // again for what is on screen.
+            "workspace/semanticTokens/refresh" | "workspace/inlayHint/refresh" => {
+                let view = if method.starts_with("workspace/semantic") {
+                    View::SemanticTokens
+                } else {
+                    View::InlayHints
+                };
+                for doc in self.docs.values_mut().filter(|d| d.key == *key) {
+                    doc.views[view.index()] = None;
+                }
+                self.ctx.request_repaint();
             }
             "window/showMessage" => {
                 if let Ok(p) = serde_json::from_value::<ShowMessageParams>(params)
@@ -1280,6 +1846,246 @@ mod tests {
         );
     }
 
+    /// A fake server for the newer features: views, code actions, signature
+    /// help and workspace symbols. After the first semantic tokens request it
+    /// asks the client to refresh them.
+    fn views_lsp(log: Arc<Mutex<Vec<Value>>>) -> Lsp {
+        let spawner: Spawner = Box::new(move |spec, _program, root, ctx| {
+            let log = Arc::clone(&log);
+            let main_uri = path_to_uri(&root.join("main.rs")).unwrap();
+            let uri_of_main = main_uri.as_str().to_owned();
+            let mut refreshed = false;
+            let (r, w) = fake_server(move |msg| {
+                log.lock().unwrap().push(msg.clone());
+                let id = msg["id"].clone();
+                let uri = msg["params"]["textDocument"]["uri"].clone();
+                let range = |l: u32, a: u32, b: u32| json!({ "start": { "line": l, "character": a }, "end": { "line": l, "character": b } });
+                match msg["method"].as_str() {
+                    Some("initialize") => init_reply(
+                        msg,
+                        json!({
+                            "semanticTokensProvider": {
+                                "legend": { "tokenTypes": ["function"], "tokenModifiers": [] },
+                                "full": true,
+                            },
+                            "inlayHintProvider": true,
+                            "documentSymbolProvider": true,
+                            "workspaceSymbolProvider": true,
+                            "codeActionProvider": { "resolveProvider": true },
+                            "signatureHelpProvider": { "triggerCharacters": ["("], "retriggerCharacters": [","] },
+                        }),
+                    ),
+                    Some("textDocument/didOpen") => vec![rpc::notification(
+                        "textDocument/publishDiagnostics",
+                        json!({ "uri": uri, "diagnostics": [
+                            { "range": range(0, 3, 6), "severity": 1, "message": "bad" },
+                            { "range": range(1, 0, 1), "severity": 2, "message": "elsewhere" },
+                        ] }),
+                    )],
+                    Some("textDocument/semanticTokens/full") => {
+                        let mut out =
+                            vec![rpc::response(id, Ok(json!({ "data": [0, 3, 3, 0, 0] })))];
+                        if !refreshed {
+                            refreshed = true;
+                            out.push(rpc::request(
+                                900,
+                                "workspace/semanticTokens/refresh",
+                                Value::Null,
+                            ));
+                        }
+                        out
+                    }
+                    Some("textDocument/inlayHint") => vec![rpc::response(
+                        id,
+                        Ok(
+                            json!([{ "position": { "line": 0, "character": 6 }, "label": ": i32", "kind": 1 }]),
+                        ),
+                    )],
+                    Some("textDocument/documentSymbol") => vec![rpc::response(
+                        id,
+                        Ok(json!([{ "name": "add", "kind": 12, "range": range(0, 0, 9),
+                            "selectionRange": range(0, 3, 6) }])),
+                    )],
+                    Some("textDocument/codeAction") => vec![rpc::response(
+                        id,
+                        Ok(json!([
+                            { "title": "Fix it", "kind": "quickfix", "isPreferred": true,
+                              "diagnostics": msg["params"]["context"]["diagnostics"].clone() },
+                            { "title": "Run", "command": "x.run" },
+                        ])),
+                    )],
+                    Some("codeAction/resolve") => {
+                        let mut action = msg["params"].clone();
+                        action["edit"] = json!({ "changes": { uri_of_main.clone(): [
+                            { "range": range(0, 3, 6), "newText": "sum" },
+                        ] } });
+                        vec![rpc::response(id, Ok(action))]
+                    }
+                    Some("textDocument/signatureHelp") => vec![rpc::response(
+                        id,
+                        Ok(json!({ "signatures": [{ "label": "add(a, b)",
+                            "parameters": [{ "label": [4, 5] }, { "label": [7, 8] }] }],
+                            "activeParameter": 1 })),
+                    )],
+                    Some("workspace/symbol") => vec![rpc::response(
+                        id,
+                        Ok(json!([{ "name": "add", "kind": 12,
+                            "location": { "uri": main_uri.clone(), "range": range(0, 3, 6) } }])),
+                    )],
+                    _ => Vec::new(),
+                }
+            });
+            Ok(Client::connect(spec, root, r, w, ctx))
+        });
+        Lsp::with_spawner(egui::Context::default(), spawner)
+    }
+
+    #[test]
+    fn keeps_views_fresh_and_answers_newer_requests() {
+        let root = std::env::temp_dir().join("forge-lsp-views-test");
+        let file = root.join("main.rs");
+        let text = "fn add() {}\nx\n";
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut lsp = views_lsp(Arc::clone(&log));
+        let all = [View::SemanticTokens, View::InlayHints, View::Symbols];
+        lsp.sync(&[(&file, text)], Some(&root), find_rust);
+
+        // All three views arrive once the server is ready, then semantic
+        // tokens again after the server's refresh request.
+        let (mut tokens, mut hints, mut symbols) = (0, None, None);
+        poll_until(&mut lsp, |l, events| {
+            l.refresh_views(&file, &all);
+            for e in events {
+                match e {
+                    LspEvent::SemanticTokens {
+                        tokens: t,
+                        text: at,
+                        ..
+                    } => {
+                        assert_eq!(&**at, text);
+                        assert_eq!(t[0].range, 3..6);
+                        tokens += 1;
+                    }
+                    LspEvent::InlayHints { hints: h, .. } => hints = Some(h[0].at),
+                    LspEvent::DocumentSymbols {
+                        symbols: s,
+                        open_picker,
+                        ..
+                    } => {
+                        assert!(!open_picker);
+                        symbols = Some(s[0].selection.clone());
+                    }
+                    _ => {}
+                }
+            }
+            tokens >= 2 && hints.is_some() && symbols.is_some()
+        });
+        assert_eq!(hints, Some(6));
+        assert_eq!(symbols, Some(3..6));
+
+        // Nothing changed, so nothing more is asked for.
+        let count = |log: &Arc<Mutex<Vec<Value>>>, method: &str| {
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|m| m["method"] == method)
+                .count()
+        };
+        lsp.refresh_views(&file, &all);
+        assert_eq!(count(&log, "textDocument/semanticTokens/full"), 2);
+        assert_eq!(count(&log, "textDocument/inlayHint"), 1);
+
+        // An edit is asked about only after typing pauses.
+        let edited = "fn add() {} \nx\n";
+        lsp.sync(&[(&file, edited)], Some(&root), find_rust);
+        lsp.refresh_views(&file, &all);
+        assert_eq!(count(&log, "textDocument/inlayHint"), 1, "debounced");
+        std::thread::sleep(VIEW_DELAY + Duration::from_millis(20));
+        lsp.refresh_views(&file, &all);
+        // The fake server logs requests on its own thread.
+        poll_until(&mut lsp, |_, _| count(&log, "textDocument/inlayHint") == 2);
+
+        // Code actions carry the diagnostics under the range.
+        lsp.code_actions(&file, edited, 4..4).unwrap();
+        let mut actions = None;
+        poll_until(&mut lsp, |_, events| {
+            for e in events {
+                if let LspEvent::CodeActions { actions: a, at, .. } = e {
+                    assert_eq!(*at, 4);
+                    actions = Some(a.len());
+                }
+            }
+            actions.is_some()
+        });
+        assert_eq!(actions, Some(2));
+        let request = log
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|m| m["method"] == "textDocument/codeAction")
+            .cloned()
+            .unwrap();
+        let diagnostics = request["params"]["context"]["diagnostics"]
+            .as_array()
+            .unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0]["message"], "bad");
+
+        // An action without an edit is resolved to get one.
+        let bare: CodeAction =
+            serde_json::from_value(json!({ "title": "Rename to sum", "data": 7 })).unwrap();
+        assert!(lsp.resolve_code_action(&file, edited, &bare).unwrap());
+        let mut resolved = None;
+        poll_until(&mut lsp, |_, events| {
+            for e in events {
+                if let LspEvent::CodeActionResolved { action, .. } = e {
+                    resolved = Some(action.clone());
+                }
+            }
+            resolved.is_some()
+        });
+        let resolved = resolved.unwrap();
+        assert_eq!(
+            resolved.data,
+            Some(json!(7)),
+            "the server gets its data back"
+        );
+        let (files, _) = workspace_edit_files(resolved.edit.unwrap());
+        assert_eq!(files[0].0, file);
+        assert_eq!(files[0].1[0].new_text, "sum");
+
+        // Signature help, opened by `(`.
+        assert_eq!(lsp.signature_triggers(&file), (vec!['('], vec![',']));
+        lsp.signature_help(&file, edited, 7, Some('('), false)
+            .unwrap();
+        let mut help = None;
+        poll_until(&mut lsp, |_, events| {
+            for e in events {
+                if let LspEvent::SignatureHelp { help: h, .. } = e {
+                    help = h.clone();
+                }
+            }
+            help.is_some()
+        });
+        assert_eq!(help.unwrap().active_parameter, Some(1));
+
+        // Workspace symbols from every server that has them.
+        assert_eq!(lsp.workspace_symbols("ad"), 1);
+        let mut found = None;
+        poll_until(&mut lsp, |_, events| {
+            for e in events {
+                if let LspEvent::WorkspaceSymbols { query, symbols } = e {
+                    assert_eq!(query, "ad");
+                    found = symbols
+                        .first()
+                        .map(|s| (s.name.clone(), s.location.path.clone()));
+                }
+            }
+            found.is_some()
+        });
+        assert_eq!(found, Some(("add".to_owned(), file.clone())));
+    }
+
     #[test]
     fn splits_workspace_edits_by_file() {
         let a = std::env::temp_dir().join("a.rs");
@@ -1439,6 +2245,113 @@ mod clangd_tests {
         println!("formatted: {formatted:?}");
         assert_ne!(formatted, messy);
         assert!(formatted.starts_with("int main(void)"));
+
+        drop(lsp);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "needs clangd installed"]
+    fn clangd_code_actions_symbols_hints_and_tokens() {
+        let spec = catalog::find("clangd").unwrap();
+        let exe = detect::detect_server(spec).expect("clangd is not installed");
+        let dir = std::env::temp_dir().join(format!("forge-clangd-views-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("main.c");
+        let text = "int add(int a, int b) { return a + b; }\nint main(void) {\n  int total = add(1, 2);\n  return totl;\n}\n";
+        std::fs::write(&file, text).unwrap();
+        let find = |name: &str| name.ends_with(".c").then(|| (spec, exe.clone()));
+
+        let mut lsp = Lsp::new(egui::Context::default());
+        lsp.sync(&[(&file, text)], Some(&dir), find);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while lsp.problems(&file, text).is_empty() {
+            lsp.poll();
+            assert!(Instant::now() < deadline, "no diagnostics from clangd");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // The quick fix for the typo replaces `totl` with `total`.
+        let typo = text.find("totl").unwrap();
+        lsp.code_actions(&file, text, typo..typo).unwrap();
+        let (actions, enc) = wait_for(&mut lsp, |_, e| match e {
+            LspEvent::CodeActions {
+                actions, encoding, ..
+            } => Some((actions, encoding)),
+            _ => None,
+        });
+        println!("code actions: {actions:?}");
+        let fix = actions
+            .into_iter()
+            .find_map(|a| match a {
+                CodeActionOrCommand::CodeAction(a) if a.edit.is_some() => Some(a),
+                _ => None,
+            })
+            .expect("a quick fix with an edit");
+        let (files, _) = workspace_edit_files(fix.edit.unwrap());
+        let fixed = crate::lsp::text::apply_edits(
+            text,
+            &crate::lsp::text::char_edits(text, &files[0].1, enc),
+        );
+        assert!(fixed.contains("return total;"), "{fixed}");
+
+        // Signature help inside the call, on the second argument.
+        let arg = text.find("2);").unwrap();
+        lsp.signature_help(&file, text, arg, None, false).unwrap();
+        let help = wait_for(&mut lsp, |_, e| match e {
+            LspEvent::SignatureHelp { help, encoding, .. } => Some(help.map(|h| (h, encoding))),
+            _ => None,
+        });
+        let (help, enc) = help.expect("signature help in a call");
+        let sig = &help.signatures[0];
+        let param = sig.active_parameter.or(help.active_parameter).unwrap();
+        let label = &sig.parameters.as_ref().unwrap()[param as usize].label;
+        let range = crate::lsp::features::parameter_range(&sig.label, label, enc).unwrap();
+        assert_eq!(&sig.label[range], "int b");
+
+        // Views: symbols, inlay hints (parameter names), semantic tokens.
+        let all = [View::SemanticTokens, View::InlayHints, View::Symbols];
+        let (mut symbols, mut hints, mut tokens) = (None, None, None);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while symbols.is_none() || hints.is_none() || tokens.is_none() {
+            assert!(Instant::now() < deadline, "views never arrived");
+            lsp.refresh_views(&file, &all);
+            for e in lsp.poll() {
+                match e {
+                    LspEvent::DocumentSymbols { symbols: s, .. } => symbols = Some(s),
+                    LspEvent::InlayHints { hints: h, .. } => hints = Some(h),
+                    LspEvent::SemanticTokens { tokens: t, .. } => tokens = Some(t),
+                    _ => {}
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let names: Vec<_> = symbols.unwrap().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, ["add", "main"]);
+        let hints = hints.unwrap();
+        println!("hints: {hints:?}");
+        let first_arg = text.find("1, 2").unwrap();
+        assert!(
+            hints
+                .iter()
+                .any(|h| h.at == first_arg && h.label.trim().trim_end_matches(':') == "a"),
+            "{hints:?}"
+        );
+        let tokens = tokens.unwrap();
+        let call = text.find("add(1").unwrap();
+        let at_call = tokens
+            .iter()
+            .find(|t| t.range.start == call)
+            .expect("token for the call");
+        assert_eq!(&*at_call.kind, "function");
+
+        // Workspace symbols find `main` in the open file.
+        assert_eq!(lsp.workspace_symbols("main"), 1);
+        let found = wait_for(&mut lsp, |_, e| match e {
+            LspEvent::WorkspaceSymbols { symbols, .. } => Some(symbols),
+            _ => None,
+        });
+        assert!(found.iter().any(|s| s.name == "main"), "{found:?}");
 
         drop(lsp);
         let _ = std::fs::remove_dir_all(&dir);

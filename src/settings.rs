@@ -33,6 +33,10 @@ pub struct Settings {
     pub word_wrap: bool,
     /// Show line numbers in the editor gutter.
     pub line_numbers: bool,
+    /// Show the language server's inline type and parameter-name hints.
+    pub inlay_hints: bool,
+    /// Show the file path and enclosing symbols above the editor.
+    pub breadcrumbs: bool,
     /// Shell for the integrated terminal, with optional arguments (e.g. `"bash --login"`).
     /// Defaults to PowerShell on Windows and `$SHELL` elsewhere.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -70,6 +74,8 @@ impl Default for Settings {
             font_size: DEFAULT_FONT_SIZE,
             word_wrap: false,
             line_numbers: true,
+            inlay_hints: true,
+            breadcrumbs: true,
             terminal_shell: None,
             recent_folders: Vec::new(),
             sessions: Vec::new(),
@@ -279,6 +285,8 @@ mod tests {
             font_size: 16.0,
             word_wrap: true,
             line_numbers: false,
+            inlay_hints: false,
+            breadcrumbs: false,
             terminal_shell: Some("bash --login".into()),
             ..Settings::default()
         };

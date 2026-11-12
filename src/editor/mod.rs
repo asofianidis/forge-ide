@@ -2,6 +2,7 @@
 
 mod buffer;
 pub mod conflicts;
+pub mod decorate;
 mod document;
 pub mod find;
 pub mod gutter;
