@@ -208,6 +208,15 @@ impl Ai {
         Some(id)
     }
 
+    /// Moves a thread into (or out of) the Archived section.
+    pub fn set_archived(&mut self, id: &str, archived: bool) {
+        if let Some(t) = self.thread_mut(id) {
+            t.archived = archived;
+            self.dirty = true;
+            self.save();
+        }
+    }
+
     /// Deletes the thread; with `remove_worktree`, also its worktree folder
     /// (its branch is kept).
     pub fn delete_thread_and_worktree(&mut self, id: &str) {
@@ -267,6 +276,8 @@ impl Ai {
         let t = self.thread_mut(id).ok_or("thread not found")?;
         // A placeholder until the generated title arrives.
         t.set_title_from(&text);
+        // Talking to an archived thread brings it back.
+        t.archived = false;
         t.messages.push(Message::User { text: text.clone() });
         t.updated = thread::now();
         if needs_worktree {

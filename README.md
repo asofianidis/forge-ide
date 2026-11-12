@@ -143,7 +143,11 @@ using your own sign-in and subscription: [Claude Code](https://docs.anthropic.co
 [Codex](https://github.com/openai/codex) (`codex`). Forge never sees an API key.
 
 - **Threads**: each conversation works in the open folder and is listed in the sidebar for that
-  folder. The text model names each thread from its first message (rename it by hand any time). Threads open as tabs and show the agent's replies, tool calls (expand for output) and
+  folder. The text model names each thread from its first message (rename it by hand any time).
+  The sidebar groups them into **Working**, **Done** and a collapsed **Archived** section;
+  right-click a thread to archive or unarchive it (sending it a message also brings it back).
+  Replies render Markdown, including tables, and common HTML (`<b>`, `<a>`, `<br>`, `<table>`,
+  `<details>`, …). Threads open as tabs and show the agent's replies, tool calls (expand for output) and
   cost. Later messages resume the same CLI session. Stop a running turn at any time.
 - **Worktrees**: before a thread's first message, the **⎇ Local / ⎇ New worktree** switch under
   the message box picks where it runs. A worktree thread gets its own branch (from your current
@@ -151,6 +155,7 @@ using your own sign-in and subscription: [Claude Code](https://docs.anthropic.co
   The branch is renamed after the thread's title (e.g. `forge/fix-login-redirect`), and the
   commit / push / PR button acts on it. Right-click the thread to open the worktree in a new
   window or delete it with the thread (its branch is kept). Your last choice is the default.
+- **Settings** shows which agent CLIs were found (✓/✗, ⟳ to look again).
 - **Default models** are set in **Settings** (Ctrl+,): the *Default AI model* (and access) new
   threads start with, and the *Commit & PR text model*.
 - **Model picker** (the pill under each thread's message box) switches the model for that thread

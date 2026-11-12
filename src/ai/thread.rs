@@ -102,6 +102,9 @@ pub struct Thread {
     /// The worktree the agent works in, once created.
     #[serde(default)]
     pub worktree: Option<super::worktree::WorktreeInfo>,
+    /// Put away in the sidebar's Archived section.
+    #[serde(default)]
+    pub archived: bool,
 }
 
 pub fn now() -> u64 {
@@ -132,6 +135,7 @@ impl Thread {
             project: None,
             use_worktree: false,
             worktree: None,
+            archived: false,
         }
     }
 

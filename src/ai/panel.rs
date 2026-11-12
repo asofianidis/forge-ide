@@ -68,6 +68,18 @@ impl GitSummary {
     }
 }
 
+/// A sidebar row: id, title, model line, last activity, running, worktree
+/// folder, archived.
+type ThreadItem = (
+    String,
+    String,
+    String,
+    u64,
+    bool,
+    Option<std::path::PathBuf>,
+    bool,
+);
+
 pub enum SidebarAction {
     /// Open a folder (a thread's worktree) in another Forge window.
     OpenFolderInNewWindow(std::path::PathBuf),
@@ -107,9 +119,6 @@ impl Ai {
         ui.horizontal(|ui| {
             ui.label(RichText::new("BYO AI").strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if icons::button(ui, Icon::Refresh, "Look for installed CLIs again").clicked() {
-                    self.redetect();
-                }
                 let can_create = self.folder.is_some();
                 let plus =
                     ui.add_enabled_ui(can_create, |ui| icons::button(ui, Icon::Plus, "New thread"));
@@ -137,16 +146,7 @@ impl Ai {
             }
         }
 
-        section(ui, "THREADS", colors);
-        type Item = (
-            String,
-            String,
-            String,
-            u64,
-            bool,
-            Option<std::path::PathBuf>,
-        );
-        let list: Vec<Item> = self
+        let list: Vec<ThreadItem> = self
             .folder_threads()
             .into_iter()
             .map(|t| {
@@ -160,156 +160,164 @@ impl Ai {
                     t.updated,
                     self.is_running(&t.id),
                     t.worktree.as_ref().map(|w| w.path.clone()),
+                    t.archived,
                 )
             })
             .collect();
-        let list_height = (ui.available_height() - 210.0).max(120.0);
+        // Running threads first, then finished ones, then the archive.
+        let working: Vec<ThreadItem> = list.iter().filter(|t| t.4).cloned().collect();
+        let done: Vec<ThreadItem> = list.iter().filter(|t| !t.4 && !t.6).cloned().collect();
+        let archived: Vec<ThreadItem> = list.iter().filter(|t| !t.4 && t.6).cloned().collect();
         egui::ScrollArea::vertical()
             .id_salt("ai_threads")
-            .max_height(list_height)
-            .auto_shrink([false, true])
+            .auto_shrink([false, false])
             .show(ui, |ui| {
                 if list.is_empty() {
+                    section(ui, "THREADS", colors);
                     ui.label(
                         RichText::new("No threads in this folder yet. Press + to start one.")
                             .small()
                             .color(colors.text_muted.0),
                     );
                 }
-                for (id, title, model, updated, running, wt_path) in &list {
-                    if let Some((rid, name)) = &mut self.renaming
-                        && rid == id
-                    {
-                        let r =
-                            ui.add(egui::TextEdit::singleline(name).desired_width(f32::INFINITY));
-                        r.request_focus();
-                        let enter = ui.input(|i| i.key_pressed(Key::Enter));
-                        if enter || r.lost_focus() {
-                            let (rid, name) = self.renaming.take().unwrap();
-                            if enter && !name.trim().is_empty() {
-                                if let Some(t) = self.thread_mut(&rid) {
-                                    t.title = name.trim().to_owned();
-                                    t.title_locked = true;
-                                }
-                                self.dirty = true;
-                                self.save();
-                            }
-                        }
-                        continue;
-                    }
-                    let (rect, response) =
-                        ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::click());
-                    if response.hovered() {
-                        ui.painter().rect_filled(rect, 6.0, colors.widget.0);
-                    }
-                    let left = rect.left() + 8.0;
-                    let mut title_right = rect.right() - 8.0;
-                    let when = crate::ui::fmt::relative_time(*updated as i64);
-                    let time = ui.painter().layout_no_wrap(
-                        when,
-                        egui::FontId::proportional(11.0),
-                        colors.text_muted.0,
-                    );
-                    title_right -= time.size().x;
-                    ui.painter().galley(
-                        egui::pos2(title_right, rect.top() + 5.0),
-                        time,
-                        colors.text_muted.0,
-                    );
-                    if *running {
-                        let s = egui::Rect::from_center_size(
-                            egui::pos2(title_right - 10.0, rect.top() + 12.0),
-                            vec2(12.0, 12.0),
-                        );
-                        egui::Spinner::new().size(12.0).paint_at(ui, s);
-                        title_right -= 20.0;
-                    }
-                    let font = egui::TextStyle::Body.resolve(ui.style());
-                    let mut job = egui::text::LayoutJob::simple_singleline(
-                        title.clone(),
-                        font,
-                        colors.text.0,
-                    );
-                    job.wrap =
-                        egui::text::TextWrapping::truncate_at_width(title_right - left - 6.0);
-                    let g = ui.fonts_mut(|f| f.layout_job(job));
-                    ui.painter()
-                        .galley(egui::pos2(left, rect.top() + 3.0), g, colors.text.0);
-                    let mut job = egui::text::LayoutJob::simple_singleline(
-                        model.clone(),
-                        egui::FontId::proportional(11.0),
-                        colors.text_muted.0,
-                    );
-                    job.wrap = egui::text::TextWrapping::truncate_at_width(rect.width() - 16.0);
-                    let g = ui.fonts_mut(|f| f.layout_job(job));
-                    ui.painter().galley(
-                        egui::pos2(left, rect.top() + 22.0),
-                        g,
-                        colors.text_muted.0,
-                    );
-                    if response.clicked() {
-                        actions.push(SidebarAction::OpenThread(id.clone()));
-                    }
-                    response.context_menu(|ui| {
-                        if ui.button("Open").clicked() {
-                            actions.push(SidebarAction::OpenThread(id.clone()));
-                        }
-                        if ui.button("Rename…").clicked() {
-                            self.renaming = Some((id.clone(), title.clone()));
-                        }
-                        if *running && ui.button("Stop").clicked() {
-                            self.stop(id);
-                        }
-                        if let Some(path) = wt_path {
-                            if ui.button("Open worktree in new window").clicked() {
-                                actions.push(SidebarAction::OpenFolderInNewWindow(path.clone()));
-                            }
-                            if ui.button("Copy worktree path").clicked() {
-                                ui.ctx().copy_text(path.display().to_string());
-                            }
-                        }
-                        ui.separator();
-                        if ui.button("Delete").clicked() {
-                            self.delete_thread(id);
-                            actions.push(SidebarAction::ThreadDeleted(id.clone()));
-                        }
-                        if wt_path.is_some()
-                            && ui
-                                .button("Delete thread and worktree")
-                                .on_hover_text(
-                                    "Also removes the worktree folder. Its branch is kept.",
-                                )
-                                .clicked()
-                        {
-                            self.delete_thread_and_worktree(id);
-                            actions.push(SidebarAction::ThreadDeleted(id.clone()));
-                        }
+                if !working.is_empty() {
+                    section(ui, &format!("WORKING · {}", working.len()), colors);
+                    self.thread_rows(ui, &working, colors, &mut actions);
+                }
+                if !done.is_empty() {
+                    section(ui, &format!("DONE · {}", done.len()), colors);
+                    self.thread_rows(ui, &done, colors, &mut actions);
+                }
+                if !archived.is_empty() {
+                    ui.add_space(6.0);
+                    egui::CollapsingHeader::new(
+                        RichText::new(format!("ARCHIVED · {}", archived.len()))
+                            .small()
+                            .strong()
+                            .color(colors.text_muted.0),
+                    )
+                    .id_salt("ai_archived")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        self.thread_rows(ui, &archived, colors, &mut actions);
                     });
                 }
             });
-
-        ui.add_space(4.0);
-        ui.separator();
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 10.0;
-            for p in Provider::ALL {
-                let (text, color, tip) = match self.exe(p) {
-                    Some(path) => ("✓", colors.added.0, path.display().to_string()),
-                    None => (
-                        "✗",
-                        colors.text_muted.0,
-                        format!("Not installed. {}", p.install_hint()),
-                    ),
-                };
-                ui.label(
-                    RichText::new(format!("{text} {}", p.name()))
-                        .small()
-                        .color(color),
-                )
-                .on_hover_text(tip);
-            }
-        });
         actions
+    }
+
+    /// Thread rows in the sidebar: title, time, model; right-click for more.
+    fn thread_rows(
+        &mut self,
+        ui: &mut Ui,
+        list: &[ThreadItem],
+        colors: &UiColors,
+        actions: &mut Vec<SidebarAction>,
+    ) {
+        for (id, title, model, updated, running, wt_path, archived) in list {
+            if let Some((rid, name)) = &mut self.renaming
+                && rid == id
+            {
+                let r = ui.add(egui::TextEdit::singleline(name).desired_width(f32::INFINITY));
+                r.request_focus();
+                let enter = ui.input(|i| i.key_pressed(Key::Enter));
+                if enter || r.lost_focus() {
+                    let (rid, name) = self.renaming.take().unwrap();
+                    if enter && !name.trim().is_empty() {
+                        if let Some(t) = self.thread_mut(&rid) {
+                            t.title = name.trim().to_owned();
+                            t.title_locked = true;
+                        }
+                        self.dirty = true;
+                        self.save();
+                    }
+                }
+                continue;
+            }
+            let (rect, response) =
+                ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::click());
+            if response.hovered() {
+                ui.painter().rect_filled(rect, 6.0, colors.widget.0);
+            }
+            let left = rect.left() + 8.0;
+            let mut title_right = rect.right() - 8.0;
+            let when = crate::ui::fmt::relative_time(*updated as i64);
+            let time = ui.painter().layout_no_wrap(
+                when,
+                egui::FontId::proportional(11.0),
+                colors.text_muted.0,
+            );
+            title_right -= time.size().x;
+            ui.painter().galley(
+                egui::pos2(title_right, rect.top() + 5.0),
+                time,
+                colors.text_muted.0,
+            );
+            if *running {
+                let s = egui::Rect::from_center_size(
+                    egui::pos2(title_right - 10.0, rect.top() + 12.0),
+                    vec2(12.0, 12.0),
+                );
+                egui::Spinner::new().size(12.0).paint_at(ui, s);
+                title_right -= 20.0;
+            }
+            let font = egui::TextStyle::Body.resolve(ui.style());
+            let mut job =
+                egui::text::LayoutJob::simple_singleline(title.clone(), font, colors.text.0);
+            job.wrap = egui::text::TextWrapping::truncate_at_width(title_right - left - 6.0);
+            let g = ui.fonts_mut(|f| f.layout_job(job));
+            ui.painter()
+                .galley(egui::pos2(left, rect.top() + 3.0), g, colors.text.0);
+            let mut job = egui::text::LayoutJob::simple_singleline(
+                model.clone(),
+                egui::FontId::proportional(11.0),
+                colors.text_muted.0,
+            );
+            job.wrap = egui::text::TextWrapping::truncate_at_width(rect.width() - 16.0);
+            let g = ui.fonts_mut(|f| f.layout_job(job));
+            ui.painter()
+                .galley(egui::pos2(left, rect.top() + 22.0), g, colors.text_muted.0);
+            if response.clicked() {
+                actions.push(SidebarAction::OpenThread(id.clone()));
+            }
+            response.context_menu(|ui| {
+                if ui.button("Open").clicked() {
+                    actions.push(SidebarAction::OpenThread(id.clone()));
+                }
+                if ui.button("Rename…").clicked() {
+                    self.renaming = Some((id.clone(), title.clone()));
+                }
+                let archive = if *archived { "Unarchive" } else { "Archive" };
+                if ui.button(archive).clicked() {
+                    self.set_archived(id, !*archived);
+                }
+                if *running && ui.button("Stop").clicked() {
+                    self.stop(id);
+                }
+                if let Some(path) = wt_path {
+                    if ui.button("Open worktree in new window").clicked() {
+                        actions.push(SidebarAction::OpenFolderInNewWindow(path.clone()));
+                    }
+                    if ui.button("Copy worktree path").clicked() {
+                        ui.ctx().copy_text(path.display().to_string());
+                    }
+                }
+                ui.separator();
+                if ui.button("Delete").clicked() {
+                    self.delete_thread(id);
+                    actions.push(SidebarAction::ThreadDeleted(id.clone()));
+                }
+                if wt_path.is_some()
+                    && ui
+                        .button("Delete thread and worktree")
+                        .on_hover_text("Also removes the worktree folder. Its branch is kept.")
+                        .clicked()
+                {
+                    self.delete_thread_and_worktree(id);
+                    actions.push(SidebarAction::ThreadDeleted(id.clone()));
+                }
+            });
+        }
     }
 
     /// The one-click git split button for the tab bar, laid out right to
@@ -487,6 +495,46 @@ impl Ai {
             settings.text = Some(text);
             changed = true;
         }
+        ui.end_row();
+
+        ui.label("Agent CLIs")
+            .on_hover_text("The command-line agents BYO AI found on this machine");
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 12.0;
+            for p in Provider::ALL {
+                match self.exe(p) {
+                    Some(path) => {
+                        ui.label(
+                            RichText::new(format!("✓ {}", p.name()))
+                                .small()
+                                .color(colors.added.0),
+                        )
+                        .on_hover_text(path.display().to_string());
+                    }
+                    None => {
+                        let r = ui
+                            .add(
+                                egui::Label::new(
+                                    RichText::new(format!("✗ {}", p.name()))
+                                        .small()
+                                        .color(colors.text_muted.0),
+                                )
+                                .sense(Sense::click()),
+                            )
+                            .on_hover_text(format!(
+                                "Not installed. Click to copy the install command:\n{}",
+                                p.install_hint()
+                            ));
+                        if r.clicked() {
+                            ui.ctx().copy_text(p.install_hint().to_owned());
+                        }
+                    }
+                }
+            }
+            if icons::button(ui, Icon::Refresh, "Look for installed CLIs again").clicked() {
+                self.redetect();
+            }
+        });
         ui.end_row();
         changed
     }
