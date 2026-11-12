@@ -19,7 +19,7 @@ use lsp_types::{
 
 use super::ForgeApp;
 use super::editing::editor_id;
-use crate::editor::ops::{self, Selection};
+use crate::editor::ops::Selection;
 use crate::fuzzy;
 use crate::lsp::text::{self, CharEdit, Encoding, LineIndex};
 use crate::lsp::{
@@ -207,7 +207,7 @@ impl ForgeApp {
 
     /// Applies `edits` to a document, keeping its caret and selection on the
     /// same text.
-    fn edit_document(&mut self, ctx: &egui::Context, idx: usize, edits: &[CharEdit]) {
+    pub(super) fn edit_document(&mut self, ctx: &egui::Context, idx: usize, edits: &[CharEdit]) {
         let Some(doc) = self.documents.get_mut(idx) else {
             return;
         };
@@ -1046,8 +1046,8 @@ impl ForgeApp {
             return false;
         };
         let text = doc.text().to_owned();
-        let indent = ops::indent_unit(&text);
-        match self.lsp.format(&path, &text, &indent, then_save) {
+        let options = crate::lsp::FormatOptions::for_document(doc);
+        match self.lsp.format(&path, &text, &options, then_save) {
             Ok(()) => {
                 self.language.formatting = Some(FormatRequest {
                     path,
@@ -1181,9 +1181,9 @@ impl ForgeApp {
             0.0,
             TextFormat::simple(font, text_color),
         );
-        let shortcut = crate::commands::Command::ShowProblems
-            .shortcuts()
-            .first()
+        let shortcut = self
+            .keymap
+            .shortcut(crate::commands::Command::ShowProblems)
             .map(|s| format!(" ({})", ui.ctx().format_shortcut(s)))
             .unwrap_or_default();
         if ui
