@@ -448,33 +448,36 @@ pub fn themes_dir() -> Option<PathBuf> {
     config_dir().map(|d| d.join("themes"))
 }
 
-/// All available themes: built-ins first, then custom themes from `dir`
-/// sorted by name. Files that fail to load are reported in the returned
-/// error list instead of aborting.
-pub fn load_all(dir: Option<&Path>) -> (Vec<Theme>, Vec<String>) {
+/// All available themes: built-ins first, then themes from `extra` files
+/// (contributed by extensions) and custom themes from `dir`, sorted by name.
+/// A later theme with the same name replaces an earlier one, so the user's
+/// own files win. Files that fail to load are reported in the returned error
+/// list instead of aborting.
+pub fn load_all(dir: Option<&Path>, extra: &[PathBuf]) -> (Vec<Theme>, Vec<String>) {
     let mut themes = Theme::builtins();
     let mut errors = Vec::new();
-    let Some(dir) = dir else {
-        return (themes, errors);
-    };
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return (themes, errors);
-    };
-    let mut paths: Vec<PathBuf> = entries
+    let mut paths: Vec<PathBuf> = dir
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .into_iter()
+        .flatten()
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|e| e == "toml"))
         .collect();
     paths.sort();
+    let paths = extra.iter().cloned().chain(paths);
 
-    let mut custom = Vec::new();
+    let mut custom: Vec<Theme> = Vec::new();
     for path in paths {
         let result = std::fs::read_to_string(&path)
             .with_context(|| "could not read file".to_owned())
             .and_then(|src| Theme::from_toml(&src, &themes));
         match result {
             Ok(theme) => {
-                // A custom theme with a built-in's name replaces it.
-                if let Some(existing) = themes.iter_mut().find(|t| t.name == theme.name) {
+                if let Some(existing) = themes
+                    .iter_mut()
+                    .chain(custom.iter_mut())
+                    .find(|t| t.name == theme.name)
+                {
                     *existing = theme;
                 } else {
                     custom.push(theme);

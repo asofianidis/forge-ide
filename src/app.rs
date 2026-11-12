@@ -1,15 +1,21 @@
 //! Top-level application state and UI layout.
 
+mod code_actions;
 mod editing;
 mod explorer;
+mod extension_ui;
 mod find_bar;
 mod groups;
 mod language;
+mod markdown_preview;
 mod pickers;
 mod preferences;
 mod search_panel;
 mod session;
+mod signature;
+mod symbols;
 mod terminal_panel;
+mod views;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -26,10 +32,12 @@ use crate::editor::scm::{self, EditorAction, EditorGit, Peek};
 use crate::editor::view::{EditorView, Reveal};
 use crate::editor::widget::{EditorConfig, EditorWidget};
 use crate::editor::{DiskEvent, DiskState, Document, Highlighter, gutter};
+use crate::extensions::{self, Extensions, install as extension_install};
 use crate::git::{self, PanelAction, ScmPanel, SourceControl};
 use crate::github::model::{CheckOutcome, WorkflowRun};
 use crate::github::{BranchContext, GhEvent, GitHub, ListAction, PrListPanel};
 use crate::history::{HistoryPane, RebasePane};
+use crate::keymap::Keymap;
 use crate::lsp::{Feature, Lsp, ServerBrowser, ServerManager};
 use crate::palette::Picker;
 use crate::panes::{ChangesPane, CommitPane, LogPane, Pane, PaneAction};
@@ -43,6 +51,7 @@ use crate::watcher::FsWatcher;
 use crate::workspace::{FileKinds, Workspace};
 
 use explorer::ExplorerDialog;
+use extension_ui::ExtensionUi;
 use find_bar::FindBar;
 use groups::EditorGroup;
 use language::{EditorFrame, LanguageUi};
@@ -66,6 +75,13 @@ enum PendingClose {
     /// Closing the last tab of the document with this id.
     Tab(u64),
     Window,
+}
+
+/// What a keyboard shortcut runs.
+enum Shortcut {
+    Builtin(Command),
+    /// An extension command (qualified id), and whether it edits the text.
+    Extension(String, bool),
 }
 
 /// The user's answer in the unsaved-changes dialog.
@@ -159,12 +175,36 @@ pub struct ForgeApp {
     focus_editor: bool,
     /// Merge conflicts found per text version.
     conflict_cache: Vec<(u64, Vec<conflicts::Conflict>)>,
+    /// Installed extensions.
+    extensions: Extensions,
+    /// Extension commands running, dialogs and the Extensions view.
+    ext: ExtensionUi,
+    /// Keyboard shortcuts: the defaults plus the user's `[keybindings]`.
+    keymap: Keymap,
+    /// The keybindings the keymap was built from, to rebuild it when they change.
+    keymap_source: std::collections::BTreeMap<String, crate::keymap::Keys>,
+    /// The Keyboard Shortcuts window is showing, with this filter text.
+    keybindings_filter: Option<String>,
+    /// Ids of the Markdown documents showing a preview beside the editor.
+    markdown_preview: HashSet<u64>,
 }
 
 impl ForgeApp {
     pub fn new(cc: &eframe::CreationContext<'_>, root: Option<PathBuf>) -> Self {
         let settings = Settings::load();
-        let (themes, errors) = theme::load_all(theme::themes_dir().as_deref());
+        let (keymap, keymap_errors) = Keymap::new(&settings.keybindings);
+        let keymap_source = settings.keybindings.clone();
+        let extensions_dir = extensions::extensions_dir();
+        if let Some(dir) = &extensions_dir {
+            extension_install::clean_up(dir);
+        }
+        let extensions = Extensions::load(
+            extensions_dir,
+            &settings.disabled_extensions,
+            keymap.table(),
+        );
+        let (themes, errors) =
+            theme::load_all(theme::themes_dir().as_deref(), &extensions.theme_files());
         let wanted = settings
             .theme
             .clone()
@@ -216,7 +256,9 @@ impl ForgeApp {
             highlighter: Highlighter::new(themes[idx].syntect_theme()),
             theme: idx,
             themes,
-            status: theme_errors_status(&errors).unwrap_or_else(|| "Ready".to_owned()),
+            status: theme_errors_status(&errors)
+                .or_else(|| keymap_errors_status(&keymap_errors))
+                .unwrap_or_else(|| "Ready".to_owned()),
             cursor: (1, 1),
             servers: ServerManager::new(cc.egui_ctx.clone()),
             server_browser: ServerBrowser::default(),
@@ -248,6 +290,12 @@ impl ForgeApp {
             terminal: TerminalPanel::default(),
             conflict_cache: Vec::new(),
             focus_editor: true,
+            extensions,
+            ext: ExtensionUi::default(),
+            keymap_source,
+            keymap,
+            keybindings_filter: None,
+            markdown_preview: HashSet::new(),
         };
         if let Some(folder) = folder {
             app.folder_opened(&folder);
@@ -369,7 +417,10 @@ impl ForgeApp {
 
     fn reload_themes(&mut self, ctx: &egui::Context) {
         let name = self.current_theme().name.clone();
-        let (themes, errors) = theme::load_all(theme::themes_dir().as_deref());
+        let (themes, errors) = theme::load_all(
+            theme::themes_dir().as_deref(),
+            &self.extensions.theme_files(),
+        );
         self.themes = themes;
         self.theme = self.themes.iter().position(|t| t.name == name).unwrap_or(0);
         let theme = &self.themes[self.theme];
@@ -496,6 +547,7 @@ impl ForgeApp {
             (Pane::PullRequest(a), Pane::PullRequest(b)) => a.number == b.number,
             (Pane::History(a), Pane::History(b)) => a.path == b.path,
             (Pane::Log(a), Pane::Log(b)) => a.key == b.key,
+            (Pane::Markdown(a), Pane::Markdown(b)) => a.key == b.key,
             (Pane::Rebase(_), Pane::Rebase(_)) => true,
             _ => false,
         });
@@ -630,8 +682,27 @@ impl ForgeApp {
         if doc.path.is_none() {
             return self.save_as(idx);
         }
-        let result = doc.save();
+        self.apply_editorconfig(idx);
+        let result = self.documents[idx].save();
         self.finish_save(idx, result)
+    }
+
+    /// Applies the document's `.editorconfig` save rules (line endings,
+    /// trailing whitespace, final newline) as one undoable edit.
+    fn apply_editorconfig(&mut self, idx: usize) {
+        let Some(doc) = self.documents.get(idx) else {
+            return;
+        };
+        let edits: Vec<_> = doc
+            .editorconfig
+            .save_edits(doc.text())
+            .into_iter()
+            .map(|(range, text)| crate::lsp::text::CharEdit { range, text })
+            .collect();
+        if !edits.is_empty() {
+            let ctx = self.egui_ctx.clone();
+            self.edit_document(&ctx, idx, &edits);
+        }
     }
 
     /// Saves a document under a path picked in the save dialog. The tab then
@@ -655,10 +726,13 @@ impl ForgeApp {
         let path = std::path::absolute(&path).unwrap_or(path);
         let doc = &mut self.documents[idx];
         let old = doc.path.clone();
-        let result = doc.save_as(path.clone());
+        doc.set_path(Some(path.clone()));
+        self.apply_editorconfig(idx);
+        let doc = &mut self.documents[idx];
+        let result = doc.save();
         if result.is_err() {
             // Keep pointing at the old file rather than one never written.
-            doc.path = old;
+            doc.set_path(old);
             return self.finish_save(idx, result);
         }
         if let Some(dir) = path.parent() {
@@ -700,6 +774,7 @@ impl ForgeApp {
                         self.reload_settings(&ctx);
                     }
                 }
+                self.run_save_hooks(idx);
                 true
             }
             Err(e) => {
@@ -920,19 +995,48 @@ impl ForgeApp {
         // Editing shortcuts only apply when typing in the editor, so that
         // e.g. Alt+Up in the find field doesn't move lines.
         // A diff / PR / history tab hides the document, so it can't be edited.
-        let pane_shown = self.group == 0 && self.active_pane.is_some();
+        let pane_shown = self.pane_shown();
         let editor_focused = !pane_shown
             && (self.editor_has_focus(ctx)
                 || (ctx.memory(|m| m.focused().is_none())
                     && !self.picker.open
                     && self.go_to_line.is_none()));
-        for (cmd, shortcut) in Command::shortcut_table() {
-            if cmd.edits_text() && !editor_focused {
+        // Built-in and extension shortcuts in one table, most modifiers
+        // first, since egui matches shortcuts logically (Cmd+O also fires
+        // for Cmd+Shift+O). Built-ins win ties.
+        let mut table: Vec<(Shortcut, egui::KeyboardShortcut)> = self
+            .keymap
+            .table()
+            .iter()
+            .map(|&(c, s)| (Shortcut::Builtin(c), s))
+            .chain(self.extensions.bindings.iter().map(|b| {
+                (
+                    Shortcut::Extension(b.command.clone(), b.edits_text),
+                    b.shortcut,
+                )
+            }))
+            .collect();
+        table.sort_by_key(|(_, s)| {
+            let m = s.modifiers;
+            std::cmp::Reverse(
+                [m.alt, m.shift, m.ctrl || m.command || m.mac_cmd]
+                    .iter()
+                    .filter(|&&b| b)
+                    .count(),
+            )
+        });
+        for (target, shortcut) in table {
+            let edits_text = match &target {
+                Shortcut::Builtin(cmd) => cmd.edits_text(),
+                Shortcut::Extension(_, edits) => *edits,
+            };
+            if edits_text && !editor_focused {
                 continue;
             }
             // In the terminal, keys without Cmd/Ctrl (F8, Alt+F5, …) and
             // plain-Ctrl ones (Ctrl+R, Ctrl+G on macOS) belong to the shell.
-            if terminal_focused && cmd != Command::ToggleTerminal && !shortcut.modifiers.command {
+            let toggles_terminal = matches!(target, Shortcut::Builtin(Command::ToggleTerminal));
+            if terminal_focused && !toggles_terminal && !shortcut.modifiers.command {
                 continue;
             }
             if ctx.input_mut(|i| i.consume_shortcut(&shortcut)) {
@@ -942,7 +1046,10 @@ impl ForgeApp {
                 if m.alt && !(m.ctrl || m.command || m.mac_cmd) {
                     ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Text(_))));
                 }
-                self.run_command(ctx, cmd);
+                match target {
+                    Shortcut::Builtin(cmd) => self.run_command(ctx, cmd),
+                    Shortcut::Extension(id, _) => self.ext.pending.push(id),
+                }
             }
         }
     }
@@ -970,6 +1077,7 @@ impl ForgeApp {
             }
             Command::OpenSettings => self.settings_open = true,
             Command::OpenSettingsFile => self.open_settings_file(),
+            Command::ShowKeybindings => self.keybindings_filter = Some(String::new()),
             Command::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             Command::Undo => self.undo(ctx, false),
             Command::Redo => self.undo(ctx, true),
@@ -1012,6 +1120,11 @@ impl ForgeApp {
             Command::ShowExplorer => self.show_sidebar(SidebarView::Explorer),
             Command::ShowSourceControl => self.show_sidebar(SidebarView::SourceControl),
             Command::ShowPullRequests => self.show_sidebar(SidebarView::PullRequests),
+            Command::ShowExtensions => self.show_sidebar(SidebarView::Extensions),
+            Command::InstallExtension => self.pick_extension_zip(),
+            Command::ReloadExtensions => self.reload_extensions(ctx, true),
+            Command::OpenExtensionsFolder => self.open_extensions_folder(),
+            Command::ExtensionGuide => self.show_extension_guide(),
             Command::ToggleBlame => self.editor_git.blame_on = !self.editor_git.blame_on,
             Command::NextChange => self.change_nav = Some(1),
             Command::PreviousChange => self.change_nav = Some(-1),
@@ -1026,6 +1139,8 @@ impl ForgeApp {
             Command::RepositoryHistory => self.open_history(None),
             Command::ToggleWordWrap => self.toggle_word_wrap(),
             Command::ToggleLineNumbers => self.toggle_line_numbers(),
+            Command::ToggleMinimap => self.toggle_minimap(),
+            Command::ToggleMarkdownPreview => self.toggle_markdown_preview(),
             Command::IncreaseFontSize => self.change_font_size(ctx, Some(1.0)),
             Command::DecreaseFontSize => self.change_font_size(ctx, Some(-1.0)),
             Command::ResetFontSize => self.change_font_size(ctx, None),
@@ -1040,6 +1155,12 @@ impl ForgeApp {
                 self.status = format!("Format on save {}", if on { "on" } else { "off" });
             }
             Command::TriggerSuggest => self.trigger_suggest(ctx),
+            Command::TriggerParameterHints => self.trigger_parameter_hints(ctx),
+            Command::QuickFix => self.quick_fix(ctx),
+            Command::GoToSymbol => self.go_to_symbol(),
+            Command::GoToWorkspaceSymbol => self.go_to_workspace_symbol(),
+            Command::ToggleInlayHints => self.toggle_inlay_hints(),
+            Command::ToggleBreadcrumbs => self.toggle_breadcrumbs(),
             Command::RenameSymbol => self.open_rename(ctx),
             Command::FormatDocument => {
                 self.format_document(false);
@@ -1073,7 +1194,7 @@ impl ForgeApp {
     /// A menu entry for `cmd`, showing its shortcut. Clicking queues the command.
     fn menu_item(&mut self, ui: &mut egui::Ui, cmd: Command) {
         let mut button = egui::Button::new(cmd.label());
-        if let Some(shortcut) = cmd.shortcuts().first() {
+        if let Some(shortcut) = self.keymap.shortcut(cmd) {
             button = button.shortcut_text(ui.ctx().format_shortcut(shortcut));
         }
         let enabled = match cmd {
@@ -1083,7 +1204,7 @@ impl ForgeApp {
             ),
             Command::QuickOpen | Command::FindInProject => self.workspace.is_some(),
             Command::Undo | Command::Redo => {
-                !(self.group == 0 && self.active_pane.is_some())
+                !self.pane_shown()
                     && self.documents.get(self.active).is_some_and(|d| {
                         if cmd == Command::Undo {
                             d.buffer.can_undo()
@@ -1105,7 +1226,7 @@ impl ForgeApp {
     /// A checkbox menu entry for a toggle command, showing its shortcut on hover.
     fn menu_checkbox(&mut self, ui: &mut egui::Ui, cmd: Command, value: &mut bool, text: &str) {
         let mut response = ui.checkbox(value, text);
-        if let Some(s) = cmd.shortcuts().first() {
+        if let Some(s) = self.keymap.shortcut(cmd) {
             response = response.on_hover_text(ui.ctx().format_shortcut(s));
         }
         if response.changed() {
@@ -1130,6 +1251,7 @@ impl ForgeApp {
                 ui.separator();
                 self.menu_item(ui, OpenSettings);
                 self.menu_item(ui, OpenSettingsFile);
+                self.menu_item(ui, ShowKeybindings);
                 ui.separator();
                 self.menu_item(ui, Quit);
             });
@@ -1149,7 +1271,13 @@ impl ForgeApp {
                     self.menu_item(ui, cmd);
                 }
                 ui.separator();
-                for cmd in [TriggerSuggest, RenameSymbol, FormatDocument] {
+                for cmd in [
+                    TriggerSuggest,
+                    TriggerParameterHints,
+                    QuickFix,
+                    RenameSymbol,
+                    FormatDocument,
+                ] {
                     self.menu_item(ui, cmd);
                 }
             });
@@ -1171,6 +1299,8 @@ impl ForgeApp {
             ui.menu_button("Go", |ui| {
                 self.menu_item(ui, QuickOpen);
                 self.menu_item(ui, GoToLine);
+                self.menu_item(ui, GoToSymbol);
+                self.menu_item(ui, GoToWorkspaceSymbol);
                 ui.separator();
                 self.menu_item(ui, GoToDefinition);
                 self.menu_item(ui, FindReferences);
@@ -1188,7 +1318,7 @@ impl ForgeApp {
                 ui.separator();
                 self.menu_item(ui, ShowExplorer);
                 let mut search = egui::Button::new("Search");
-                if let Some(s) = FindInProject.shortcuts().first() {
+                if let Some(s) = self.keymap.shortcut(FindInProject) {
                     search = search.shortcut_text(ui.ctx().format_shortcut(s));
                 }
                 if ui.add(search).clicked() {
@@ -1197,11 +1327,12 @@ impl ForgeApp {
                 }
                 self.menu_item(ui, ShowSourceControl);
                 self.menu_item(ui, ShowPullRequests);
+                self.menu_item(ui, ShowExtensions);
                 self.menu_item(ui, ShowProblems);
                 ui.separator();
                 let mut blame = self.editor_git.blame_on;
                 let mut checkbox = ui.add(egui::Checkbox::new(&mut blame, "Blame"));
-                if let Some(s) = ToggleBlame.shortcuts().first() {
+                if let Some(s) = self.keymap.shortcut(ToggleBlame) {
                     checkbox = checkbox.on_hover_text(ui.ctx().format_shortcut(s));
                 }
                 if checkbox.changed() {
@@ -1222,6 +1353,16 @@ impl ForgeApp {
                 self.menu_checkbox(ui, ToggleWordWrap, &mut wrap, "Word Wrap");
                 let mut numbers = self.settings.line_numbers;
                 self.menu_checkbox(ui, ToggleLineNumbers, &mut numbers, "Line Numbers");
+                let mut hints = self.settings.inlay_hints;
+                self.menu_checkbox(ui, ToggleInlayHints, &mut hints, "Inlay Hints");
+                let mut crumbs = self.settings.breadcrumbs;
+                self.menu_checkbox(ui, ToggleBreadcrumbs, &mut crumbs, "Breadcrumbs");
+                let mut minimap = self.settings.minimap;
+                self.menu_checkbox(ui, ToggleMinimap, &mut minimap, "Minimap");
+                if self.active_is_markdown() {
+                    let mut preview = self.markdown_preview_open();
+                    self.menu_checkbox(ui, ToggleMarkdownPreview, &mut preview, "Markdown Preview");
+                }
                 for cmd in [IncreaseFontSize, DecreaseFontSize, ResetFontSize] {
                     self.menu_item(ui, cmd);
                 }
@@ -1254,6 +1395,31 @@ impl ForgeApp {
                 {
                     self.update_settings(|s| s.format_on_save = on);
                 }
+                ui.separator();
+                ui.menu_button("Extensions", |ui| {
+                    for cmd in [
+                        InstallExtension,
+                        ReloadExtensions,
+                        OpenExtensionsFolder,
+                        ExtensionGuide,
+                    ] {
+                        self.menu_item(ui, cmd);
+                    }
+                    let commands: Vec<(String, String)> = self
+                        .extensions
+                        .commands()
+                        .map(|(e, c, id)| (id, format!("{}: {}", e.name(), c.title)))
+                        .collect();
+                    if !commands.is_empty() {
+                        ui.separator();
+                    }
+                    for (id, label) in commands {
+                        if ui.button(label).clicked() {
+                            self.ext.pending.push(id);
+                            ui.close();
+                        }
+                    }
+                });
             });
             ui.menu_button("Terminal", |ui| {
                 self.menu_item(ui, ToggleTerminal);
@@ -1323,6 +1489,10 @@ impl ForgeApp {
                     }
                     None => {}
                 }
+            }
+            SidebarView::Extensions => {
+                ui.add_space(4.0);
+                self.extensions_view(ui);
             }
             SidebarView::PullRequests => {
                 ui.add_space(4.0);
@@ -1483,6 +1653,7 @@ impl ForgeApp {
             self.language_server_hint(ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 self.update_indicator(ui);
+                self.extension_spinner(ui);
                 if let Some(doc) = self.documents.get(self.active) {
                     ui.label(doc.extension());
                     ui.separator();
@@ -1540,6 +1711,7 @@ impl ForgeApp {
         let focused_group = gi == self.group;
         let panes_shown = gi == 0 && self.active_pane.is_some();
         let groups = self.groups.len();
+        let close_shortcut = self.keymap.shortcut(Command::CloseTab).copied();
         egui::ScrollArea::horizontal()
             .id_salt(("tab_bar", gi))
             .show(ui, |ui| {
@@ -1612,8 +1784,14 @@ impl ForgeApp {
                                 ui.close();
                             }
                         });
-                        let close =
-                            tab_close_button(ui, &colors, response.rect, selected, doc.is_dirty());
+                        let close = tab_close_button(
+                            ui,
+                            &colors,
+                            response.rect,
+                            selected,
+                            doc.is_dirty(),
+                            close_shortcut.as_ref(),
+                        );
                         if close.clicked() {
                             to_close = Some(idx);
                         }
@@ -1665,7 +1843,14 @@ impl ForgeApp {
                         if response.middle_clicked() {
                             pane_to_close = Some(idx);
                         }
-                        let close = tab_close_button(ui, &colors, response.rect, selected, false);
+                        let close = tab_close_button(
+                            ui,
+                            &colors,
+                            response.rect,
+                            selected,
+                            false,
+                            close_shortcut.as_ref(),
+                        );
                         if close.clicked() {
                             pane_to_close = Some(idx);
                         }
@@ -1758,7 +1943,21 @@ impl ForgeApp {
 
     /// One group: its tabs and the active tab's editor (or pane).
     fn group_ui(&mut self, ui: &mut egui::Ui, gi: usize, colors: &UiColors) {
-        self.tab_bar(ui, gi);
+        let focused = gi == self.group;
+        if focused {
+            ui.horizontal(|ui| {
+                // Right-to-left so the preview toggle keeps its place at the
+                // end and the tabs scroll in the space left over.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.markdown_preview_button(ui);
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        self.tab_bar(ui, gi);
+                    });
+                });
+            });
+        } else {
+            self.tab_bar(ui, gi);
+        }
         ui.separator();
         if gi == 0
             && let Some(i) = self.active_pane.filter(|&i| i < self.panes.len())
@@ -1782,9 +1981,13 @@ impl ForgeApp {
         else {
             return;
         };
+        if focused {
+            self.markdown_preview_panel(ui);
+        }
         self.disk_banner(ui, doc_idx);
-        if gi == self.group {
+        if focused {
             self.find_bar(ui);
+            self.breadcrumbs(ui);
         }
         self.editor(ui, gi, doc_idx);
     }
@@ -1949,11 +2152,45 @@ impl ForgeApp {
         };
         let editor_rect = ui.available_rect_before_wrap();
         ui.painter().rect_filled(editor_rect, 0.0, background);
+        // The minimap takes the right edge, unless the editor is too narrow.
+        let minimap_rect = (self.settings.minimap
+            && editor_rect.width() > crate::editor::minimap::WIDTH * 4.0)
+            .then(|| {
+                Rect::from_min_max(
+                    egui::pos2(
+                        editor_rect.right() - crate::editor::minimap::WIDTH,
+                        editor_rect.top(),
+                    ),
+                    editor_rect.max,
+                )
+            });
+        let text_rect = match minimap_rect {
+            Some(m) => {
+                Rect::from_min_max(editor_rect.min, egui::pos2(m.left(), editor_rect.bottom()))
+            }
+            None => editor_rect,
+        };
+
+        // Semantic highlighting and inlay hints from the language server.
+        let hint_color = self.settings.inlay_hints.then_some(colors.text_muted.0);
+        let hint_fill = colors.text_muted.0.gamma_multiply(0.14);
+        if let Some(p) = &path
+            && let Some(v) = self.language.views.get_mut(p)
+        {
+            v.prepare(
+                ui,
+                self.documents[doc_idx].text(),
+                &mut self.highlighter,
+                &font,
+                hint_color,
+            );
+        }
+        let views = path.as_ref().and_then(|p| self.language.views.get(p));
 
         let doc = &mut self.documents[doc_idx];
         let language_key = doc.language_key();
         let extension = doc.extension().to_owned();
-        let unit = ops::indent_unit(doc.text());
+        let unit = doc.indent_unit();
         let gutter_width = gutter::width(doc.line_count(), digit_width, line_numbers);
         let g = &mut self.groups[gi];
         let Some(view) = g.tabs.get_mut(g.active) else {
@@ -1978,15 +2215,22 @@ impl ForgeApp {
             },
             selection_color,
             muted_color: colors.text_muted.0,
+            decorations: views.and_then(|v| v.decorations()),
         };
         let mut peek_anchor = None;
+        let highlighter = &self.highlighter;
+        let mut text_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(text_rect)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
         let output = EditorWidget {
             doc,
             view,
-            highlighter: &self.highlighter,
+            highlighter,
             config,
         }
-        .show(ui, |ui, layout, doc| {
+        .show(&mut text_ui, |ui, layout, doc| {
             let mut shapes = Vec::new();
             // Find matches, only those on screen.
             let visible = layout.visible_chars.clone();
@@ -2007,6 +2251,9 @@ impl ForgeApp {
             ui.painter()
                 .with_clip_rect(layout.text_clip)
                 .set(layout.underlay, Shape::Vec(shapes));
+            if let Some(v) = views {
+                views::paint_hints(ui, layout, v.placed_hints(), hint_fill);
+            }
             language::paint_problems(ui, layout, &problems, &colors);
 
             // What the language features need: the symbol under the
@@ -2076,6 +2323,44 @@ impl ForgeApp {
             layout.text_clip.left()
         });
         let text_left = output.inner;
+        ui.allocate_rect(editor_rect, egui::Sense::hover());
+
+        // The minimap, built from the rows of this view.
+        if let Some(rect) = minimap_rect {
+            let doc = &self.documents[doc_idx];
+            let g = &mut self.groups[gi];
+            if let Some(view) = g.tabs.get_mut(g.active) {
+                let wrap = view.wrap_cols();
+                let map = view.display_map(&doc.buffer, wrap).clone();
+                let scroll = output.scroll;
+                let viewport = crate::editor::minimap::Viewport {
+                    offset: scroll.offset,
+                    height: scroll.height,
+                    content_height: scroll.content_height,
+                    row_height: scroll.row_height,
+                    rows: map.total_rows(),
+                };
+                let fg = self.highlighter.foreground();
+                let target = crate::editor::minimap::show(ui, rect, &viewport, |row| {
+                    let (line, r) = map.line_at_row(row);
+                    let text = doc.buffer.line_text(line);
+                    let parts = crate::editor::view::line_rows(&text, wrap);
+                    let Some(part) = parts.get(r) else {
+                        return Vec::new();
+                    };
+                    crate::editor::minimap::line_runs(
+                        &text,
+                        part.clone(),
+                        doc.highlight.spans(line),
+                        fg,
+                    )
+                });
+                if let Some(y) = target {
+                    view.scroll_to = Some(y);
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
 
         // Matching bracket pair around the caret, drawn over the text's
         // underlay now that the caret is known.
@@ -2101,6 +2386,7 @@ impl ForgeApp {
         if focused {
             self.cursor = doc.line_col(primary.head);
             lsp_frame.caret = output.caret;
+            lsp_frame.caret_rect = output.layout.caret_rect(primary.head);
             if output.changed {
                 lsp_frame.typed = output.typed;
             }
@@ -2244,6 +2530,18 @@ fn conflict_bar(ui: &mut egui::Ui, count: usize, colors: &UiColors) -> Option<Co
 }
 
 /// Formats theme loading errors for the status bar.
+/// Status bar message for keybindings in `settings.toml` that couldn't be used.
+fn keymap_errors_status(errors: &[String]) -> Option<String> {
+    match errors {
+        [] => None,
+        [one] => Some(format!("Keybinding ignored: {one}")),
+        [first, rest @ ..] => Some(format!(
+            "Keybinding ignored: {first} (and {} more; see File → Keyboard Shortcuts)",
+            rest.len()
+        )),
+    }
+}
+
 fn theme_errors_status(errors: &[String]) -> Option<String> {
     match errors {
         [] => None,
@@ -2276,6 +2574,7 @@ fn tab_close_button(
     tab_rect: Rect,
     selected: bool,
     dirty: bool,
+    close_shortcut: Option<&egui::KeyboardShortcut>,
 ) -> egui::Response {
     let size = egui::vec2(18.0, tab_rect.height().max(18.0));
     let (slot, response) = ui.allocate_exact_size(size, egui::Sense::click());
@@ -2314,11 +2613,9 @@ fn tab_close_button(
             icons::paint(painter, button.shrink(3.0), Icon::Close, color);
         }
     }
-    let tip = if selected {
-        let shortcut = Command::CloseTab.shortcuts()[0];
-        format!("Close ({})", ui.ctx().format_shortcut(&shortcut))
-    } else {
-        "Close".to_owned()
+    let tip = match close_shortcut.filter(|_| selected) {
+        Some(s) => format!("Close ({})", ui.ctx().format_shortcut(s)),
+        None => "Close".to_owned(),
     };
     response.on_hover_text(tip)
 }
@@ -2329,11 +2626,18 @@ impl eframe::App for ForgeApp {
         self.follow_editor_focus(&ctx);
         self.sync_active();
         self.apply_editor_focus(&ctx);
+        self.sync_keymap();
         self.intercept_close(&ctx);
         // The dialog is modal; keep shortcuts from acting behind it.
-        if self.pending_close.is_none() && self.explorer_dialog.is_none() {
+        if self.pending_close.is_none()
+            && self.explorer_dialog.is_none()
+            && !self.extension_dialog_open()
+        {
+            self.code_action_keys(&ctx);
             self.completion_keys(&ctx);
+            self.signature_keys(&ctx);
             self.handle_shortcuts(&ctx);
+            self.handle_dropped_zips(&ctx);
         }
         self.servers.poll();
         self.sync_language_servers();
@@ -2348,6 +2652,7 @@ impl eframe::App for ForgeApp {
         self.github
             .poll(self.sidebar_open && self.sidebar_view == SidebarView::PullRequests);
         self.handle_events();
+        self.poll_extension_runs(&ctx);
 
         let panel_frame =
             egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin::symmetric(10, 6));
@@ -2372,7 +2677,7 @@ impl eframe::App for ForgeApp {
                     |v| match v {
                         SidebarView::SourceControl => changes,
                         SidebarView::PullRequests => review_requests,
-                        SidebarView::Explorer | SidebarView::Search => 0,
+                        SidebarView::Explorer | SidebarView::Search | SidebarView::Extensions => 0,
                     },
                     &colors,
                 );
@@ -2405,13 +2710,17 @@ impl eframe::App for ForgeApp {
         }
 
         self.settings_window(&ctx);
+        self.keybindings_window(&ctx);
         self.show_picker(&ctx);
         self.go_to_line_dialog(&ctx);
         self.rename_dialog(&ctx);
         for cmd in std::mem::take(&mut self.pending_commands) {
             self.run_command(&ctx, cmd);
         }
+        self.run_pending_extension_commands(&ctx);
         self.explorer_dialog(&ctx);
+        self.extension_install_dialog(&ctx);
+        self.extension_prompt_dialog(&ctx);
         self.close_dialog(&ctx);
         self.persist_session(false);
     }

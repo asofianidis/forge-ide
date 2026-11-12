@@ -1,7 +1,8 @@
 //! Every user-facing action, with its name and keyboard shortcut.
 //!
 //! Menus, keyboard shortcuts and the command palette are all built from this
-//! list, so an action added here is reachable all three ways.
+//! list, so an action added here is reachable all three ways. The shortcuts
+//! here are the defaults; see [`crate::keymap`] for the user's own.
 
 use egui::{Key, KeyboardShortcut, Modifiers};
 
@@ -17,6 +18,7 @@ pub enum Command {
     RevealActiveFile,
     OpenSettings,
     OpenSettingsFile,
+    ShowKeybindings,
     Quit,
     Undo,
     Redo,
@@ -39,10 +41,14 @@ pub enum Command {
     FoldAll,
     UnfoldAll,
     TriggerSuggest,
+    TriggerParameterHints,
+    QuickFix,
     RenameSymbol,
     FormatDocument,
     QuickOpen,
     GoToLine,
+    GoToSymbol,
+    GoToWorkspaceSymbol,
     NextTab,
     PreviousTab,
     GoToDefinition,
@@ -53,6 +59,7 @@ pub enum Command {
     ShowExplorer,
     ShowSourceControl,
     ShowPullRequests,
+    ShowExtensions,
     ShowProblems,
     ToggleBlame,
     NextChange,
@@ -66,6 +73,10 @@ pub enum Command {
     FocusFirstGroup,
     FocusSecondGroup,
     FocusThirdGroup,
+    ToggleInlayHints,
+    ToggleBreadcrumbs,
+    ToggleMinimap,
+    ToggleMarkdownPreview,
     IncreaseFontSize,
     DecreaseFontSize,
     ResetFontSize,
@@ -75,6 +86,10 @@ pub enum Command {
     LanguageServers,
     RestartLanguageServers,
     ToggleFormatOnSave,
+    InstallExtension,
+    ReloadExtensions,
+    OpenExtensionsFolder,
+    ExtensionGuide,
     ToggleTerminal,
     RestartTerminal,
     CheckForUpdates,
@@ -112,6 +127,7 @@ impl Command {
         Command::RevealActiveFile,
         Command::OpenSettings,
         Command::OpenSettingsFile,
+        Command::ShowKeybindings,
         Command::Quit,
         Command::Undo,
         Command::Redo,
@@ -134,10 +150,14 @@ impl Command {
         Command::FoldAll,
         Command::UnfoldAll,
         Command::TriggerSuggest,
+        Command::TriggerParameterHints,
+        Command::QuickFix,
         Command::RenameSymbol,
         Command::FormatDocument,
         Command::QuickOpen,
         Command::GoToLine,
+        Command::GoToSymbol,
+        Command::GoToWorkspaceSymbol,
         Command::NextTab,
         Command::PreviousTab,
         Command::GoToDefinition,
@@ -148,6 +168,7 @@ impl Command {
         Command::ShowExplorer,
         Command::ShowSourceControl,
         Command::ShowPullRequests,
+        Command::ShowExtensions,
         Command::ShowProblems,
         Command::ToggleBlame,
         Command::NextChange,
@@ -161,6 +182,10 @@ impl Command {
         Command::FocusFirstGroup,
         Command::FocusSecondGroup,
         Command::FocusThirdGroup,
+        Command::ToggleInlayHints,
+        Command::ToggleBreadcrumbs,
+        Command::ToggleMinimap,
+        Command::ToggleMarkdownPreview,
         Command::IncreaseFontSize,
         Command::DecreaseFontSize,
         Command::ResetFontSize,
@@ -170,6 +195,10 @@ impl Command {
         Command::LanguageServers,
         Command::RestartLanguageServers,
         Command::ToggleFormatOnSave,
+        Command::InstallExtension,
+        Command::ReloadExtensions,
+        Command::OpenExtensionsFolder,
+        Command::ExtensionGuide,
         Command::ToggleTerminal,
         Command::RestartTerminal,
         Command::CheckForUpdates,
@@ -188,6 +217,7 @@ impl Command {
             Command::RevealActiveFile => REVEAL_LABEL,
             Command::OpenSettings => "Settings…",
             Command::OpenSettingsFile => "Open Settings File (TOML)",
+            Command::ShowKeybindings => "Keyboard Shortcuts…",
             Command::Quit => "Quit",
             Command::Undo => "Undo",
             Command::Redo => "Redo",
@@ -210,10 +240,14 @@ impl Command {
             Command::FoldAll => "Fold All",
             Command::UnfoldAll => "Unfold All",
             Command::TriggerSuggest => "Trigger Suggest",
+            Command::TriggerParameterHints => "Trigger Parameter Hints",
+            Command::QuickFix => "Quick Fix…",
             Command::RenameSymbol => "Rename Symbol…",
             Command::FormatDocument => "Format Document",
             Command::QuickOpen => "Go to File…",
             Command::GoToLine => "Go to Line…",
+            Command::GoToSymbol => "Go to Symbol in File…",
+            Command::GoToWorkspaceSymbol => "Go to Symbol in Workspace…",
             Command::NextTab => "Next Tab",
             Command::PreviousTab => "Previous Tab",
             Command::GoToDefinition => "Go to Definition",
@@ -224,6 +258,7 @@ impl Command {
             Command::ShowExplorer => "Explorer",
             Command::ShowSourceControl => "Source Control",
             Command::ShowPullRequests => "Pull Requests",
+            Command::ShowExtensions => "Extensions",
             Command::ShowProblems => "Problems…",
             Command::ToggleBlame => "Toggle Blame",
             Command::NextChange => "Next Change",
@@ -237,6 +272,10 @@ impl Command {
             Command::FocusFirstGroup => "Focus First Editor Group",
             Command::FocusSecondGroup => "Focus Second Editor Group",
             Command::FocusThirdGroup => "Focus Third Editor Group",
+            Command::ToggleInlayHints => "Toggle Inlay Hints",
+            Command::ToggleBreadcrumbs => "Toggle Breadcrumbs",
+            Command::ToggleMinimap => "Toggle Minimap",
+            Command::ToggleMarkdownPreview => "Markdown Preview",
             Command::IncreaseFontSize => "Increase Font Size",
             Command::DecreaseFontSize => "Decrease Font Size",
             Command::ResetFontSize => "Reset Font Size",
@@ -246,6 +285,10 @@ impl Command {
             Command::LanguageServers => "Language Servers…",
             Command::RestartLanguageServers => "Restart Language Servers",
             Command::ToggleFormatOnSave => "Format on Save",
+            Command::InstallExtension => "Install Extension from ZIP…",
+            Command::ReloadExtensions => "Reload Extensions",
+            Command::OpenExtensionsFolder => "Open Extensions Folder",
+            Command::ExtensionGuide => "Extension Authoring Guide",
             Command::ToggleTerminal => "Toggle Terminal",
             Command::RestartTerminal => "Restart Shell",
             Command::CheckForUpdates => "Check for Updates",
@@ -257,21 +300,59 @@ impl Command {
         use Command::*;
         match self {
             NewFile | OpenFile | OpenFolder | OpenRecent | Save | SaveAs | CloseTab
-            | RevealActiveFile | OpenSettings | OpenSettingsFile | Quit => "File",
-            Undo | Redo | Find | Replace | FindInProject | ToggleComment | Indent | Outdent
-            | DuplicateLine | MoveLineUp | MoveLineDown | TriggerSuggest | RenameSymbol
+            | RevealActiveFile | OpenSettings | OpenSettingsFile | ShowKeybindings | Quit => "File",
+            Undo
+            | Redo
+            | Find
+            | Replace
+            | FindInProject
+            | ToggleComment
+            | Indent
+            | Outdent
+            | DuplicateLine
+            | MoveLineUp
+            | MoveLineDown
+            | TriggerSuggest
+            | TriggerParameterHints
+            | QuickFix
+            | RenameSymbol
             | FormatDocument => "Edit",
             AddCursorAbove | AddCursorBelow | AddNextOccurrence | SelectAllOccurrences
             | AddCursorsToLineEnds => "Selection",
             Fold | Unfold | FoldAll | UnfoldAll => "View",
-            QuickOpen | GoToLine | NextTab | PreviousTab | GoToDefinition | FindReferences
-            | NextProblem | PreviousProblem | NextChange | PreviousChange => "Go",
-            ShowCommandPalette | ShowExplorer | ShowSourceControl | ShowPullRequests
-            | ShowProblems | ToggleBlame | FileHistory | RepositoryHistory | ToggleWordWrap
-            | ToggleLineNumbers | IncreaseFontSize | DecreaseFontSize | ResetFontSize
-            | SplitEditor | MoveTabToNextGroup | FocusFirstGroup | FocusSecondGroup
-            | FocusThirdGroup | SelectTheme | ReloadThemes | OpenThemesFolder => "View",
+            QuickOpen | GoToLine | GoToSymbol | GoToWorkspaceSymbol | NextTab | PreviousTab
+            | GoToDefinition | FindReferences | NextProblem | PreviousProblem | NextChange
+            | PreviousChange => "Go",
+            ShowCommandPalette
+            | ShowExplorer
+            | ShowSourceControl
+            | ShowPullRequests
+            | ShowExtensions
+            | ShowProblems
+            | ToggleBlame
+            | FileHistory
+            | RepositoryHistory
+            | ToggleWordWrap
+            | ToggleLineNumbers
+            | ToggleInlayHints
+            | ToggleBreadcrumbs
+            | ToggleMinimap
+            | ToggleMarkdownPreview
+            | SplitEditor
+            | MoveTabToNextGroup
+            | FocusFirstGroup
+            | FocusSecondGroup
+            | FocusThirdGroup
+            | IncreaseFontSize
+            | DecreaseFontSize
+            | ResetFontSize
+            | SelectTheme
+            | ReloadThemes
+            | OpenThemesFolder => "View",
             LanguageServers | RestartLanguageServers | ToggleFormatOnSave => "Tools",
+            InstallExtension | ReloadExtensions | OpenExtensionsFolder | ExtensionGuide => {
+                "Extensions"
+            }
             ToggleTerminal | RestartTerminal => "Terminal",
             CheckForUpdates => "Help",
         }
@@ -286,8 +367,31 @@ impl Command {
         )
     }
 
-    /// Shortcuts that trigger this command; the first is shown in menus.
-    pub fn shortcuts(self) -> &'static [KeyboardShortcut] {
+    /// Name used for the command in `settings.toml` keybindings: the variant
+    /// name in snake_case, e.g. `toggle_terminal`.
+    pub fn id(self) -> String {
+        let mut id = String::new();
+        for (i, c) in format!("{self:?}").chars().enumerate() {
+            if c.is_ascii_uppercase() {
+                if i > 0 {
+                    id.push('_');
+                }
+                id.push(c.to_ascii_lowercase());
+            } else {
+                id.push(c);
+            }
+        }
+        id
+    }
+
+    /// The command with this [`Self::id`].
+    pub fn from_id(id: &str) -> Option<Command> {
+        Self::ALL.iter().copied().find(|c| c.id() == id)
+    }
+
+    /// Default shortcuts for this command; the first is shown in menus.
+    /// Use [`crate::keymap::Keymap`] for the ones in effect.
+    pub fn default_shortcuts(self) -> &'static [KeyboardShortcut] {
         const fn one(s: KeyboardShortcut) -> [KeyboardShortcut; 1] {
             [s]
         }
@@ -336,10 +440,15 @@ impl Command {
             Command::ShowSourceControl => &const { one(shortcut(CMD_SHIFT, Key::G)) },
             // Cmd+Shift+P is the command palette, as in other editors.
             Command::ShowPullRequests => &const { one(shortcut(CMD_SHIFT, Key::R)) },
+            Command::ShowExtensions => &const { one(shortcut(CMD_SHIFT, Key::X)) },
             Command::ToggleBlame => &const { one(shortcut(CMD_ALT, Key::B)) },
             Command::NextChange => &const { one(shortcut(ALT, Key::F5)) },
             // Ctrl+Space on every platform, as in other editors.
             Command::TriggerSuggest => &const { one(shortcut(Modifiers::CTRL, Key::Space)) },
+            Command::TriggerParameterHints => &const { one(shortcut(CMD_SHIFT, Key::Space)) },
+            Command::QuickFix => &const { one(shortcut(CMD, Key::Period)) },
+            Command::GoToSymbol => &const { one(shortcut(CMD_SHIFT, Key::O)) },
+            Command::GoToWorkspaceSymbol => &const { one(shortcut(CMD, Key::T)) },
             Command::RenameSymbol => &const { one(shortcut(Modifiers::NONE, Key::F2)) },
             Command::FormatDocument => &const { one(shortcut(CMD_SHIFT, Key::I)) },
             Command::GoToDefinition => &const { one(shortcut(Modifiers::NONE, Key::F12)) },
@@ -361,6 +470,8 @@ impl Command {
             Command::FocusFirstGroup => &const { one(shortcut(CMD, Key::Num1)) },
             Command::FocusSecondGroup => &const { one(shortcut(CMD, Key::Num2)) },
             Command::FocusThirdGroup => &const { one(shortcut(CMD, Key::Num3)) },
+            // As in other editors. Plain Cmd+V stays paste.
+            Command::ToggleMarkdownPreview => &const { one(shortcut(CMD_SHIFT, Key::V)) },
             // Cmd+= and Cmd+Shift+= (Cmd++) both make the text bigger. These
             // replace egui's whole-UI keyboard zoom, which is turned off.
             Command::IncreaseFontSize => {
@@ -397,30 +508,11 @@ impl Command {
                 | Command::FoldAll
                 | Command::UnfoldAll
                 | Command::TriggerSuggest
+                | Command::TriggerParameterHints
+                | Command::QuickFix
                 | Command::RenameSymbol
                 | Command::FormatDocument
         )
-    }
-
-    /// Commands paired with their shortcuts, most specific first.
-    ///
-    /// egui matches shortcuts "logically" (Cmd+P also matches Cmd+Shift+P), so
-    /// shortcuts with more modifiers must be checked first.
-    pub fn shortcut_table() -> Vec<(Command, KeyboardShortcut)> {
-        let mut table: Vec<_> = Self::ALL
-            .iter()
-            .flat_map(|&c| c.shortcuts().iter().map(move |&s| (c, s)))
-            .collect();
-        table.sort_by_key(|(_, s)| {
-            let m = s.modifiers;
-            std::cmp::Reverse(
-                [m.alt, m.shift, m.ctrl || m.command || m.mac_cmd]
-                    .iter()
-                    .filter(|&&b| b)
-                    .count(),
-            )
-        });
-        table
     }
 }
 
@@ -428,50 +520,6 @@ impl Command {
 mod tests {
     use super::*;
     use std::collections::HashSet;
-
-    #[test]
-    fn shortcuts_are_unique() {
-        let mut seen = HashSet::new();
-        for (cmd, s) in Command::shortcut_table() {
-            assert!(
-                seen.insert((s.modifiers, s.logical_key)),
-                "{cmd:?} reuses a shortcut"
-            );
-        }
-    }
-
-    #[test]
-    fn more_specific_shortcuts_come_first() {
-        let table = Command::shortcut_table();
-        let pos = |c| table.iter().position(|(x, _)| *x == c).unwrap();
-        assert!(pos(Command::ShowCommandPalette) < pos(Command::QuickOpen));
-        assert!(pos(Command::FindInProject) < pos(Command::Find));
-        assert!(pos(Command::DuplicateLine) < pos(Command::MoveLineDown));
-        assert!(pos(Command::PreviousChange) < pos(Command::NextChange));
-        assert!(pos(Command::FindReferences) < pos(Command::GoToDefinition));
-        assert!(pos(Command::PreviousProblem) < pos(Command::NextProblem));
-        // Cmd+Z would also match Cmd+Shift+Z.
-        assert!(pos(Command::Redo) < pos(Command::Undo));
-        assert!(pos(Command::SaveAs) < pos(Command::Save));
-        assert!(pos(Command::PreviousTab) < pos(Command::NextTab));
-    }
-
-    /// egui's `consume_shortcut` ignores an extra Shift, so the plain
-    /// shortcut would swallow its Shift variant if it were checked first.
-    #[test]
-    fn shift_variants_are_not_swallowed() {
-        let table = Command::shortcut_table();
-        for (i, (cmd, s)) in table.iter().enumerate() {
-            for (other, earlier) in &table[..i] {
-                assert!(
-                    !s.modifiers.matches_logically(earlier.modifiers)
-                        || s.logical_key != earlier.logical_key
-                        || s.modifiers == earlier.modifiers,
-                    "{other:?} is checked before {cmd:?} and would swallow it"
-                );
-            }
-        }
-    }
 
     #[test]
     fn every_command_is_listed() {
@@ -483,5 +531,15 @@ mod tests {
             Command::RestartTerminal.palette_label(),
             "Terminal: Restart Shell"
         );
+    }
+
+    #[test]
+    fn ids_round_trip() {
+        assert_eq!(Command::ToggleTerminal.id(), "toggle_terminal");
+        assert_eq!(Command::Quit.id(), "quit");
+        for &cmd in Command::ALL {
+            assert_eq!(Command::from_id(&cmd.id()), Some(cmd));
+        }
+        assert_eq!(Command::from_id("ToggleTerminal"), None);
     }
 }

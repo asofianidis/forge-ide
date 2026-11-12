@@ -92,6 +92,11 @@ impl ForgeApp {
             .unwrap_or(0);
     }
 
+    /// Whether a diff / commit / PR tab hides the focused group's editor.
+    pub(super) fn pane_shown(&self) -> bool {
+        self.group == 0 && self.active_pane.is_some()
+    }
+
     pub(super) fn focused_view(&self) -> Option<&EditorView> {
         self.groups.get(self.group)?.active_view()
     }

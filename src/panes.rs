@@ -34,6 +34,7 @@ pub enum Pane {
     History(Box<HistoryPane>),
     Rebase(Box<RebasePane>),
     Log(LogPane),
+    Markdown(MarkdownPane),
 }
 
 impl Pane {
@@ -52,6 +53,7 @@ impl Pane {
             Pane::History(p) => p.title(),
             Pane::Rebase(p) => p.title(),
             Pane::Log(p) => p.title.clone(),
+            Pane::Markdown(p) => p.title.clone(),
         }
     }
 
@@ -62,6 +64,7 @@ impl Pane {
             Pane::PullRequest(_) => Icon::PullRequest,
             Pane::History(_) | Pane::Rebase(_) => Icon::History,
             Pane::Log(_) => Icon::OpenFile,
+            Pane::Markdown(_) => Icon::Extensions,
         }
     }
 
@@ -83,6 +86,10 @@ impl Pane {
             Pane::Rebase(p) => p.show(ui, sc, colors).map(history_action),
             Pane::Log(p) => {
                 p.show(ui, colors);
+                None
+            }
+            Pane::Markdown(p) => {
+                p.show(ui);
                 None
             }
         }
@@ -114,6 +121,17 @@ impl LogPane {
             key,
             text: None,
             task: Some(task),
+            filter: String::new(),
+        }
+    }
+
+    /// A log whose text is already known.
+    pub fn finished(title: String, key: String, text: Result<String, String>) -> Self {
+        Self {
+            title,
+            key,
+            text: Some(text),
+            task: None,
             filter: String::new(),
         }
     }
@@ -185,6 +203,34 @@ impl LogPane {
                     )
                     .on_hover_text(*line);
                 }
+            });
+    }
+}
+
+/// A read-only Markdown document (an extension's README, the authoring guide).
+pub struct MarkdownPane {
+    pub title: String,
+    /// Identifies the document so reopening reuses the tab.
+    pub key: String,
+    text: String,
+}
+
+impl MarkdownPane {
+    pub fn new(title: String, key: String, text: String) -> Self {
+        Self { title, key, text }
+    }
+
+    fn show(&mut self, ui: &mut Ui) {
+        egui::ScrollArea::vertical()
+            .id_salt(("markdown", &self.key))
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::symmetric(24, 16))
+                    .show(ui, |ui| {
+                        ui.set_max_width(820.0);
+                        crate::ui::markdown::show(ui, &self.text);
+                    });
             });
     }
 }

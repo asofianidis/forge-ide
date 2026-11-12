@@ -17,6 +17,18 @@ pub(super) enum PickerMode {
     RecentFolders,
     /// Definitions, references or problems from the language server.
     Locations,
+    /// Symbols in the active file.
+    Symbols,
+    /// Symbols anywhere in the workspace, searched as you type.
+    WorkspaceSymbols,
+}
+
+/// A command palette entry.
+#[derive(Debug, Clone)]
+enum PaletteCommand {
+    Builtin(Command),
+    /// An extension command by qualified id.
+    Extension(String),
 }
 
 /// Fuzzy-matched file list, cached until the query or the index changes.
@@ -104,17 +116,49 @@ impl ForgeApp {
             .unzip()
     }
 
-    fn command_items(&self, ctx: &egui::Context) -> (Vec<PickerItem>, Vec<Command>) {
-        let candidates: Vec<(Command, String)> = Command::ALL
+    fn command_items(&self, ctx: &egui::Context) -> (Vec<PickerItem>, Vec<PaletteCommand>) {
+        // Extension commands that apply to the active tab.
+        let file_name = self
+            .active_pane
+            .is_none()
+            .then(|| self.documents.get(self.active))
+            .flatten()
+            .and_then(|d| d.path.as_deref())
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned());
+        let extension_commands = self
+            .extensions
+            .commands()
+            .filter(|(_, c, _)| c.applies_to(file_name.as_deref()))
+            .map(|(e, c, id)| {
+                let detail = c
+                    .shortcut()
+                    .map(|s| ctx.format_shortcut(&s))
+                    .unwrap_or_default();
+                (
+                    PaletteCommand::Extension(id),
+                    format!("{}: {}", e.name(), c.title),
+                    detail,
+                )
+            });
+        let candidates: Vec<(PaletteCommand, String, String)> = Command::ALL
             .iter()
             .filter(|&&c| c != Command::ShowCommandPalette)
-            .map(|&c| (c, c.palette_label()))
+            .map(|&c| {
+                let detail = self
+                    .keymap
+                    .shortcut(c)
+                    .map(|s| ctx.format_shortcut(s))
+                    .unwrap_or_default();
+                (PaletteCommand::Builtin(c), c.palette_label(), detail)
+            })
+            .chain(extension_commands)
             .collect();
         let ranked = rank(
             candidates
                 .iter()
                 .enumerate()
-                .filter_map(|(i, (_, label))| {
+                .filter_map(|(i, (_, label, _))| {
                     fuzzy::score(&self.picker.query, label).map(|m| (i, m))
                 })
                 .collect(),
@@ -122,19 +166,14 @@ impl ForgeApp {
         ranked
             .into_iter()
             .map(|(i, m)| {
-                let (cmd, label) = &candidates[i];
-                let detail = cmd
-                    .shortcuts()
-                    .first()
-                    .map(|s| ctx.format_shortcut(s))
-                    .unwrap_or_default();
+                let (cmd, label, detail) = &candidates[i];
                 (
                     PickerItem {
                         label: label.clone(),
-                        detail,
+                        detail: detail.clone(),
                         highlights: m.indices,
                     },
-                    *cmd,
+                    cmd.clone(),
                 )
             })
             .unzip()
@@ -221,7 +260,10 @@ impl ForgeApp {
                     .picker
                     .show(ctx, "Type a command", &items, None, &style)
                 {
-                    self.pending_commands.push(commands[i]);
+                    match &commands[i] {
+                        PaletteCommand::Builtin(c) => self.pending_commands.push(*c),
+                        PaletteCommand::Extension(id) => self.ext.pending.push(id.clone()),
+                    }
                 }
             }
             PickerMode::Themes => {
@@ -239,6 +281,27 @@ impl ForgeApp {
                 if let Some(i) = self.picker.show(ctx, hint, &items, None, &style) {
                     let location = self.language.locations[indices[i]].location.clone();
                     self.go_to_location(ctx, &location);
+                }
+            }
+            PickerMode::Symbols => {
+                let (items, indices) = self.symbol_picker_items(&self.picker.query);
+                if let Some(i) = self
+                    .picker
+                    .show(ctx, "Go to symbol in file", &items, None, &style)
+                {
+                    self.go_to_symbol_item(ctx, indices[i]);
+                }
+            }
+            PickerMode::WorkspaceSymbols => {
+                let (items, indices, footer) = self.workspace_symbol_items();
+                if let Some(i) = self.picker.show(
+                    ctx,
+                    "Go to symbol in workspace",
+                    &items,
+                    footer.as_deref(),
+                    &style,
+                ) {
+                    self.go_to_workspace_symbol_item(ctx, indices[i]);
                 }
             }
             PickerMode::RecentFolders => {

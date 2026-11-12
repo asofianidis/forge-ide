@@ -215,7 +215,14 @@ impl Client {
                 }
                 Some(Incoming::Request { id, method, params }) => {
                     match self.auto_reply(&method, &params) {
-                        Some(reply) => self.respond(id, reply),
+                        Some(reply) => {
+                            self.respond(id, reply);
+                            // The editor still needs to hear about refreshes,
+                            // to ask again for what it shows.
+                            if method.ends_with("/refresh") {
+                                out.push(Incoming::Notification { method, params });
+                            }
+                        }
                         None => out.push(Incoming::Request { id, method, params }),
                     }
                 }
@@ -345,6 +352,8 @@ fn workspace_folder(root: &Path) -> Value {
 /// actually uses are advertised.
 fn initialize_params(root: &Path) -> Value {
     let uri = path_to_uri(root).map(|u| u.as_str().to_owned());
+    // Every symbol kind the protocol defines (File = 1 … TypeParameter = 26).
+    let symbol_kinds: Vec<u32> = (1..=26).collect();
     json!({
         "processId": std::process::id(),
         "clientInfo": { "name": "Forge IDE", "version": env!("CARGO_PKG_VERSION") },
@@ -359,6 +368,10 @@ fn initialize_params(root: &Path) -> Value {
                 "workspaceEdit": { "documentChanges": true },
                 "configuration": true,
                 "workspaceFolders": true,
+                "executeCommand": {},
+                "symbol": { "symbolKind": { "valueSet": symbol_kinds } },
+                "semanticTokens": { "refreshSupport": true },
+                "inlayHint": { "refreshSupport": true },
             },
             "textDocument": {
                 "synchronization": { "didSave": true },
@@ -379,6 +392,50 @@ fn initialize_params(root: &Path) -> Value {
                 "formatting": {},
                 // Whole lines only, so ranges end where the editor's folds do.
                 "foldingRange": { "lineFoldingOnly": true },
+                "codeAction": {
+                    "codeActionLiteralSupport": {
+                        "codeActionKind": {
+                            "valueSet": [
+                                "", "quickfix", "refactor", "refactor.extract",
+                                "refactor.inline", "refactor.rewrite", "source",
+                                "source.organizeImports",
+                            ],
+                        },
+                    },
+                    "isPreferredSupport": true,
+                    "disabledSupport": true,
+                    "dataSupport": true,
+                    "resolveSupport": { "properties": ["edit", "command"] },
+                },
+                "signatureHelp": {
+                    "contextSupport": true,
+                    "signatureInformation": {
+                        "documentationFormat": ["markdown", "plaintext"],
+                        "parameterInformation": { "labelOffsetSupport": true },
+                        "activeParameterSupport": true,
+                    },
+                },
+                "documentSymbol": {
+                    "hierarchicalDocumentSymbolSupport": true,
+                    "symbolKind": { "valueSet": symbol_kinds },
+                },
+                "inlayHint": {},
+                "semanticTokens": {
+                    "requests": { "full": true },
+                    "tokenTypes": [
+                        "namespace", "type", "class", "enum", "interface", "struct",
+                        "typeParameter", "parameter", "variable", "property", "enumMember",
+                        "event", "function", "method", "macro", "keyword", "modifier",
+                        "comment", "string", "number", "regexp", "operator", "decorator",
+                    ],
+                    "tokenModifiers": [
+                        "declaration", "definition", "readonly", "static", "deprecated",
+                        "abstract", "async", "modification", "documentation", "defaultLibrary",
+                    ],
+                    "formats": ["relative"],
+                    "overlappingTokenSupport": false,
+                    "multilineTokenSupport": false,
+                },
             },
         },
     })

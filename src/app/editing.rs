@@ -69,7 +69,7 @@ impl ForgeApp {
     /// Undoes (or with `redo`, redoes) the last step in the active document
     /// and restores the cursors it had.
     pub(super) fn undo(&mut self, ctx: &egui::Context, redo: bool) {
-        if self.group == 0 && self.active_pane.is_some() {
+        if self.pane_shown() {
             return;
         }
         let Some(doc) = self.documents.get_mut(self.active) else {
@@ -106,7 +106,7 @@ impl ForgeApp {
             self.status = format!("Don't know how to comment {} files", doc.title());
             return;
         }
-        let unit = ops::indent_unit(doc.text());
+        let unit = doc.indent_unit();
         // Lines of context each command needs around a cursor.
         let (above, below) = match cmd {
             Command::MoveLineUp => (1, 0),

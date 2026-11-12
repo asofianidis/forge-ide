@@ -185,6 +185,8 @@ pub struct EditorView {
     /// Widest line seen, so horizontal scrolling doesn't jump around.
     pub max_width: f32,
     pub reveal: Option<Reveal>,
+    /// Vertical scroll offset to jump to next frame (from the minimap).
+    pub scroll_to: Option<f32>,
     /// IME composition in progress, shown at the caret.
     pub preedit: Option<String>,
     /// Pointer interaction in progress.
@@ -209,6 +211,7 @@ impl EditorView {
             map: DisplayMap::default(),
             max_width: 0.0,
             reveal: None,
+            scroll_to: None,
             preedit: None,
             drag: None,
             clicks: Default::default(),

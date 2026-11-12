@@ -44,7 +44,7 @@ impl ForgeApp {
         let folder = &self.workspace.as_ref()?.root.path;
         let mut files = Vec::new();
         let mut active = None;
-        let pane_shown = self.group == 0 && self.active_pane.is_some();
+        let pane_shown = self.pane_shown();
         // Tabs left to right across the groups, each file once, with the
         // cursor of its first view.
         let mut seen = Vec::new();

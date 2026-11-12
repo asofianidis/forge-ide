@@ -20,6 +20,7 @@ use egui::{
     Response, Sense, Shape, Stroke, Ui, pos2, vec2,
 };
 
+use super::decorate::{self, Decorations};
 use super::folding::FoldSource;
 use super::multi::{self, CursorEdit, Transaction};
 use super::ops;
@@ -78,6 +79,8 @@ pub struct EditorConfig<'a> {
     pub folding: FoldSource<'a>,
     pub selection_color: Color32,
     pub muted_color: Color32,
+    /// Semantic token colors and inlay hint gaps from the language server.
+    pub decorations: Option<&'a Decorations>,
 }
 
 /// One laid-out row on screen.
@@ -256,7 +259,21 @@ pub struct EditorOutput<R> {
     pub typed: Option<char>,
     /// Screen rect of the primary caret, when the editor has focus and it is visible.
     pub caret: Option<(usize, Rect)>,
+    /// Where the text is scrolled to.
+    pub scroll: ScrollState,
     pub inner: R,
+}
+
+/// The editor's scroll position, for the minimap.
+#[derive(Debug, Clone, Copy)]
+pub struct ScrollState {
+    /// Vertical scroll offset.
+    pub offset: f32,
+    /// Height of the visible part.
+    pub height: f32,
+    /// Height of everything that can be scrolled through.
+    pub content_height: f32,
+    pub row_height: f32,
 }
 
 pub struct EditorWidget<'a> {
@@ -308,103 +325,108 @@ impl EditorWidget<'_> {
             ui.memory_mut(|m| m.set_focus_lock_filter(id, filter));
         }
 
-        let scroll = egui::ScrollArea::both()
-            .id_salt(id)
-            .auto_shrink(false)
-            .show_viewport(ui, |ui, viewport| {
-                let clip = ui.clip_rect();
-                let origin = ui.max_rect().min;
-                let side = config.blame_width + config.gutter_width;
-                let text_width = (clip.width() - side).max(metrics.char_width * 8.0);
-                let wrap_cols = config
-                    .word_wrap
-                    .then(|| {
-                        ((text_width - metrics.char_width) / metrics.char_width).floor() as usize
-                    })
-                    .map(|c| c.max(8));
-                let page_rows = ((clip.height() / metrics.row_height) as isize - 1).max(1);
+        let mut area = egui::ScrollArea::both().id_salt(id).auto_shrink(false);
+        if let Some(y) = view.scroll_to.take() {
+            area = area.vertical_scroll_offset(y);
+        }
+        let scroll = area.show_viewport(ui, |ui, viewport| {
+            let clip = ui.clip_rect();
+            let origin = ui.max_rect().min;
+            let side = config.blame_width + config.gutter_width;
+            let text_width = (clip.width() - side).max(metrics.char_width * 8.0);
+            let wrap_cols = config
+                .word_wrap
+                .then(|| ((text_width - metrics.char_width) / metrics.char_width).floor() as usize)
+                .map(|c| c.max(8));
+            let page_rows = ((clip.height() / metrics.row_height) as isize - 1).max(1);
 
-                // Keyboard first, so this frame shows its result.
-                if has_focus {
-                    let events = ui.input(|i| i.filtered_events(&filter));
-                    let input = Input {
-                        doc: &mut *doc,
-                        view: &mut *view,
-                        config: &config,
-                        wrap_cols,
-                        page_rows,
-                        mac: ui.os() == egui::os::OperatingSystem::Mac,
-                    };
-                    let (c, t) = input.handle_events(ui, &events);
-                    changed |= c;
-                    typed = t.or(typed);
-                }
-
-                let map = view.display_map(&doc.buffer, wrap_cols).clone();
-                let height = (map.total_rows() + 2) as f32 * metrics.row_height;
-                let width = side + view.max_width.max(text_width);
-                let (content, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
-                let visible = content.intersect(clip);
-                let response = ui.interact(visible, id, Sense::click_and_drag());
-
-                let geometry = Geometry {
-                    origin,
-                    clip,
-                    side,
-                    blame_width: config.blame_width,
-                    gutter_width: config.gutter_width,
-                    metrics,
+            // Keyboard first, so this frame shows its result.
+            if has_focus {
+                let events = ui.input(|i| i.filtered_events(&filter));
+                let input = Input {
+                    doc: &mut *doc,
+                    view: &mut *view,
+                    config: &config,
                     wrap_cols,
+                    page_rows,
+                    mac: ui.os() == egui::os::OperatingSystem::Mac,
                 };
+                let (c, t) = input.handle_events(ui, &events);
+                changed |= c;
+                typed = t.or(typed);
+            }
 
-                // Mouse, against this frame's text.
-                let pointer_changed =
-                    handle_pointer(ui, &response, &geometry, &*doc, &mut *view, &map, &config);
-                if pointer_changed {
-                    ui.memory_mut(|m| m.request_focus(id));
-                }
-                let map = view.display_map(&doc.buffer, wrap_cols).clone();
+            let map = view.display_map(&doc.buffer, wrap_cols).clone();
+            let height = (map.total_rows() + 2) as f32 * metrics.row_height;
+            let width = side + view.max_width.max(text_width);
+            let (content, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
+            let visible = content.intersect(clip);
+            let response = ui.interact(visible, id, Sense::click_and_drag());
 
-                // Scroll a moved cursor into view.
-                if let Some(reveal) = view.reveal.take() {
-                    reveal_cursor(ui, &geometry, &doc.buffer, view, &map, reveal);
-                }
+            let geometry = Geometry {
+                origin,
+                clip,
+                side,
+                blame_width: config.blame_width,
+                gutter_width: config.gutter_width,
+                metrics,
+                wrap_cols,
+            };
 
-                // Highlight what's visible, a little ahead.
-                let first_row = (viewport.top() / metrics.row_height).floor().max(0.0) as usize;
-                let last_row = (viewport.bottom() / metrics.row_height).ceil() as usize;
-                let (last_line, _) = map.line_at_row(last_row);
-                if !highlighter.highlight(
-                    &mut doc.highlight,
-                    &doc.buffer,
-                    config.extension,
-                    last_line + 2,
-                    HIGHLIGHT_BUDGET,
-                ) {
-                    ui.ctx().request_repaint();
-                }
+            // Mouse, against this frame's text.
+            let pointer_changed =
+                handle_pointer(ui, &response, &geometry, &*doc, &mut *view, &map, &config);
+            if pointer_changed {
+                ui.memory_mut(|m| m.request_focus(id));
+            }
+            let map = view.display_map(&doc.buffer, wrap_cols).clone();
 
-                let underlay = ui
-                    .painter()
-                    .with_clip_rect(text_clip(&geometry))
-                    .add(Shape::Noop);
-                let layout = lay_out(
-                    ui,
-                    &geometry,
-                    &*doc,
-                    view,
-                    highlighter,
-                    &config,
-                    &map,
-                    first_row..last_row + 1,
-                    viewport,
-                    underlay,
-                );
-                paint(ui, &layout, &doc.buffer, view, &config, has_focus);
-                let inner = decorate(ui, &layout, &*doc);
-                (response, layout, inner)
-            });
+            // Scroll a moved cursor into view.
+            if let Some(reveal) = view.reveal.take() {
+                reveal_cursor(ui, &geometry, &doc.buffer, view, &map, reveal);
+            }
+
+            // Highlight what's visible, a little ahead.
+            let first_row = (viewport.top() / metrics.row_height).floor().max(0.0) as usize;
+            let last_row = (viewport.bottom() / metrics.row_height).ceil() as usize;
+            let (last_line, _) = map.line_at_row(last_row);
+            if !highlighter.highlight(
+                &mut doc.highlight,
+                &doc.buffer,
+                config.extension,
+                last_line + 2,
+                HIGHLIGHT_BUDGET,
+            ) {
+                ui.ctx().request_repaint();
+            }
+
+            let underlay = ui
+                .painter()
+                .with_clip_rect(text_clip(&geometry))
+                .add(Shape::Noop);
+            let layout = lay_out(
+                ui,
+                &geometry,
+                &*doc,
+                view,
+                highlighter,
+                &config,
+                &map,
+                first_row..last_row + 1,
+                viewport,
+                underlay,
+            );
+            paint(ui, &layout, &doc.buffer, view, &config, has_focus);
+            let inner = decorate(ui, &layout, &*doc);
+            (response, layout, inner)
+        });
         let (response, layout, inner) = scroll.inner;
+        let scroll_state = ScrollState {
+            offset: scroll.state.clamped_offset().y,
+            height: scroll.inner_rect.height(),
+            content_height: scroll.content_size.y,
+            row_height: metrics.row_height,
+        };
 
         let primary = view.sel.primary();
         let caret = has_focus
@@ -432,6 +454,7 @@ impl EditorWidget<'_> {
             changed,
             typed,
             caret,
+            scroll: scroll_state,
             inner,
         }
     }
@@ -517,6 +540,10 @@ fn lay_out(
                 let byte_b = char_to_byte(&text, shown.end);
                 let mut job = LayoutJob::default();
                 highlighter.append(&mut job, &text[byte_a..byte_b], byte_a, spans, &config.font);
+                if let Some(d) = config.decorations {
+                    let chars = line_start + shown.start..line_start + shown.end;
+                    decorate::apply(&mut job, &d.row_overlay(chars, &text[byte_a..byte_b]));
+                }
                 job.wrap.max_width = f32::INFINITY;
                 let galley = ui.fonts_mut(|f| f.layout_job(job));
                 let gx =

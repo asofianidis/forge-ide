@@ -3,11 +3,13 @@
 
 mod buffer;
 pub mod conflicts;
+pub mod decorate;
 mod document;
 pub mod find;
 pub mod folding;
 pub mod gutter;
 mod highlight;
+pub mod minimap;
 pub mod multi;
 pub mod ops;
 pub mod scm;
