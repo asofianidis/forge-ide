@@ -27,7 +27,8 @@ enum Row {
 
 impl ForgeApp {
     pub(super) fn open_project_search(&mut self, ctx: &egui::Context) {
-        self.sidebar = super::Sidebar::Search;
+        self.sidebar_view = crate::ui::activity::SidebarView::Search;
+        self.sidebar_open = true;
         self.search.focus_query = true;
         // Seed the query with a single-line selection, like the find bar.
         let sel = self.selection(ctx);

@@ -26,6 +26,13 @@ pub enum Command {
     GoToLine,
     ShowCommandPalette,
     ShowExplorer,
+    ShowSourceControl,
+    ShowPullRequests,
+    ToggleBlame,
+    NextChange,
+    PreviousChange,
+    FileHistory,
+    RepositoryHistory,
     SelectTheme,
     ReloadThemes,
     OpenThemesFolder,
@@ -64,6 +71,13 @@ impl Command {
         Command::GoToLine,
         Command::ShowCommandPalette,
         Command::ShowExplorer,
+        Command::ShowSourceControl,
+        Command::ShowPullRequests,
+        Command::ToggleBlame,
+        Command::NextChange,
+        Command::PreviousChange,
+        Command::FileHistory,
+        Command::RepositoryHistory,
         Command::SelectTheme,
         Command::ReloadThemes,
         Command::OpenThemesFolder,
@@ -93,6 +107,13 @@ impl Command {
             Command::GoToLine => "Go to Line…",
             Command::ShowCommandPalette => "Command Palette…",
             Command::ShowExplorer => "Explorer",
+            Command::ShowSourceControl => "Source Control",
+            Command::ShowPullRequests => "Pull Requests",
+            Command::ToggleBlame => "Toggle Blame",
+            Command::NextChange => "Next Change",
+            Command::PreviousChange => "Previous Change",
+            Command::FileHistory => "File History",
+            Command::RepositoryHistory => "Repository History",
             Command::SelectTheme => "Color Theme…",
             Command::ReloadThemes => "Reload Themes",
             Command::OpenThemesFolder => "Open Themes Folder",
@@ -109,9 +130,9 @@ impl Command {
             Find | Replace | FindInProject | ToggleComment | Indent | Outdent | DuplicateLine
             | MoveLineUp | MoveLineDown => "Edit",
             QuickOpen | GoToLine => "Go",
-            ShowCommandPalette | ShowExplorer | SelectTheme | ReloadThemes | OpenThemesFolder => {
-                "View"
-            }
+            ShowCommandPalette | ShowExplorer | ShowSourceControl | ShowPullRequests
+            | ToggleBlame | NextChange | PreviousChange | FileHistory | RepositoryHistory
+            | SelectTheme | ReloadThemes | OpenThemesFolder => "View",
             LanguageServers => "Tools",
             CheckForUpdates => "Help",
         }
@@ -158,6 +179,12 @@ impl Command {
             Command::GoToLine => &const { one(shortcut(Modifiers::CTRL, Key::G)) },
             Command::ShowCommandPalette => &const { one(shortcut(CMD_SHIFT, Key::P)) },
             Command::ShowExplorer => &const { one(shortcut(CMD_SHIFT, Key::E)) },
+            Command::ShowSourceControl => &const { one(shortcut(CMD_SHIFT, Key::G)) },
+            // Cmd+Shift+P is the command palette, as in other editors.
+            Command::ShowPullRequests => &const { one(shortcut(CMD_SHIFT, Key::R)) },
+            Command::ToggleBlame => &const { one(shortcut(CMD_ALT, Key::B)) },
+            Command::NextChange => &const { one(shortcut(ALT, Key::F5)) },
+            Command::PreviousChange => &const { one(shortcut(ALT_SHIFT, Key::F5)) },
             _ => &[],
         }
     }
@@ -221,6 +248,7 @@ mod tests {
         assert!(pos(Command::ShowCommandPalette) < pos(Command::QuickOpen));
         assert!(pos(Command::FindInProject) < pos(Command::Find));
         assert!(pos(Command::DuplicateLine) < pos(Command::MoveLineDown));
+        assert!(pos(Command::PreviousChange) < pos(Command::NextChange));
     }
 
     #[test]
