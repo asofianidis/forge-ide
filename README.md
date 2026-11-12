@@ -7,7 +7,12 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
 ## Features
 
 - Activity bar with four sidebar views: **Explorer**, **Search**, **Source Control** and **Pull Requests**
-- File explorer with lazily-loaded directory tree, colored by git status
+- File explorer with lazily-loaded directory tree, colored by git status. Right-click to create
+  files and folders (`a/b/c.rs` creates the folders in between), rename, delete (to the trash),
+  reveal in Finder / File Explorer, or copy the path
+- File watching (via [notify](https://github.com/notify-rs/notify)): the explorer, open files and
+  git status follow changes made by other programs as they happen. Unmodified open files reload;
+  files with unsaved edits show a banner to reload or keep your version
 - Tabbed editing with unsaved-change indicators
 - Session restore: each folder reopens with the tabs, selected tab and cursor positions it had
   last time. Starting Forge without a folder argument opens the last folder you used
@@ -23,6 +28,9 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
 - Quick open (fuzzy file search) and a command palette that reaches every menu action
 - Line editing: go to line, toggle comment, indent/outdent a selection (Tab / Shift+Tab
   work on multi-line selections), duplicate and move lines, matching-bracket highlighting
+- Typing aids: Enter keeps the line's indentation (one level deeper after an opening bracket, or
+  `:` in Python/YAML); brackets and quotes auto-close, wrap a selection, and step over their
+  closer; Backspace in an empty pair deletes both halves
 - Native open/save dialogs (via [rfd](https://github.com/PolyMeilex/rfd))
 - Language server browser (**Tools → Language Servers…**): finds servers for the
   languages in your project, shows which are installed, and installs missing ones
@@ -223,6 +231,7 @@ src/
 ├── app.rs               # application state and UI layout
 ├── app/
 │   ├── editing.rs       # line-editing commands, selection helpers, Go to Line
+│   ├── explorer.rs      # file tree, its new / rename / delete / reveal actions, watcher events
 │   ├── language.rs      # diagnostics, hover, completion, definition, rename, formatting UI
 │   ├── find_bar.rs      # find / replace bar
 │   ├── search_panel.rs  # "Search" sidebar
@@ -238,7 +247,8 @@ src/
 ├── settings.rs          # persisted preferences (settings.toml)
 ├── theme.rs             # built-in + custom themes
 ├── updater.rs           # self-update from GitHub releases
-├── workspace.rs         # file tree / project explorer, file-type scan
+├── watcher.rs           # file watching (notify), batching events for the UI
+├── workspace.rs         # file tree / project explorer, file operations, file-type scan
 ├── git/
 │   ├── mod.rs           # repository state and operations
 │   ├── status.rs        # `git status --porcelain=v2` parser
@@ -271,7 +281,7 @@ src/
 └── editor/
     ├── document.rs      # open file buffer, load/save, dirty tracking
     ├── find.rs          # in-file find / replace
-    ├── ops.rs           # comment, indent, duplicate/move lines, bracket matching
+    ├── ops.rs           # comment, indent, move lines, auto-indent/pairs, brackets
     ├── gutter.rs        # line-number gutter and change markers
     ├── highlight.rs     # syntect → egui LayoutJob highlighting
     ├── scm.rs           # change peek, blame column, conflict actions
