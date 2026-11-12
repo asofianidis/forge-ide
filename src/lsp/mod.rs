@@ -6,7 +6,7 @@
 
 mod browser;
 pub mod catalog;
-mod detect;
+pub mod detect;
 mod install;
 
 use std::collections::{HashMap, HashSet};

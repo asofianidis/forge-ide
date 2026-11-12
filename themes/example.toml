@@ -34,6 +34,9 @@ link = "#5eead4"
 # text_muted = "#..."
 # warning = "#..."
 # error = "#..."
+# added = "#..."      # source control: added lines/files
+# modified = "#..."   # modified lines/files
+# deleted = "#..."    # deleted lines/files
 
 [syntax]
 keyword = "#5eead4"
