@@ -92,6 +92,16 @@ pub struct Thread {
     /// Renamed by hand, so a generated title must not replace it.
     #[serde(default)]
     pub title_locked: bool,
+    /// The folder the thread belongs to in the sidebar, when the agent works
+    /// elsewhere (a worktree). `None` means `folder`.
+    #[serde(default)]
+    pub project: Option<PathBuf>,
+    /// Start the first turn in a new git worktree.
+    #[serde(default)]
+    pub use_worktree: bool,
+    /// The worktree the agent works in, once created.
+    #[serde(default)]
+    pub worktree: Option<super::worktree::WorktreeInfo>,
 }
 
 pub fn now() -> u64 {
@@ -119,7 +129,20 @@ impl Thread {
             created: t,
             updated: t,
             title_locked: false,
+            project: None,
+            use_worktree: false,
+            worktree: None,
         }
+    }
+
+    /// The folder this thread is listed under.
+    pub fn project(&self) -> &Path {
+        self.project.as_deref().unwrap_or(&self.folder)
+    }
+
+    /// No turn has run yet, so where it runs can still change.
+    pub fn not_started(&self) -> bool {
+        self.session.is_none() && self.worktree.is_none()
     }
 
     /// Applies an event from the running turn. Streamed text collects in

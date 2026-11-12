@@ -1,20 +1,50 @@
 //! Connects the BYO AI view to the rest of the app: the sidebar, thread
 //! tabs, and the one-click commit / push / pull request flow.
 
+use std::path::PathBuf;
+
 use super::ForgeApp;
 use crate::ai::{FlowKind, FlowPlan, GitSummary, SidebarAction, ThreadAction};
-use crate::git::RepoState;
+use crate::git::{RepoState, SourceControl};
 use crate::panes::{AiPane, Pane};
 
 impl ForgeApp {
     /// Per-frame upkeep: agent output, the git flow, and keeping Source
     /// Control's "Generate" buttons on the selected text model.
     pub(super) fn poll_ai(&mut self) {
+        self.ai.in_repo = self.source_control.state == RepoState::Ready;
+        self.ai.current_branch = self.source_control.status.branch.head.clone();
+        // Follow the worktree of the thread on screen, if it has one.
+        match self.visible_worktree() {
+            Some(path) => {
+                if self.ai_worktree_sc.as_ref().is_none_or(|(p, _)| *p != path) {
+                    let sc = SourceControl::new(self.egui_ctx.clone(), Some(&path));
+                    self.ai_worktree_sc = Some((path, sc));
+                }
+                if let Some((_, sc)) = &mut self.ai_worktree_sc {
+                    sc.poll();
+                }
+            }
+            None => self.ai_worktree_sc = None,
+        }
         if self.ai.poll() {
             // An agent finished a turn; it may have changed files.
             self.source_control.refresh();
+            if let Some((_, sc)) = &mut self.ai_worktree_sc {
+                sc.refresh();
+            }
         }
-        self.source_control.text_gen = self.ai.text_generator(&self.settings.ai);
+        let text_gen = self.ai.text_generator(&self.settings.ai);
+        if let Some((_, sc)) = &mut self.ai_worktree_sc {
+            sc.text_gen = text_gen.clone();
+            for event in sc.take_events() {
+                self.status = match event {
+                    crate::git::Event::Done(msg) => msg,
+                    crate::git::Event::Failed(msg) => format!("Error: {msg}"),
+                };
+            }
+        }
+        self.source_control.text_gen = text_gen;
         for msg in self.ai.take_status() {
             self.status = msg;
         }
@@ -24,6 +54,9 @@ impl ForgeApp {
                 Err(e) => format!("Error: {e}"),
             };
             self.source_control.refresh();
+            if let Some((_, sc)) = &mut self.ai_worktree_sc {
+                sc.refresh();
+            }
             if self.github.is_ready() {
                 self.github.refresh();
             }
@@ -39,8 +72,30 @@ impl ForgeApp {
         }
     }
 
+    /// The worktree folder of the AI thread on screen, if it has one.
+    fn visible_worktree(&self) -> Option<PathBuf> {
+        let Some(crate::panes::Pane::Ai(p)) = self.active_pane.and_then(|i| self.panes.get(i))
+        else {
+            return None;
+        };
+        self.ai
+            .thread(&p.id)?
+            .worktree
+            .as_ref()
+            .map(|w| w.path.clone())
+    }
+
+    /// The repository the git button acts on: the visible thread's
+    /// worktree, else the open folder.
+    fn ai_git(&self) -> &SourceControl {
+        match (&self.ai_worktree_sc, self.visible_worktree()) {
+            (Some((p, sc)), Some(v)) if *p == v => sc,
+            _ => &self.source_control,
+        }
+    }
+
     fn git_summary(&self) -> GitSummary {
-        let sc = &self.source_control;
+        let sc = self.ai_git();
         let b = &sc.status.branch;
         let pr = b
             .head
@@ -107,6 +162,7 @@ impl ForgeApp {
                 SidebarAction::StartFlow(kind) => self.start_ai_flow(kind),
                 SidebarAction::OpenPr(n) => self.open_pull_request(n),
                 SidebarAction::OpenSettings => self.settings_open = true,
+                SidebarAction::OpenFolderInNewWindow(path) => self.open_folder_in_new_window(&path),
             }
         }
     }
@@ -142,7 +198,7 @@ impl ForgeApp {
         if self.ai.flow.is_some() {
             return;
         }
-        let sc = &self.source_control;
+        let sc = self.ai_git();
         let Some(git) = sc.git_cli() else {
             self.status = "This folder isn't a git repository".to_owned();
             return;

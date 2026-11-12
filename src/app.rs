@@ -152,6 +152,9 @@ pub struct ForgeApp {
     terminal: TerminalPanel,
     /// BYO AI: agent threads and AI-written git text.
     ai: Ai,
+    /// Git state of the worktree the visible AI thread works in, for its
+    /// commit / push / PR button.
+    ai_worktree_sc: Option<(PathBuf, SourceControl)>,
 }
 
 impl ForgeApp {
@@ -238,6 +241,7 @@ impl ForgeApp {
             explorer_dialog: None,
             terminal: TerminalPanel::default(),
             ai: Ai::new(cc.egui_ctx.clone(), folder.as_deref()),
+            ai_worktree_sc: None,
         };
         if let Some(folder) = folder {
             app.folder_opened(&folder);

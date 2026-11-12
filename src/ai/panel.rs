@@ -69,6 +69,8 @@ impl GitSummary {
 }
 
 pub enum SidebarAction {
+    /// Open a folder (a thread's worktree) in another Forge window.
+    OpenFolderInNewWindow(std::path::PathBuf),
     OpenThread(String),
     /// Close the tab of a deleted thread.
     ThreadDeleted(String),
@@ -136,16 +138,28 @@ impl Ai {
         }
 
         section(ui, "THREADS", colors);
-        let list: Vec<(String, String, String, u64, bool)> = self
+        type Item = (
+            String,
+            String,
+            String,
+            u64,
+            bool,
+            Option<std::path::PathBuf>,
+        );
+        let list: Vec<Item> = self
             .folder_threads()
             .into_iter()
             .map(|t| {
                 (
                     t.id.clone(),
                     t.title.clone(),
-                    format!("{} · {}", t.choice.label(), t.choice.provider.name()),
+                    match &t.worktree {
+                        Some(wt) => format!("⎇ {} · {}", wt.branch, t.choice.label()),
+                        None => format!("{} · {}", t.choice.label(), t.choice.provider.name()),
+                    },
                     t.updated,
                     self.is_running(&t.id),
+                    t.worktree.as_ref().map(|w| w.path.clone()),
                 )
             })
             .collect();
@@ -162,7 +176,7 @@ impl Ai {
                             .color(colors.text_muted.0),
                     );
                 }
-                for (id, title, model, updated, running) in &list {
+                for (id, title, model, updated, running, wt_path) in &list {
                     if let Some((rid, name)) = &mut self.renaming
                         && rid == id
                     {
@@ -246,9 +260,28 @@ impl Ai {
                         if *running && ui.button("Stop").clicked() {
                             self.stop(id);
                         }
+                        if let Some(path) = wt_path {
+                            if ui.button("Open worktree in new window").clicked() {
+                                actions.push(SidebarAction::OpenFolderInNewWindow(path.clone()));
+                            }
+                            if ui.button("Copy worktree path").clicked() {
+                                ui.ctx().copy_text(path.display().to_string());
+                            }
+                        }
                         ui.separator();
                         if ui.button("Delete").clicked() {
                             self.delete_thread(id);
+                            actions.push(SidebarAction::ThreadDeleted(id.clone()));
+                        }
+                        if wt_path.is_some()
+                            && ui
+                                .button("Delete thread and worktree")
+                                .on_hover_text(
+                                    "Also removes the worktree folder. Its branch is kept.",
+                                )
+                                .clicked()
+                        {
+                            self.delete_thread_and_worktree(id);
                             actions.push(SidebarAction::ThreadDeleted(id.clone()));
                         }
                     });
@@ -472,12 +505,27 @@ impl Ai {
         };
         let title = thread.title.clone();
         let folder = thread.folder.display().to_string();
+        let branch = thread
+            .worktree
+            .as_ref()
+            .map(|w| (w.branch.clone(), w.base.clone()));
         let running = self.is_running(id);
         let mut action = None;
 
         ui.horizontal(|ui| {
             ui.label(RichText::new(&title).strong().size(16.0));
-            ui.label(RichText::new(folder).small().color(colors.text_muted.0));
+            if let Some((branch, base)) = &branch {
+                ui.label(
+                    RichText::new(format!("⎇ {branch}"))
+                        .small()
+                        .color(colors.accent.0),
+                )
+                .on_hover_text(format!("Worktree branch, started from {base}"));
+            }
+            ui.add(
+                egui::Label::new(RichText::new(folder).small().color(colors.text_muted.0))
+                    .truncate(),
+            );
         });
         ui.separator();
 
@@ -515,6 +563,17 @@ impl Ai {
                 }
                 let streaming = self.runs.get(id).map(|a| a.streaming.as_str());
                 transcript(ui, thread, streaming, running, colors);
+                if self.creating_worktree(id) {
+                    ui.horizontal(|ui| {
+                        ui.add_space(14.0);
+                        ui.spinner();
+                        ui.label(
+                            RichText::new("Creating worktree…")
+                                .small()
+                                .color(colors.text_muted.0),
+                        );
+                    });
+                }
                 if let Some(active) = self.runs.get(id) {
                     ui.horizontal(|ui| {
                         ui.add_space(14.0);
@@ -571,7 +630,44 @@ impl Ai {
                         .filter(|p| self.is_installed(*p))
                         .collect();
                     let is_installed = |p: Provider| installed.contains(&p);
+                    let in_repo = self.in_repo;
+                    let base = self.current_branch.clone();
                     let t = self.threads.iter_mut().find(|t| t.id == id).unwrap();
+                    // Where the first turn runs: here, or in a new worktree.
+                    if in_repo && t.not_started() && !running {
+                        let text = if t.use_worktree {
+                            "⎇ New worktree"
+                        } else {
+                            "⎇ Local"
+                        };
+                        let tip = match (&base, t.use_worktree) {
+                            (Some(b), true) => format!(
+                                "Runs in a new git worktree on its own branch from {b}, leaving your working copy alone. Click to work in this folder instead."
+                            ),
+                            (_, true) => "Runs in a new git worktree on its own branch. Click to work in this folder instead.".to_owned(),
+                            (_, false) => "Works in this folder. Click to run in a new git worktree on its own branch instead.".to_owned(),
+                        };
+                        let fill = if t.use_worktree {
+                            colors.accent.0.gamma_multiply(0.35)
+                        } else {
+                            colors.widget.0
+                        };
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new(text).small())
+                                    .fill(fill)
+                                    .corner_radius(5.0),
+                            )
+                            .on_hover_text(tip)
+                            .clicked()
+                        {
+                            t.use_worktree = !t.use_worktree;
+                            // New threads start the same way.
+                            settings.new_thread_worktree = t.use_worktree;
+                            self.dirty = true;
+                            action = Some(ThreadAction::SettingsChanged);
+                        }
+                    }
                     let before = t.choice.provider;
                     let mut choice = t.choice.clone();
                     let mut access = t.access;

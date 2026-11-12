@@ -57,6 +57,8 @@ pub struct AiSettings {
     pub favorites: Vec<String>,
     /// Model ids typed into the picker, as `provider:model`.
     pub custom_models: Vec<String>,
+    /// Start new threads in their own git worktree.
+    pub new_thread_worktree: bool,
     // Tables last: TOML needs plain values before them.
     /// Model for new agent threads.
     #[serde(skip_serializing_if = "Option::is_none")]

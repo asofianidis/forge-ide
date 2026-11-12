@@ -9,6 +9,7 @@ pub mod picker;
 pub mod provider;
 pub mod textgen;
 pub mod thread;
+pub mod worktree;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -19,6 +20,7 @@ pub use provider::{Access, Provider};
 pub use textgen::TextGenerator;
 pub use thread::ModelChoice;
 
+use crate::task::Pending;
 use picker::PickerState;
 use thread::{Message, Run, RunEvent, Thread};
 
@@ -54,7 +56,18 @@ pub struct Ai {
     status: Vec<String>,
     /// Titles being written by the text model: (thread id, result).
     title_tasks: Vec<(String, crate::task::Pending<Result<String, String>>)>,
+    /// Background work whose only result is a status message.
+    side_tasks: Vec<Pending<Result<String, String>>>,
+    /// Worktrees being created, with the message to send once ready.
+    worktree_tasks: Vec<(String, String, Pending<WorktreeResult>)>,
+    /// Worktree branches being renamed after their thread: (id, result).
+    rename_tasks: Vec<(String, Pending<Result<String, String>>)>,
+    /// The open folder is in a git repository, and its current branch.
+    pub in_repo: bool,
+    pub current_branch: Option<String>,
 }
+
+type WorktreeResult = Result<(worktree::WorktreeInfo, PathBuf), String>;
 
 impl Ai {
     pub fn new(ctx: egui::Context, folder: Option<&Path>) -> Self {
@@ -76,6 +89,11 @@ impl Ai {
             flow_result: None,
             status: Vec::new(),
             title_tasks: Vec::new(),
+            worktree_tasks: Vec::new(),
+            side_tasks: Vec::new(),
+            rename_tasks: Vec::new(),
+            in_repo: false,
+            current_branch: None,
         }
     }
 
@@ -152,7 +170,7 @@ impl Ai {
         let mut list: Vec<&Thread> = self
             .threads
             .iter()
-            .filter(|t| &t.folder == folder)
+            .filter(|t| t.project() == folder.as_path())
             .collect();
         list.sort_by_key(|t| std::cmp::Reverse(t.updated));
         list
@@ -167,7 +185,11 @@ impl Ai {
     }
 
     pub fn is_running(&self, id: &str) -> bool {
-        self.runs.contains_key(id)
+        self.runs.contains_key(id) || self.creating_worktree(id)
+    }
+
+    pub fn creating_worktree(&self, id: &str) -> bool {
+        self.worktree_tasks.iter().any(|(t, _, _)| t == id)
     }
 
     pub fn running_count(&self) -> usize {
@@ -177,12 +199,30 @@ impl Ai {
     /// Starts an empty thread in the open folder and returns its id.
     pub fn new_thread(&mut self, settings: &AiSettings) -> Option<String> {
         let folder = self.folder.clone()?;
-        let t = Thread::new(folder, self.agent_choice(settings), settings.access);
+        let mut t = Thread::new(folder, self.agent_choice(settings), settings.access);
+        t.use_worktree = settings.new_thread_worktree && self.in_repo;
         let id = t.id.clone();
         self.threads.push(t);
         self.dirty = true;
         self.save();
         Some(id)
+    }
+
+    /// Deletes the thread; with `remove_worktree`, also its worktree folder
+    /// (its branch is kept).
+    pub fn delete_thread_and_worktree(&mut self, id: &str) {
+        if let Some(t) = self.thread(id)
+            && let Some(wt) = t.worktree.clone()
+        {
+            let project = t.project().to_path_buf();
+            let task = Pending::spawn(&self.ctx, move || {
+                worktree::remove(&project, &wt)
+                    .map(|()| format!("Removed worktree {}", wt.path.display()))
+            });
+            // Reported through the status bar once done.
+            self.side_tasks.push(task);
+        }
+        self.delete_thread(id);
     }
 
     pub fn delete_thread(&mut self, id: &str) {
@@ -196,27 +236,63 @@ impl Ai {
     }
 
     /// Sends `text` to the thread's agent. On a thread's first message,
-    /// `titler` (the text model) names the thread in the background.
+    /// `titler` (the text model) names the thread in the background, and a
+    /// worktree is created first if the thread asked for one.
     pub fn send(
         &mut self,
         id: &str,
         text: String,
         titler: Option<TextGenerator>,
     ) -> Result<(), String> {
-        if self.runs.contains_key(id) {
+        if self.is_running(id) {
             return Err("the agent is still working on the last message".to_owned());
         }
+        let t = self.thread(id).ok_or("thread not found")?;
+        let first = !t.messages.iter().any(|m| matches!(m, Message::User { .. }));
+        let needs_worktree = t.use_worktree && t.worktree.is_none() && self.in_repo;
+        if !needs_worktree {
+            self.start_run(id, &text)?;
+        }
         let ctx = self.ctx.clone();
-        let (provider, exe) = {
-            let t = self.thread(id).ok_or("thread not found")?;
-            let p = t.choice.provider;
-            let exe = self
-                .exe(p)
-                .ok_or_else(|| format!("the {} CLI isn't installed", p.name()))?
-                .to_path_buf();
-            (p, exe)
-        };
         let t = self.thread_mut(id).ok_or("thread not found")?;
+        if first
+            && !t.title_locked
+            && let Some(r#gen) = titler
+        {
+            let folder = t.project().to_path_buf();
+            let prompt = text.clone();
+            let task = Pending::spawn(&ctx, move || r#gen.thread_title(&folder, &prompt));
+            self.title_tasks.push((id.to_owned(), task));
+        }
+        let t = self.thread_mut(id).ok_or("thread not found")?;
+        // A placeholder until the generated title arrives.
+        t.set_title_from(&text);
+        t.messages.push(Message::User { text: text.clone() });
+        t.updated = thread::now();
+        if needs_worktree {
+            t.project = Some(t.folder.clone());
+            let project = t.folder.clone();
+            let base = self.current_branch.clone();
+            let tid = id.to_owned();
+            let task = Pending::spawn(&ctx, move || {
+                worktree::create(&project, base.as_deref(), &tid)
+            });
+            self.worktree_tasks.push((id.to_owned(), text, task));
+        }
+        self.dirty = true;
+        self.save();
+        Ok(())
+    }
+
+    /// Starts the agent process for `text` in the thread's folder.
+    fn start_run(&mut self, id: &str, text: &str) -> Result<(), String> {
+        let ctx = self.ctx.clone();
+        let t = self.thread(id).ok_or("thread not found")?;
+        let provider = t.choice.provider;
+        let exe = self
+            .exe(provider)
+            .ok_or_else(|| format!("the {} CLI isn't installed", provider.name()))?
+            .to_path_buf();
         if !t.folder.is_dir() {
             return Err(format!("{} no longer exists", t.folder.display()));
         }
@@ -226,25 +302,9 @@ impl Ai {
             &t.choice.effort,
             t.access,
             t.session.as_deref(),
-            &text,
+            text,
         );
         let run = Run::start(&ctx, &exe, provider, &t.folder, args, stdin)?;
-        let first = !t.messages.iter().any(|m| matches!(m, Message::User { .. }));
-        if first
-            && !t.title_locked
-            && let Some(r#gen) = titler
-        {
-            let folder = t.folder.clone();
-            let prompt = text.clone();
-            let task =
-                crate::task::Pending::spawn(&ctx, move || r#gen.thread_title(&folder, &prompt));
-            self.title_tasks.push((id.to_owned(), task));
-        }
-        let t = self.thread_mut(id).ok_or("thread not found")?;
-        // A placeholder until the generated title arrives.
-        t.set_title_from(&text);
-        t.messages.push(Message::User { text });
-        t.updated = thread::now();
         self.runs.insert(
             id.to_owned(),
             ActiveRun {
@@ -253,9 +313,106 @@ impl Ai {
                 stopped: false,
             },
         );
-        self.dirty = true;
-        self.save();
         Ok(())
+    }
+
+    /// Finishes background worktree work: starts turns whose worktree is
+    /// ready and renames branches after their thread's title.
+    fn poll_worktrees(&mut self) {
+        let mut ready = Vec::new();
+        self.worktree_tasks
+            .retain(|(id, text, task)| match task.try_take() {
+                Some(result) => {
+                    ready.push((id.clone(), text.clone(), result));
+                    false
+                }
+                None => true,
+            });
+        for (id, text, result) in ready {
+            let Some(t) = self.thread_mut(&id) else {
+                continue;
+            };
+            match result {
+                Ok((wt, folder)) => {
+                    t.messages.push(Message::Info {
+                        text: format!(
+                            "Working in a new worktree on branch {} (from {}): {}",
+                            wt.branch,
+                            wt.base,
+                            wt.path.display()
+                        ),
+                    });
+                    t.folder = folder;
+                    t.worktree = Some(wt);
+                    self.rename_if_titled(&id);
+                    if let Err(e) = self.start_run(&id, &text)
+                        && let Some(t) = self.thread_mut(&id)
+                    {
+                        t.messages.push(Message::Error { text: e });
+                    }
+                }
+                Err(e) => {
+                    t.use_worktree = false;
+                    t.messages.push(Message::Error {
+                        text: format!(
+                            "Couldn't create a worktree: {e}. The thread is set back to work in the folder itself; send your message again."
+                        ),
+                    });
+                }
+            }
+            self.dirty = true;
+        }
+
+        let mut renamed = Vec::new();
+        self.rename_tasks
+            .retain(|(id, task)| match task.try_take() {
+                Some(result) => {
+                    renamed.push((id.clone(), result));
+                    false
+                }
+                None => true,
+            });
+        for (id, result) in renamed {
+            if let Some(wt) = self.thread_mut(&id).and_then(|t| t.worktree.as_mut()) {
+                if let Ok(branch) = result {
+                    wt.branch = branch;
+                }
+                wt.auto_named = false;
+                self.dirty = true;
+            }
+        }
+
+        let mut done = Vec::new();
+        self.side_tasks.retain(|task| match task.try_take() {
+            Some(r) => {
+                done.push(r);
+                false
+            }
+            None => true,
+        });
+        for r in done {
+            self.status.push(match r {
+                Ok(msg) => msg,
+                Err(e) => format!("Error: {e}"),
+            });
+        }
+    }
+
+    /// Names a placeholder worktree branch after the thread, once it has a
+    /// generated (or hand-written) title.
+    fn rename_if_titled(&mut self, id: &str) {
+        if self.rename_tasks.iter().any(|(t, _)| t == id)
+            || self.title_tasks.iter().any(|(t, _)| t == id)
+        {
+            return;
+        }
+        let Some(t) = self.thread(id) else { return };
+        let Some(wt) = t.worktree.clone().filter(|w| w.auto_named) else {
+            return;
+        };
+        let title = t.title.clone();
+        let task = Pending::spawn(&self.ctx, move || worktree::rename_branch(&wt, &title));
+        self.rename_tasks.push((id.to_owned(), task));
     }
 
     pub fn stop(&mut self, id: &str) {
@@ -322,6 +479,16 @@ impl Ai {
         });
         if titled {
             self.dirty = true;
+        }
+        self.poll_worktrees();
+        let waiting: Vec<String> = self
+            .threads
+            .iter()
+            .filter(|t| t.worktree.as_ref().is_some_and(|w| w.auto_named))
+            .map(|t| t.id.clone())
+            .collect();
+        for id in waiting {
+            self.rename_if_titled(&id);
         }
         let any = !finished.is_empty();
         for id in finished {
@@ -488,6 +655,93 @@ mod tests {
             .unwrap();
         eprintln!("commit message: {msg}");
         assert!(!msg.is_empty() && !msg.contains("```"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A worktree thread with the real Claude CLI: the agent's file lands in
+    /// the worktree, not the main checkout, and the branch is renamed after
+    /// the generated title. `cargo test -- --ignored claude_worktree`.
+    #[test]
+    #[ignore = "needs the claude CLI and makes paid model calls"]
+    fn claude_worktree_thread() {
+        use crate::cli::Cli;
+        let dir = std::env::temp_dir().join(format!("forge-ai-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = dir.join("demo");
+        std::fs::create_dir_all(&repo).unwrap();
+        unsafe {
+            std::env::set_var("FORGE_AI_THREADS", dir.join("threads.json"));
+            std::env::set_var("FORGE_WORKTREES", dir.join("wts"));
+        }
+        let g = Cli::new(Cli::locate("git").unwrap(), repo.clone());
+        g.run(&["init", "-q", "-b", "main"]).unwrap();
+        g.run(&["config", "user.email", "t@example.com"]).unwrap();
+        g.run(&["config", "user.name", "T"]).unwrap();
+        std::fs::write(repo.join("README.md"), "demo").unwrap();
+        g.run(&["add", "-A"]).unwrap();
+        g.run(&["commit", "-qm", "init"]).unwrap();
+
+        let mut ai = Ai::new(egui::Context::default(), Some(&repo));
+        ai.in_repo = true;
+        ai.current_branch = Some("main".into());
+        let settings = AiSettings {
+            new_thread_worktree: true,
+            agent: Some(ModelChoice {
+                provider: Provider::Claude,
+                model: "claude-haiku-5-5".into(),
+                effort: "low".into(),
+            }),
+            ..Default::default()
+        };
+        let id = ai.new_thread(&settings).unwrap();
+        assert!(ai.thread(&id).unwrap().use_worktree);
+        let titler = ai.text_generator(&AiSettings::default());
+        ai.send(
+            &id,
+            "Create a file named notes.txt containing exactly the word forge. Then reply DONE."
+                .into(),
+            titler,
+        )
+        .unwrap();
+        let start = Instant::now();
+        loop {
+            ai.poll();
+            let t = ai.thread(&id).unwrap();
+            let renamed = t.worktree.as_ref().is_some_and(|w| !w.auto_named);
+            if !ai.is_running(&id) && renamed {
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(180), "timed out");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let t = ai.thread(&id).unwrap();
+        eprintln!("{:#?}", t.messages);
+        let wt = t.worktree.clone().unwrap();
+        eprintln!(
+            "title: {} | branch: {} | path: {}",
+            t.title,
+            wt.branch,
+            wt.path.display()
+        );
+        assert_eq!(t.project(), repo.as_path());
+        assert_eq!(t.folder, wt.path);
+        assert_eq!(
+            std::fs::read_to_string(wt.path.join("notes.txt"))
+                .unwrap()
+                .trim(),
+            "forge"
+        );
+        assert!(
+            !repo.join("notes.txt").exists(),
+            "main checkout must be untouched"
+        );
+        assert!(wt.branch.starts_with("forge/") && !wt.branch.contains("thread-"));
+        let head = Cli::new(Cli::locate("git").unwrap(), wt.path.clone())
+            .run(&["rev-parse", "--abbrev-ref", "HEAD"])
+            .unwrap();
+        assert_eq!(head.trim(), wt.branch);
+        // Listed under the project in the sidebar.
+        assert_eq!(ai.folder_threads().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
