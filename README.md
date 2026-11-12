@@ -6,7 +6,8 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
 
 ## Features
 
-- File explorer with lazily-loaded directory tree
+- Activity bar with three sidebar views: **Explorer**, **Source Control** and **Pull Requests**
+- File explorer with lazily-loaded directory tree, colored by git status
 - Tabbed editing with unsaved-change indicators
 - Syntax highlighting for many languages (via [syntect](https://github.com/trishume/syntect))
 - Line-number gutter with current-line highlight
@@ -15,8 +16,42 @@ A lightweight, native code editor written in Rust, built on [egui](https://githu
 - Language server browser (**Tools → Language Servers…**): finds servers for the
   languages in your project, shows which are installed, and installs missing ones
   with one click via the language's own toolchain (rustup, npm, go, pipx, …)
+- Git source control (see below) with live change markers in the editor gutter
+- GitHub pull requests through the GitHub CLI (see below)
 - Themes: built-in **Blossom** (default) and **Blossom Light**, plus custom TOML themes
 - Automatic updates from GitHub releases
+
+## Source control
+
+The **Source Control** view (Cmd/Ctrl+Shift+G) drives the `git` command line, so it works with
+your existing config, hooks, credentials and SSH keys:
+
+- Staged, unstaged and merge-conflict files; click one to open its diff as a tab
+- Stage, unstage or discard whole files, or **individual hunks** from the diff view
+- Commit (Cmd/Ctrl+Enter), Commit All when nothing is staged, Commit & Push, amend, undo last commit
+- Branch picker: switch, create, track remote branches; merge and delete from the Branches list
+- Push / pull / fetch / sync with ahead-behind counts; publish new branches; force push with lease
+- Stashes (stash, apply, pop, drop), commit history with full commit diffs
+- Conflict resolution: accept ours/theirs, mark resolved, abort merge
+- Explorer colors and editor gutter markers for added, modified and deleted lines
+
+The current branch and its pull request are also shown at the left of the status bar.
+
+## Pull requests
+
+The **Pull Requests** view (Cmd/Ctrl+Shift+P) uses the [GitHub CLI](https://cli.github.com), which
+handles sign-in and finds the GitHub repository from the folder's remotes. Install it and run
+`gh auth login` once; Forge never stores tokens.
+
+- List open, merged, closed or all PRs; filter by created by me, review requested or assigned, or
+  any GitHub search query. The PR for your current branch is pinned to the top.
+- Open a PR as a tab: description, comments and reviews, checks, reviewers, labels
+- **Files changed** with the full diff and inline review threads; click any line to comment,
+  reply to threads
+- Review changes: comment, approve or request changes
+- Merge (squash, merge commit or rebase), update branch, ready for review / convert to draft,
+  close or reopen, request reviewers, check out the PR locally
+- Create a pull request from the current branch (pushing it first if needed)
 
 ## Install
 
@@ -91,6 +126,9 @@ cargo run --release -- path/to/project
 | Open file  | Ctrl+O   |
 | Save       | Ctrl+S   |
 | Close tab  | Ctrl+W   |
+| Explorer   | Ctrl+Shift+E |
+| Source Control | Ctrl+Shift+G |
+| Pull Requests  | Ctrl+Shift+P |
 
 (Cmd instead of Ctrl on macOS.)
 
@@ -100,10 +138,30 @@ cargo run --release -- path/to/project
 src/
 ├── main.rs              # entry point, window setup
 ├── app.rs               # application state and UI layout
+├── panes.rs             # diff / commit / pull request tabs
+├── cli.rs               # running git and gh
+├── task.rs              # background work helper
 ├── settings.rs          # persisted preferences (settings.toml)
 ├── theme.rs             # built-in + custom themes
 ├── updater.rs           # self-update from GitHub releases
 ├── workspace.rs         # file tree / project explorer, file-type scan
+├── git/
+│   ├── mod.rs           # repository state and operations
+│   ├── status.rs        # `git status --porcelain=v2` parser
+│   ├── diff.rs          # unified diff parser, single-hunk patches
+│   ├── line_changes.rs  # gutter change markers
+│   └── panel.rs         # Source Control sidebar
+├── github/
+│   ├── mod.rs           # gh connection, PR list, creating PRs
+│   ├── model.rs         # gh JSON types
+│   ├── list.rs          # Pull Requests sidebar
+│   └── pr.rs            # pull request tab
+├── ui/
+│   ├── activity.rs      # activity bar
+│   ├── diff_view.rs     # diff rendering
+│   ├── markdown.rs      # Markdown for PR bodies and comments
+│   ├── icons.rs         # vector icons
+│   └── fmt.rs           # relative times
 ├── lsp/
 │   ├── catalog.rs       # known language servers and their install commands
 │   ├── detect.rs        # finding installed servers / package managers
@@ -126,6 +184,7 @@ src/
 - [x] Language server discovery and installation
 - [ ] LSP client (diagnostics, completion, go to definition)
 - [x] Themes
+- [x] Git source control and GitHub pull requests
 - [ ] Settings UI
 
 ## License
