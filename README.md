@@ -196,7 +196,9 @@ cargo run --release -- path/to/project
 | New file               | Ctrl+N                                  |
 | Open file              | Ctrl+O                                  |
 | Save                   | Ctrl+S                                  |
+| Save as                | Ctrl+Shift+S                            |
 | Close tab              | Ctrl+W                                  |
+| Next / previous tab    | Ctrl+Tab / Ctrl+Shift+Tab (Ctrl on macOS too) |
 | Command palette        | Ctrl+Shift+P                            |
 | Go to file             | Ctrl+P                                  |
 | Go to line             | Ctrl+G (Ctrl on macOS too), `line:col` works |
@@ -220,7 +222,7 @@ cargo run --release -- path/to/project
 | Problems               | Ctrl+Shift+M                            |
 | Next / prev. problem   | F8 / Shift+F8                           |
 
-(Cmd instead of Ctrl on macOS, except for Go to line.) macOS uses Cmd+H to hide the app, so
+(Cmd instead of Ctrl on macOS, except for Go to line and switching tabs.) macOS uses Cmd+H to hide the app, so
 Replace is also on Cmd+Option+F there. Every action is also in the command palette.
 
 ## Project layout
@@ -295,7 +297,7 @@ src/
 - [x] Find / replace, go to line
 - [x] Project search, quick open
 - [x] Command palette
-- [ ] Unsaved-changes prompt on close
+- [x] Unsaved-changes prompt on close
 - [ ] Integrated terminal
 - [x] Language server discovery and installation
 - [x] LSP client: diagnostics, hover, go to definition, completion, rename, references, formatting

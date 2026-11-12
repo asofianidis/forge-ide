@@ -587,13 +587,66 @@ impl ForgeApp {
         let Some(doc) = self.documents.get_mut(idx) else {
             return false;
         };
-        let result = if doc.path.is_some() {
-            doc.save()
-        } else if let Some(path) = rfd::FileDialog::new().save_file() {
-            doc.save_as(path)
-        } else {
+        if doc.path.is_none() {
+            return self.save_as(idx);
+        }
+        let result = doc.save();
+        self.finish_save(idx, result)
+    }
+
+    /// Saves a document under a path picked in the save dialog. The tab then
+    /// follows the new path. Returns whether it was saved.
+    fn save_as(&mut self, idx: usize) -> bool {
+        let Some(doc) = self.documents.get(idx) else {
             return false;
         };
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(path) = &doc.path {
+            dialog = dialog.set_file_name(doc.title());
+            if let Some(dir) = path.parent() {
+                dialog = dialog.set_directory(dir);
+            }
+        } else if let Some(ws) = &self.workspace {
+            dialog = dialog.set_directory(&ws.root.path);
+        }
+        let Some(path) = dialog.save_file() else {
+            return false;
+        };
+        let path = std::path::absolute(&path).unwrap_or(path);
+        let doc = &mut self.documents[idx];
+        let old = doc.path.clone();
+        let result = doc.save_as(path.clone());
+        if result.is_err() {
+            // Keep pointing at the old file rather than one never written.
+            doc.path = old;
+            return self.finish_save(idx, result);
+        }
+        if let Some(dir) = path.parent() {
+            self.reload_tree_dir(dir);
+        }
+        self.finish_save(idx, result)
+    }
+
+    /// Save As for the active tab. A clean tab already showing the chosen
+    /// file is closed, since the file now holds this tab's text.
+    fn save_active_as(&mut self) {
+        self.active_pane = None;
+        if !self.save_as(self.active) {
+            return;
+        }
+        let path = self.documents[self.active].path.clone();
+        let mut i = self.documents.len();
+        while i > 0 {
+            i -= 1;
+            let other = &self.documents[i];
+            if i != self.active && other.path == path && !other.is_dirty() {
+                self.remove_tab(i);
+            }
+        }
+    }
+
+    fn finish_save(&mut self, idx: usize, result: anyhow::Result<()>) -> bool {
+        let doc = &self.documents[idx];
         let saved = match result {
             Ok(()) => {
                 self.status = format!("Saved {}", doc.title());
@@ -609,6 +662,20 @@ impl ForgeApp {
         };
         self.source_control.refresh();
         saved
+    }
+
+    /// Moves to the next or previous tab (files, then diff / history panes),
+    /// wrapping around at either end.
+    fn cycle_tab(&mut self, forward: bool) {
+        let docs = self.documents.len();
+        let current = self.active_pane.map_or(self.active, |p| docs + p);
+        match cycle(current, docs + self.panes.len(), forward) {
+            i if i < docs => {
+                self.active = i;
+                self.active_pane = None;
+            }
+            i => self.active_pane = Some(i - docs),
+        }
     }
 
     /// Closes a tab, first asking what to do with unsaved changes.
@@ -844,6 +911,7 @@ impl ForgeApp {
             Command::OpenFolder => self.open_folder_dialog(),
             Command::OpenRecent => self.open_recent_picker(),
             Command::Save => self.save_active(),
+            Command::SaveAs => self.save_active_as(),
             Command::CloseTab => match self.active_pane {
                 Some(i) => self.close_pane(i),
                 None => self.close_tab(self.active),
@@ -875,6 +943,8 @@ impl ForgeApp {
                 self.active_pane = None;
                 self.open_go_to_line();
             }
+            Command::NextTab => self.cycle_tab(true),
+            Command::PreviousTab => self.cycle_tab(false),
             Command::ShowCommandPalette => self.open_command_palette(),
             Command::ShowExplorer => self.show_sidebar(SidebarView::Explorer),
             Command::ShowSourceControl => self.show_sidebar(SidebarView::SourceControl),
@@ -942,6 +1012,7 @@ impl ForgeApp {
                 UpdateState::Checking | UpdateState::Installing(_)
             ),
             Command::QuickOpen | Command::FindInProject => self.workspace.is_some(),
+            Command::NextTab | Command::PreviousTab => self.documents.len() + self.panes.len() > 1,
             _ => true,
         };
         if ui.add_enabled(enabled, button).clicked() {
@@ -960,6 +1031,7 @@ impl ForgeApp {
                 self.open_recent_menu(ui);
                 ui.separator();
                 self.menu_item(ui, Save);
+                self.menu_item(ui, SaveAs);
                 self.menu_item(ui, CloseTab);
                 ui.separator();
                 self.menu_item(ui, RevealActiveFile);
@@ -992,6 +1064,11 @@ impl ForgeApp {
                 ui.separator();
                 self.menu_item(ui, NextProblem);
                 self.menu_item(ui, PreviousProblem);
+                self.menu_item(ui, NextChange);
+                self.menu_item(ui, PreviousChange);
+                ui.separator();
+                self.menu_item(ui, NextTab);
+                self.menu_item(ui, PreviousTab);
             });
             ui.menu_button("View", |ui| {
                 self.menu_item(ui, ShowCommandPalette);
@@ -1017,8 +1094,6 @@ impl ForgeApp {
                 if checkbox.changed() {
                     self.editor_git.blame_on = blame;
                 }
-                self.menu_item(ui, NextChange);
-                self.menu_item(ui, PreviousChange);
                 self.menu_item(ui, FileHistory);
                 self.menu_item(ui, RepositoryHistory);
                 ui.separator();
@@ -2076,5 +2151,30 @@ impl eframe::App for ForgeApp {
 
     fn on_exit(&mut self) {
         self.persist_session(true);
+    }
+}
+
+/// The index after (or before) `current` among `len` items, wrapping around.
+fn cycle(current: usize, len: usize, forward: bool) -> usize {
+    match (len, forward) {
+        (0, _) => 0,
+        (_, true) => (current + 1) % len,
+        (_, false) => (current.min(len - 1) + len - 1) % len,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cycle;
+
+    #[test]
+    fn tab_cycling_wraps() {
+        assert_eq!(cycle(0, 3, true), 1);
+        assert_eq!(cycle(2, 3, true), 0);
+        assert_eq!(cycle(0, 3, false), 2);
+        assert_eq!(cycle(2, 3, false), 1);
+        assert_eq!(cycle(0, 1, true), 0);
+        assert_eq!(cycle(0, 1, false), 0);
+        assert_eq!(cycle(0, 0, true), 0);
     }
 }
